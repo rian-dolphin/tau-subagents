@@ -1283,6 +1283,212 @@ async def test_skills_true_pins_discovery_to_parent_cwd_under_worktree(
     assert "<name>parentskill</name>" not in unpinned_system
 
 
+async def test_skills_none_disables_native_discovery(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    (tmp_path / ".tau" / "skills").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "idxskill.md").write_text(
+        "---\ndescription: Indexed skill\n---\nDo indexed things."
+    )
+    (tmp_path / ".tau" / "agents").mkdir(exist_ok=True)
+    (tmp_path / ".tau" / "agents" / "noskills.md").write_text(
+        "---\ndescription: No skills\nskills: none\n---\nBody."
+    )
+    control_provider = FakeProvider([_text_stream("done")])
+    noskills_provider = FakeProvider([_text_stream("done")])
+    _patch_provider_sequence(module, [control_provider, noskills_provider])
+
+    agent_tool = _agent_tool(runtime)
+    control = await agent_tool.execute({"prompt": "x", "description": "x"})
+    noskills = await agent_tool.execute(
+        {"prompt": "x", "description": "x", "subagent_type": "noskills"}
+    )
+
+    assert control.ok is True
+    assert noskills.ok is True
+    control_system = control_provider.calls[0][1]
+    assert "<name>idxskill</name>" in control_system  # omitted => native discovery
+    noskills_system = noskills_provider.calls[0][1]
+    assert "<available_skills>" not in noskills_system
+    assert "idxskill" not in noskills_system
+
+
+async def test_named_skills_preload_disables_native_index(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    (tmp_path / ".tau" / "skills").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "idxskill.md").write_text(
+        "---\ndescription: Indexed skill\n---\nDo indexed things."
+    )
+    (tmp_path / ".tau" / "agents").mkdir(exist_ok=True)
+    (tmp_path / ".tau" / "agents" / "preloader.md").write_text(
+        "---\ndescription: Preloads\nskills: idxskill\n---\nBody."
+    )
+    provider = FakeProvider([_text_stream("done")])
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "x", "description": "x", "subagent_type": "preloader"}
+    )
+
+    assert result.ok is True
+    system = provider.calls[0][1]
+    assert "# Preloaded Skill: idxskill" in system
+    assert "<available_skills>" not in system  # pi: named preload sets noSkills
+
+
+async def test_skills_none_falls_back_without_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    (tmp_path / ".tau" / "skills").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "idxskill.md").write_text(
+        "---\ndescription: Indexed skill\n---\nDo indexed things."
+    )
+    (tmp_path / ".tau" / "agents").mkdir(exist_ok=True)
+    (tmp_path / ".tau" / "agents" / "noskills.md").write_text(
+        "---\ndescription: No skills\nskills: none\n---\nBody."
+    )
+    monkeypatch.setattr(module, "_supports_skills_enabled", lambda: False)
+    provider = FakeProvider([_text_stream("done")])
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "x", "description": "x", "subagent_type": "noskills"}
+    )
+
+    # Against an older Tau without the seam, the spawn still works and
+    # native discovery stays on.
+    assert result.ok is True
+    assert "<name>idxskill</name>" in provider.calls[0][1]
+
+
+async def test_usage_surfaced_in_results_and_notifications(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    _patch_provider_sequence(
+        module,
+        [
+            FakeProvider([_text_stream("fg done")]),
+            FakeProvider([_text_stream("bg done")]),
+        ],
+    )
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute({"prompt": "fg", "description": "fg"})
+    assert "Agent completed in " in result.content
+    assert "(0 tool uses, ~" in result.content
+    assert "context tokens)." in result.content
+
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    fetched = await get_result.execute({"agent_id": "agent-1"})
+    assert "Usage: 0 tool uses · ~" in fetched.content
+    assert "context tokens" in fetched.content
+
+    await agent_tool.execute(
+        {"prompt": "bg", "description": "bg", "run_in_background": True}
+    )
+    await _wait_for(lambda: session.followed_up)
+    note = session.followed_up[0]
+    assert "<usage><tool_uses>0</tool_uses><context_tokens>" in note
+    assert "<duration_ms>" in note
+
+
+async def test_consuming_within_nudge_window_suppresses_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    module.load_subagent_settings = (  # type: ignore[attr-defined]
+        lambda cwd, home=None: module.SubagentSettings(default_join_mode="async")
+    )
+    monkeypatch.setattr(module, "NUDGE_HOLD_SECONDS", 0.3)
+    _patch_provider_factory(module, FakeProvider([_text_stream("done")]))
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "x", "description": "x", "run_in_background": True}
+    )
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    fetched = None
+    for _ in range(500):
+        fetched = await get_result.execute({"agent_id": "agent-1"})
+        if "[completed]" in fetched.content:
+            break
+        await asyncio.sleep(0.01)
+    assert fetched is not None and "[completed]" in fetched.content
+
+    # The read consumed the result inside the hold window; no nudge arrives.
+    await asyncio.sleep(0.5)
+    assert session.followed_up == []
+
+
+async def test_nudge_arrives_when_unconsumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    module.load_subagent_settings = (  # type: ignore[attr-defined]
+        lambda cwd, home=None: module.SubagentSettings(default_join_mode="async")
+    )
+    monkeypatch.setattr(module, "NUDGE_HOLD_SECONDS", 0.05)
+    _patch_provider_factory(module, FakeProvider([_text_stream("done")]))
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "x", "description": "x", "run_in_background": True}
+    )
+
+    await _wait_for(lambda: session.followed_up)
+    assert "<task-notification>" in session.followed_up[0]
+
+
+async def test_shutdown_cancels_pending_nudges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    module.load_subagent_settings = (  # type: ignore[attr-defined]
+        lambda cwd, home=None: module.SubagentSettings(default_join_mode="async")
+    )
+    monkeypatch.setattr(module, "NUDGE_HOLD_SECONDS", 0.5)
+    _patch_provider_factory(module, FakeProvider([_text_stream("done")]))
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "x", "description": "x", "run_in_background": True}
+    )
+    # The record is persisted just before the nudge is scheduled.
+    await _wait_for(
+        lambda: any(
+            namespace == "subagents:record"
+            for namespace, _data in session.custom_entries
+        )
+    )
+
+    await runtime.emit_session_shutdown("new")
+    await asyncio.sleep(0.7)
+    assert session.followed_up == []
+
+
 def test_extension_loads(tmp_path: Path) -> None:
     runtime = _load_runtime(tmp_path)
 

@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import functools
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -64,6 +67,7 @@ GROUP_RESULT_CHARS = 300
 RECORD_RESULT_CHARS = 4_000
 TRUNCATION_SUFFIX = "\n...(truncated, use get_subagent_result for full output)"
 BATCH_DEBOUNCE_SECONDS = 0.1
+NUDGE_HOLD_SECONDS = 0.2
 GROUP_TIMEOUT_SECONDS = DEFAULT_TIMEOUT
 STRAGGLER_TIMEOUT_SECONDS = STRAGGLER_TIMEOUT
 STALE_AFTER_SECONDS = 600.0
@@ -72,6 +76,14 @@ SOFT_LIMIT_MESSAGE = (
     "You have reached your turn limit. Wrap up immediately — provide your"
     " final answer now."
 )
+
+
+@functools.cache
+def _supports_skills_enabled() -> bool:
+    """Whether this Tau has the CodingSessionConfig.skills_enabled seam."""
+    return "skills_enabled" in {
+        config_field.name for config_field in dataclasses.fields(CodingSessionConfig)
+    }
 
 
 class _MemoryStorage:
@@ -105,7 +117,9 @@ class AgentRun:
     session: CodingSession | None = None
     provider: object | None = None
     result_consumed: bool = False
+    started_at: float | None = None
     completed_at: float | None = None
+    context_tokens: int = 0
     requested_model: str | None = None
     requested_thinking: str | None = None
     requested_max_turns: int | None = None
@@ -138,6 +152,7 @@ class SubagentManager:
         self._batch_counter = 0
         self._group_join: GroupJoinManager | None = None
         self._worktree_repos: set[str] = set()
+        self._nudge_timers: dict[str, asyncio.TimerHandle] = {}
 
     @property
     def runs(self) -> dict[str, AgentRun]:
@@ -237,6 +252,7 @@ class SubagentManager:
 
     def _start(self, run: AgentRun, definition: AgentDefinition) -> None:
         run.status = "running"
+        run.started_at = time.monotonic()
         if run.background:
             self._running_background += 1
         run.task = asyncio.get_running_loop().create_task(
@@ -261,12 +277,14 @@ class SubagentManager:
         run.result_text = ""
         run.aborted = False
         run.soft_limit_reached = False
+        run.started_at = time.monotonic()
         run.completed_at = None
         final_text: list[str] = []
         try:
             async for event in session.prompt(prompt):
                 self._observe(run, event, final_text)
             run.result_text = final_text[-1] if final_text else ""
+            run.context_tokens = session.context_token_estimate
             if run.status == "running":
                 run.status = "completed"
         except Exception as exc:  # noqa: BLE001 - report subagent failures as results
@@ -285,6 +303,9 @@ class SubagentManager:
             self._batch.clear()
             if self._group_join is not None:
                 self._group_join.cancel_all()
+            for handle in self._nudge_timers.values():
+                handle.cancel()
+            self._nudge_timers.clear()
             for run, _definition in self._queue:
                 if run.status == "queued":
                     run.status = "cancelled"
@@ -466,6 +487,15 @@ class SubagentManager:
             memory_block=memory_block,
         )
         append_active = definition.prompt_mode == "append" and bool(parent_prompt)
+        extra_config: dict[str, bool] = {}
+        # skills: none/false disables skill discovery; a named CSV also
+        # disables it so preloaded bodies aren't double-listed in the index
+        # (pi sets noSkills for both). Requires the skills_enabled seam;
+        # otherwise fall back to default discovery.
+        if (
+            definition.skills is False or isinstance(definition.skills, tuple)
+        ) and _supports_skills_enabled():
+            extra_config["skills_enabled"] = False
         session = await CodingSession.load(
             CodingSessionConfig(
                 provider=provider,
@@ -487,6 +517,7 @@ class SubagentManager:
                 auto_compact_enabled=False,
                 # Subagents load no extensions, so they cannot spawn recursively.
                 extensions_enabled=False,
+                **extra_config,
             )
         )
         run.session = session
@@ -509,9 +540,11 @@ class SubagentManager:
             self._observe(run, event, final_text)
             if event.type == "turn_end":
                 self._enforce_turn_limit(run)
+                run.context_tokens = session.context_token_estimate
                 if run.output_writer is not None:
                     await run.output_writer.flush(session.messages)
         run.result_text = final_text[-1] if final_text else ""
+        run.context_tokens = session.context_token_estimate
         if run.aborted:
             run.status = "aborted"
         elif run.status == "running":
@@ -547,6 +580,37 @@ class SubagentManager:
     def _deliver_background_result(self, run: AgentRun) -> None:
         if run.result_consumed:
             return
+        self._schedule_nudge(run.agent_id, lambda: self._send_individual_nudge(run))
+
+    def _deliver_group_notification(self, records: list[AgentRun], partial: bool) -> None:
+        key = "group:" + ",".join(run.agent_id for run in records)
+        self._schedule_nudge(
+            key, lambda: self._send_group_notification(records, partial)
+        )
+
+    def _schedule_nudge(self, key: str, send: Callable[[], None]) -> None:
+        """Hold a notification briefly so a prompt result read can cancel it."""
+        existing = self._nudge_timers.pop(key, None)
+        if existing is not None:
+            existing.cancel()
+
+        def fire() -> None:
+            self._nudge_timers.pop(key, None)
+            send()
+
+        self._nudge_timers[key] = asyncio.get_running_loop().call_later(
+            NUDGE_HOLD_SECONDS, fire
+        )
+
+    def cancel_nudge(self, agent_id: str) -> None:
+        """Cancel a pending individual nudge for a consumed run."""
+        handle = self._nudge_timers.pop(agent_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _send_individual_nudge(self, run: AgentRun) -> None:
+        if run.result_consumed:
+            return
         try:
             self._api.notify(
                 f"Subagent {run.agent_id} ({run.description}) {run.status}.",
@@ -564,10 +628,13 @@ class SubagentManager:
         except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
             pass
 
-    def _deliver_group_notification(self, records: list[AgentRun], partial: bool) -> None:
+    def _send_group_notification(self, records: list[AgentRun], partial: bool) -> None:
+        unconsumed = [run for run in records if not run.result_consumed]
+        if not unconsumed:
+            return
         try:
             self._api.send_user_message(
-                format_group_notification(records, partial=partial),
+                format_group_notification(unconsumed, partial=partial),
                 deliver_as="follow_up",
             )
         except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
@@ -629,6 +696,14 @@ def format_task_notification(
     output_line = (
         f"<output-file>{run.output_file}</output-file>\n" if run.output_file else ""
     )
+    usage_parts = [f"<tool_uses>{run.tool_calls}</tool_uses>"]
+    if run.context_tokens:
+        usage_parts.append(
+            f"<context_tokens>{run.context_tokens}</context_tokens>"
+        )
+    duration = _duration_ms(run)
+    if duration is not None:
+        usage_parts.append(f"<duration_ms>{duration}</duration_ms>")
     return (
         "<task-notification>\n"
         f"<agent-id>{run.agent_id}</agent-id>\n"
@@ -638,6 +713,7 @@ def format_task_notification(
         f"<status>{run.status}</status>\n"
         f"<turns>{run.turns}</turns>\n"
         f"<result>{truncated}</result>\n"
+        f"<usage>{''.join(usage_parts)}</usage>\n"
         "</task-notification>"
     )
 
@@ -669,6 +745,23 @@ def format_run_summary(run: AgentRun) -> str:
         f"{run.agent_id} [{run.status}] type={run.agent_type}"
         f" turns={run.turns} tools={run.tool_calls} — {run.description}"
     )
+
+
+def format_usage_parts(run: AgentRun) -> str:
+    """Format pi-style usage parts joined by middle dots."""
+    parts = [f"{run.tool_calls} tool uses"]
+    if run.context_tokens:
+        parts.append(f"~{run.context_tokens} context tokens")
+    duration = _duration_ms(run)
+    if duration is not None:
+        parts.append(f"{duration / 1000:.1f}s")
+    return " · ".join(parts)
+
+
+def _duration_ms(run: AgentRun) -> int | None:
+    if run.started_at is None or run.completed_at is None:
+        return None
+    return max(0, int((run.completed_at - run.started_at) * 1000))
 
 
 def setup(tau: ExtensionAPI) -> None:
@@ -795,9 +888,11 @@ def setup(tau: ExtensionAPI) -> None:
             # rather than the task so a queued run is followed through its
             # queued -> started -> finished transitions.
             run.result_consumed = True
+            manager.cancel_nudge(agent_id)
             while run.status in ("running", "queued"):
                 await asyncio.sleep(0.05)
         header = format_run_summary(run)
+        header += f"\nUsage: {format_usage_parts(run)}"
         if run.output_file:
             header += f"\nOutput file: {run.output_file}"
         if run.status == "queued":
@@ -814,6 +909,7 @@ def setup(tau: ExtensionAPI) -> None:
                 content=f"{header}\n\nStill running.",
             )
         run.result_consumed = True
+        manager.cancel_nudge(agent_id)
         body = run.error if run.status == "error" else run.result_text
         return _tool_result(
             "get_subagent_result",
@@ -848,12 +944,17 @@ def setup(tau: ExtensionAPI) -> None:
                 " It will be delivered once the session initializes.",
             )
         run.session.queue_steering_message(message)
+        state_parts = [f"{run.tool_calls} tool uses"]
+        with contextlib.suppress(Exception):
+            state_parts.append(
+                f"~{run.session.context_token_estimate} context tokens"
+            )
         return _tool_result(
             "steer_subagent",
             ok=True,
             content=f"Steering message sent to agent {agent_id}."
             " The agent will process it after its current tool execution.\n"
-            f"Current state: {run.tool_calls} tool uses",
+            f"Current state: {' · '.join(state_parts)}",
         )
 
     def agents_command(args: str, context) -> str:  # noqa: ANN001
@@ -1002,10 +1103,19 @@ def setup(tau: ExtensionAPI) -> None:
 def _foreground_result(run: AgentRun) -> AgentToolResult:
     if run.status in ("completed", "steered"):
         content = run.result_text or "(subagent produced no output)"
+        duration = _duration_ms(run)
+        seconds = f"{duration / 1000:.1f}" if duration is not None else "?"
+        tokens_note = (
+            f", ~{run.context_tokens} context tokens" if run.context_tokens else ""
+        )
+        completed_line = (
+            f"Agent completed in {seconds}s"
+            f" ({run.tool_calls} tool uses{tokens_note})."
+        )
         return _tool_result(
             "agent",
             ok=True,
-            content=f"{format_run_summary(run)}\n\n{content}",
+            content=f"{format_run_summary(run)}\n{completed_line}\n\n{content}",
         )
     return _tool_result(
         "agent",

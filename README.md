@@ -131,19 +131,26 @@ cwd's `.tau/skills/`) and gets an `<available_skills>` index in its prompt
 plus on-demand skill expansion. The `skills:` frontmatter layers on top of
 that:
 
-- `skills: foo, bar` — **additionally preloads** the named skills' full
-  bodies into the child's system prompt as `# Preloaded Skill: <name>`
-  sections (a missing name becomes a `(Skill "<name>" not found)`
-  placeholder), so the child doesn't have to read them on demand.
+- `skills: foo, bar` — preloads the named skills' full bodies into the
+  child's system prompt as `# Preloaded Skill: <name>` sections (a missing
+  name becomes a `(Skill "<name>" not found)` placeholder), so the child
+  doesn't have to read them on demand. Native discovery is turned off for
+  such agents (matching pi, which sets `noSkills` for named preloads so the
+  same skill isn't both preloaded and indexed) — the child gets exactly the
+  named skills. Requires the `skills_enabled` seam; against an older Tau the
+  index stays on alongside the preloaded bodies.
 - `skills: true` (or `*` / `all`) — pins the child's resource discovery
   (skills **and** project context files such as AGENTS.md) to the **parent**
   working directory. This only makes a difference under
   `isolation: worktree`, where default discovery would otherwise resolve
   against the worktree copy — e.g. uncommitted project skills would be
   invisible to the isolated child.
-- `skills: none` / `false` — currently does **not** disable native discovery
-  (a known drift from pi, where `false` means no skills; disabling would need
-  a Tau-side seam). It only means "no preloaded skill blocks".
+- `skills: none` / `false` — disables the child's skill discovery entirely
+  (no `<available_skills>` index, no `/skill:` expansion) when Tau supports
+  the `CodingSessionConfig.skills_enabled` seam (tau fork branch
+  `skills-seam`). Against an older Tau without the seam, the extension
+  feature-detects and falls back to the previous behavior: native discovery
+  stays on and this value only skips preloading.
 
 In `prompt_mode: append` the parent prompt prefix already carries the
 parent's skill index verbatim.
@@ -186,6 +193,20 @@ are delivered:
 Foreground agents never join groups. Members whose results were already read
 via `get_subagent_result` are skipped at delivery time. Groups need at least
 two members — a lone background agent always notifies individually.
+
+All completion notifications (individual and group) are held for 200ms before
+delivery; reading the result with `get_subagent_result` inside that window
+cancels the now-redundant notification.
+
+## Usage reporting
+
+Results and notifications include lightweight usage stats: tool uses, an
+estimated context size in tokens (Tau exposes a deterministic estimate of the
+child's context, not provider-billed token usage), and run duration. They
+appear in the foreground completion line (`Agent completed in <X>s (<N> tool
+uses, ~<K> context tokens).`), the `get_subagent_result` header (`Usage:`),
+the `<usage>` block of task notifications, and the `steer_subagent`
+confirmation's `Current state:` line.
 
 ## Concurrency and the background queue
 

@@ -11,19 +11,19 @@ built-in tool names, or `*`), `model`, `thinking` (a Tau thinking level),
 `max_turns`, `skills`, `prompt_mode` (`replace` or `append`), `memory`
 (`user`, `project`, or `local`), and `isolation` (`worktree`).
 
-Children always discover skills natively through Tau's own machinery.
+Children discover skills natively through Tau's own machinery by default.
 `skills: <csv>` additionally preloads the named skills' bodies into the
 system prompt; `skills: true`/`*`/`all` pins resource discovery (skills and
 project context files) to the parent cwd, which only matters under worktree
-isolation; `skills: none`/`false` does not disable native discovery — it only
-skips preloading.
+isolation; `skills: none`/`false` disables skill discovery entirely when Tau
+supports the `skills_enabled` config seam (otherwise it only skips
+preloading).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.thinking import THINKING_LEVELS
@@ -40,7 +40,7 @@ class AgentDefinition:
     model: str | None = None
     thinking: str | None = None
     max_turns: int | None = None
-    skills: tuple[str, ...] | Literal[True] | None = None
+    skills: tuple[str, ...] | bool | None = None
     prompt_mode: str = "replace"
     memory: str | None = None
     isolation: str | None = None
@@ -126,13 +126,21 @@ def _parse_tools(raw: str | None) -> tuple[str, ...] | None:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-def _parse_skills(raw: str | None) -> tuple[str, ...] | Literal[True] | None:
-    """Parse `skills:`: CSV = named preload, `true`/`*`/`all` = pin to parent cwd."""
+def _parse_skills(raw: str | None) -> tuple[str, ...] | bool | None:
+    """Parse `skills:` into four states.
+
+    None = omitted (Tau's native discovery, default); tuple = named preload;
+    True (`true`/`*`/`all`) = pin discovery to the parent cwd; False
+    (`none`/`false`) = disable skill discovery (needs Tau's skills_enabled
+    seam; otherwise same as omitted).
+    """
     if raw is None:
         return None
     stripped = raw.strip().lower()
-    if stripped in ("", "none", "false"):
+    if stripped == "":
         return None
+    if stripped in ("none", "false"):
+        return False
     if stripped in ("*", "all", "true"):
         return True
     return tuple(part.strip() for part in raw.split(",") if part.strip()) or None
