@@ -6,7 +6,13 @@ ports), within the capabilities of Tau's extension system — and extend Tau
 itself where a capability is genuinely missing.
 
 Written 2026-07-03 at the end of the session that built Tau's extension
-system and this initial port.
+system and this initial port. **Updated 2026-07-03 (second session):** all
+"buildable now" features below have been implemented and committed
+(4d866c6, 14ac035, b1b6f90); the remaining work is the Tau-capability-blocked
+list. Implementation-ready notes from that session (a full pi-subagents
+semantics spec extracted from source, and a Tau extension API reference) may
+still exist in the session scratchpad under `notes/`, but the code + README
+are now the source of truth.
 
 ## Where everything is
 
@@ -45,53 +51,77 @@ git clone --depth 20 https://github.com/tintinweb/pi-subagents.git reference/pi-
 
 ## Current state of this extension
 
+Modules: `extension.py` (orchestration: run lifecycle, queue, notifications),
+`agents.py` (agent-type definitions), `settings.py`, `prompts.py` (child
+prompt assembly + skills), `group_join.py` (notification batching),
+`worktree.py`, `memory.py`, `output_file.py`. 36 tests.
+
 - `agent` tool — spawns a scoped in-process `CodingSession` (in-memory
   transcript, `extensions_enabled=False` so no recursive spawning). Params:
-  `prompt`, `description`, `subagent_type`, `run_in_background`.
-- `get_subagent_result` tool — poll, or `wait=true` to block; claiming a
-  result suppresses the redundant background notification.
+  `prompt`, `description`, `subagent_type`, `run_in_background`,
+  `max_turns`, `resume`, `isolation`.
+- `get_subagent_result` tool — poll (queued runs report queued), or
+  `wait=true` to block through queued→running→done; claiming a result
+  suppresses the redundant background notification.
+- `steer_subagent` tool — injects a user message into a running child;
+  steers sent before the child session exists are queued and flushed.
 - `/agents` command — plain-text list of types and runs.
 - Agent types from `~/.tau/agents/*.md` and `<cwd>/.tau/agents/*.md`
-  (frontmatter: `description`, `tools`, `model`; body = system prompt).
+  (frontmatter: `description`, `tools`, `model`, `max_turns`, `skills`,
+  `prompt_mode`, `memory`, `isolation`; body = system prompt).
   Built-ins: `general`, `explore`.
+- Settings: `~/.tau/subagents.json` merged with `<cwd>/.tau/subagents.json`
+  (project wins): `maxConcurrent` (default 4), `defaultMaxTurns`,
+  `graceTurns` (5), `defaultJoinMode` (`smart`).
+- Concurrency: background runs beyond `maxConcurrent` queue FIFO and drain
+  as slots free; foreground runs bypass.
+- `max_turns` + grace: at the limit the child is steered to wrap up
+  (status `steered` if it does); `graceTurns` later it is hard-cancelled
+  (status `aborted`). Precedence: frontmatter ?? param ?? settings.
+- `resume`: finished runs keep sessions open for follow-up prompts (always
+  foreground; not for worktree runs). Stale consumed runs evicted after
+  10 min (session closed, record kept — deviation from pi, which deletes).
+- Join modes: same-100ms-window background spawns form a group; `smart`
+  delivers one consolidated notification (partial after 30s, stragglers on
+  a 15s cadence), `group` waits for all, `async` stays individual.
+- Worktree isolation: child runs in a detached `git worktree`; dirty
+  changes are committed to a `tau-agent-<id>` branch, surfaced in results
+  (including error terminals). Strict failure if cwd isn't a committed repo.
+- Output files: child transcripts stream as JSONL under
+  `<tmpdir>/tau-subagents-<uid>/…/tasks/<id>.jsonl`; path surfaced in spawn
+  results, notifications, and `get_subagent_result`.
+- Per-agent memory: `memory: user|project|local` injects a MEMORY.md block
+  (read-write if the agent has write/edit, else read-only).
+- Skill preloading (`skills:` CSV) + `prompt_mode: append` (parent prompt +
+  pi's verbatim bridge + env block + agent body; cache-friendly byte prefix).
+  `skills: true` full inheritance is NOT yet supported.
+- Run records: terminal transitions append a `subagents:record` custom
+  entry (best-effort) so history survives session resume.
 - Background completion → `<task-notification>` via
   `send_user_message(deliver_as="follow_up")`; when the parent session is
   idle this starts a new turn automatically.
-- Tests in `tests/` run against a Tau checkout:
-  `uv run --project ~/Documents/personal-projects/tau pytest tests/`
+- Tests must run against the extensions branch (the main clone is on
+  `personal`, which lacks `tau_coding.extensions`):
+  `uv run --project ~/.herdr/worktrees/tau/worktree-extensions pytest tests/`
 
 ## Gap analysis vs pi-subagents
 
-Buildable **now** with Tau's current extension API:
+Everything from the original "buildable now" list is done (see above).
+Smaller parity gaps that remain buildable in-extension, roughly in value
+order:
 
-- **`steer_subagent` tool** — child sessions expose `steer()`; pi queues
-  steers if the session isn't up yet (`pendingSteers`).
-- **`resume` param on `agent`** — keep completed runs' sessions (or persist
-  them) and allow follow-up prompts.
-- **`max_turns` + grace steering** — count `turn_end` events; at the limit
-  steer "wrap up now", hard-`cancel()` after N grace turns
-  (pi: `agent-runner.ts:615`). Tau's harness has no `max_turns` seam on
-  `CodingSessionConfig`, so do it via event counting.
-- **Concurrency queue** — pi defaults to 4 concurrent, queues the rest
-  (`agent-manager.ts`). Ours spawns unbounded.
-- **Join modes** — batch multiple same-turn background completions into one
-  consolidated notification (`group-join.ts`, "smart" mode with 30s partial
-  timeout).
-- **Worktree isolation** — `git worktree add` before the run, commit to a
-  branch after (`worktree.ts`); plain subprocess git, no Tau support needed.
-- **Skill preloading** (`skills:` frontmatter) — inject skill markdown into
-  the child's system prompt; Tau exposes `load_skills`/`format_skill_invocation`.
-- **Persistent per-agent memory** (`memory:` frontmatter) — pi keeps
-  `MEMORY.md` + files under `.pi/agent-memory/<name>/` (`memory.ts`).
-- **`prompt_mode: append`** — build the child prompt as parent system prompt
-  + bridge + agent body for KV-cache prefix reuse; parent prompt available
-  via `tau.context.system_prompt`.
-- **Settings file** — `~/.tau/subagents.json` merged with
-  `<cwd>/.tau/subagents.json` (concurrency, defaults), mirroring pi.
-- **Output files** — stream child transcripts to a tmp dir so
-  `get_subagent_result` can point at a full log (`output-file.ts`).
-- **Persist run records** — `await tau.append_entry("subagents:record", …)`
-  so runs survive resume (pi does this).
+- **`skills: true` / full skill inheritance** — inherit all discovered
+  skills into the child (we only support named CSV preloading).
+- **Per-call `model`/`thinking` params on the `agent` tool** — pi lets the
+  caller pick (frontmatter still wins); we only honor frontmatter `model`.
+- **`isolated` / `inherit_context` params** — pi's no-extension-tools mode
+  and parent-conversation forking.
+- **Usage/token accounting** — pi surfaces tokens, context %, compactions
+  in notifications and steer results; we only track turns/tool calls.
+- **pi's 200ms nudge debounce** for individual notifications (we deliver
+  directly; group batching covers the main case).
+- **Cron scheduling** — buildable in-extension today, but pi's UX leans on
+  settings UI; decide scope first.
 
 **Currently blocked on Tau capabilities** — but not dead ends. If a feature
 here is limited by Tau's extension implementation, **extend Tau**: branch
@@ -111,8 +141,6 @@ for what's missing, not a fence. Known gaps and where they'd land:
 - Interactive `/agents` menu, live agent widget, conversation viewer —
   needs extension UI surfaces on the `UiBridge` (dialogs first: `select` /
   `confirm` / `input`; widgets/overlays after).
-- Cron scheduling — buildable in-extension today, but pi's UX leans on
-  settings UI; decide scope first.
 
 ## Working agreement with the tau repo
 
@@ -154,10 +182,16 @@ for what's missing, not a fence. Known gaps and where they'd land:
 ## Live smoke test
 
 ```bash
-cd ~/Documents/personal-projects/tau  # or the worktree
+# Interactive (must run against the extensions branch/worktree):
+cd ~/.herdr/worktrees/tau/worktree-extensions
 uv run tau -x ~/Documents/personal-projects/tau-subagents
 # "Spawn an explore subagent to summarize this repo's architecture."
 # /agents  — check the run shows up
+
+# Headless (verified working 2026-07-03):
+cd ~/Documents/personal-projects/tau-subagents
+uv run --project ~/.herdr/worktrees/tau/worktree-extensions tau -x . \
+  -p "Use the agent tool to spawn an 'explore' subagent to summarize this repo."
 ```
 
 The default provider (`openai-codex`, stored OAuth) works for real runs.
