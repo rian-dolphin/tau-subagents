@@ -98,8 +98,9 @@ here is limited by Tau's extension implementation, **extend Tau**: branch
 off `worktree-extensions` in the tau repo, make the edits that enable the
 capability (with tests, keeping the `tau_agent` purity boundary and the
 existing gate green), and build the feature in this repo against that
-branch. The design doc's non-goals list is the tracker for what's missing,
-not a fence. Known gaps and where they'd land:
+branch. Design such capabilities from Pi's implementation first (see the
+working agreement below). The design doc's non-goals list is the tracker
+for what's missing, not a fence. Known gaps and where they'd land:
 
 - Live progress for foreground agents — needs partial tool-result streaming:
   emit the already-defined `ToolExecutionUpdateEvent` from `tau_agent`'s
@@ -128,6 +129,17 @@ not a fence. Known gaps and where they'd land:
   `worktree-extensions` is a clean candidate for upstreaming (personal
   tweaks were deliberately rebased out), so capability work should stay
   cleanly stacked on it.
+- **Pi is the blueprint for new Tau capabilities.** Before designing any
+  Tau feature added to support this extension, read how Pi implements it
+  (`reference/pi`, usually `packages/coding-agent/src/core/extensions/` and
+  `docs/extensions.md`) and port that design unless there is a strictly
+  better way — "different" is not "better", and Tau is deliberately a
+  Python port of Pi's architecture, so API names, semantics (first-wins,
+  chaining order, fail-safe blocking), and event shapes should match Pi's
+  wherever they translate. Where Pi's approach genuinely doesn't translate
+  (TypeScript-isms, its jiti loader, npm packaging), record the deviation
+  and the reason in the tau design doc the way the existing **Ruling:**
+  notes do.
 - Tau's verification gate: `uv run pytest && uv run ruff check . && uv run mypy`
   (4 pre-existing mypy errors in `tui/widgets.py`/`tui/app.py` are known;
   2 pre-existing ruff errors in `tests/test_coding_session.py` /
