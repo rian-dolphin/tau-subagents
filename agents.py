@@ -27,6 +27,7 @@ class AgentDefinition:
     system_prompt: str | None = None
     tools: tuple[str, ...] | None = None
     model: str | None = None
+    max_turns: int | None = None
 
 
 DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
@@ -86,6 +87,7 @@ def _load_definition(path: Path) -> AgentDefinition | None:
         system_prompt=body.strip() or None,
         tools=tools,
         model=metadata.get("model") or None,
+        max_turns=_parse_max_turns(metadata.get("max_turns")),
     )
 
 
@@ -93,3 +95,14 @@ def _parse_tools(raw: str | None) -> tuple[str, ...] | None:
     if raw is None or raw.strip() in ("", "*", "all"):
         return None
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _parse_max_turns(raw: str | None) -> int | None:
+    """Parse a non-negative int turn limit (0 = unlimited); invalid → None."""
+    if raw is None:
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None

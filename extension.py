@@ -2,11 +2,14 @@
 
 Registers an `agent` tool that spawns autonomous subagents in-process (a
 scoped `CodingSession` with its own tools and system prompt), a
-`get_subagent_result` tool for background runs, and an `/agents` command.
+`get_subagent_result` tool for background runs, a `steer_subagent` tool for
+redirecting live runs, and an `/agents` command.
 
 Foreground agents block and return their final assistant text. Background
 agents return an id immediately and deliver a `<task-notification>` back into
-the parent conversation when they finish.
+the parent conversation when they finish. Only background agents count toward
+the `maxConcurrent` limit; excess background spawns are queued FIFO and started
+as slots free up.
 
 Install by copying this directory into `~/.tau/extensions/subagents/`, or run:
 
@@ -16,6 +19,8 @@ Install by copying this directory into `~/.tau/extensions/subagents/`, or run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,11 +38,18 @@ from tau_coding.provider_runtime import create_model_provider
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
+from .settings import SubagentSettings, load_subagent_settings
 
 if TYPE_CHECKING:
     from tau_agent.events import AgentEvent
 
 RESULT_TRUNCATION_CHARS = 4_000
+STALE_AFTER_SECONDS = 600.0
+TERMINAL_STATUSES = ("completed", "steered", "aborted", "error", "cancelled")
+SOFT_LIMIT_MESSAGE = (
+    "You have reached your turn limit. Wrap up immediately — provide your"
+    " final answer now."
+)
 
 
 class _MemoryStorage:
@@ -69,7 +81,15 @@ class AgentRun:
     tool_calls: int = 0
     task: asyncio.Task[None] | None = None
     session: CodingSession | None = None
-    result_consumed: bool = field(default=False)
+    provider: object | None = None
+    result_consumed: bool = False
+    completed_at: float | None = None
+    requested_max_turns: int | None = None
+    max_turns: int | None = None
+    grace_turns: int = 5
+    soft_limit_reached: bool = False
+    aborted: bool = False
+    pending_steers: list[str] = field(default_factory=list)
 
 
 class SubagentManager:
@@ -79,13 +99,26 @@ class SubagentManager:
         self._api = api
         self._runs: dict[str, AgentRun] = {}
         self._counter = 0
+        self._settings: SubagentSettings | None = None
+        self._running_background = 0
+        self._queue: list[tuple[AgentRun, AgentDefinition]] = []
+        self._shutting_down = False
 
     @property
     def runs(self) -> dict[str, AgentRun]:
         return self._runs
 
+    @property
+    def max_concurrent(self) -> int:
+        return self._get_settings().max_concurrent
+
     def definitions(self) -> dict[str, AgentDefinition]:
         return load_agent_definitions(self._api.context.cwd)
+
+    def _get_settings(self) -> SubagentSettings:
+        if self._settings is None:
+            self._settings = load_subagent_settings(self._api.context.cwd)
+        return self._settings
 
     def spawn(
         self,
@@ -94,6 +127,7 @@ class SubagentManager:
         prompt: str,
         description: str,
         background: bool,
+        max_turns: int | None = None,
     ) -> AgentRun:
         self._counter += 1
         run = AgentRun(
@@ -102,19 +136,105 @@ class SubagentManager:
             description=description,
             prompt=prompt,
             background=background,
+            requested_max_turns=max_turns,
         )
         self._runs[run.agent_id] = run
-        run.task = asyncio.get_running_loop().create_task(
-            self._run_agent(run, agent_type)
-        )
+        if background and self._running_background >= self.max_concurrent:
+            run.status = "queued"
+            self._queue.append((run, agent_type))
+            return run
+        self._start(run, agent_type)
         return run
 
+    def _start(self, run: AgentRun, definition: AgentDefinition) -> None:
+        run.status = "running"
+        if run.background:
+            self._running_background += 1
+        run.task = asyncio.get_running_loop().create_task(
+            self._run_agent(run, definition)
+        )
+
+    def _drain_queue(self) -> None:
+        if self._shutting_down:
+            return
+        while self._queue and self._running_background < self.max_concurrent:
+            run, definition = self._queue.pop(0)
+            if run.status != "queued":
+                continue
+            self._start(run, definition)
+
+    async def resume(self, run: AgentRun, prompt: str) -> None:
+        """Resume a finished run's live session with a follow-up prompt."""
+        session = run.session
+        assert session is not None
+        run.status = "running"
+        run.error = None
+        run.result_text = ""
+        run.aborted = False
+        run.soft_limit_reached = False
+        run.completed_at = None
+        final_text: list[str] = []
+        try:
+            async for event in session.prompt(prompt):
+                self._observe(run, event, final_text)
+            run.result_text = final_text[-1] if final_text else ""
+            if run.status == "running":
+                run.status = "completed"
+        except Exception as exc:  # noqa: BLE001 - report subagent failures as results
+            run.status = "error"
+            run.error = str(exc)
+        finally:
+            run.completed_at = time.monotonic()
+
     async def shutdown(self) -> None:
+        self._shutting_down = True
+        try:
+            for run, _definition in self._queue:
+                if run.status == "queued":
+                    run.status = "cancelled"
+                    run.completed_at = time.monotonic()
+            self._queue.clear()
+            pending: list[asyncio.Task[None]] = []
+            for run in self._runs.values():
+                if run.task is not None and not run.task.done():
+                    if run.session is not None:
+                        run.session.cancel()
+                    run.task.cancel()
+                    pending.append(run.task)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for run in self._runs.values():
+                await self.close_run(run)
+        finally:
+            self._shutting_down = False
+
+    async def evict_stale(self) -> None:
+        """Close sessions of consumed terminal runs older than the staleness cap."""
+        now = time.monotonic()
         for run in self._runs.values():
-            if run.task is not None and not run.task.done():
-                if run.session is not None:
-                    run.session.cancel()
-                run.task.cancel()
+            if run.session is None and run.provider is None:
+                continue
+            if run.status not in TERMINAL_STATUSES or not run.result_consumed:
+                continue
+            if run.completed_at is None or now - run.completed_at < STALE_AFTER_SECONDS:
+                continue
+            await self.close_run(run)
+
+    async def close_run(self, run: AgentRun) -> None:
+        session = run.session
+        if session is not None:
+            try:
+                await session.aclose()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+        closer = getattr(run.provider, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+        run.session = None
+        run.provider = None
 
     async def _run_agent(self, run: AgentRun, definition: AgentDefinition) -> None:
         try:
@@ -126,17 +246,23 @@ class SubagentManager:
             run.status = "error"
             run.error = str(exc)
         finally:
-            if run.background and run.status != "cancelled":
-                self._deliver_background_result(run)
+            run.completed_at = time.monotonic()
+            if run.background:
+                self._running_background -= 1
+                self._drain_queue()
+                if run.status != "cancelled":
+                    self._deliver_background_result(run)
 
     async def _execute(self, run: AgentRun, definition: AgentDefinition) -> None:
-        settings = load_provider_settings()
-        selection = resolve_provider_selection(settings, model=definition.model)
+        settings = self._get_settings()
+        provider_settings = load_provider_settings()
+        selection = resolve_provider_selection(provider_settings, model=definition.model)
         provider = create_model_provider(
             selection.provider,
             model=selection.model,
             thinking_level=DEFAULT_THINKING_LEVEL,
         )
+        run.provider = provider
         session = await CodingSession.load(
             CodingSessionConfig(
                 provider=provider,
@@ -151,24 +277,42 @@ class SubagentManager:
             )
         )
         run.session = session
-        try:
-            if definition.tools is not None:
-                allowed = set(definition.tools)
-                session._harness.config.tools = [  # noqa: SLF001 - scoped tool gating
-                    tool for tool in session._harness.config.tools if tool.name in allowed
-                ]
-            final_text: list[str] = []
-            async for event in session.prompt(run.prompt):
-                self._observe(run, event, final_text)
-            run.result_text = final_text[-1] if final_text else ""
-            if run.status == "running":
-                run.status = "completed"
-        finally:
-            await session.aclose()
-            closer = getattr(provider, "aclose", None)
-            if closer is not None:
-                await closer()
-            run.session = None
+        for message in run.pending_steers:
+            session.queue_steering_message(message)
+        run.pending_steers.clear()
+        run.max_turns = _effective_max_turns(
+            definition.max_turns, run.requested_max_turns, settings.default_max_turns
+        )
+        run.grace_turns = settings.grace_turns
+        if definition.tools is not None:
+            allowed = set(definition.tools)
+            session._harness.config.tools = [  # noqa: SLF001 - scoped tool gating
+                tool for tool in session._harness.config.tools if tool.name in allowed
+            ]
+        final_text: list[str] = []
+        async for event in session.prompt(run.prompt):
+            self._observe(run, event, final_text)
+            if event.type == "turn_end":
+                self._enforce_turn_limit(run)
+        run.result_text = final_text[-1] if final_text else ""
+        if run.aborted:
+            run.status = "aborted"
+        elif run.status == "running":
+            run.status = "steered" if run.soft_limit_reached else "completed"
+
+    def _enforce_turn_limit(self, run: AgentRun) -> None:
+        if run.max_turns is None or run.session is None:
+            return
+        if not run.soft_limit_reached and run.turns >= run.max_turns:
+            run.soft_limit_reached = True
+            run.session.queue_steering_message(SOFT_LIMIT_MESSAGE)
+        elif (
+            run.soft_limit_reached
+            and not run.aborted
+            and run.turns >= run.max_turns + run.grace_turns
+        ):
+            run.aborted = True
+            run.session.cancel()
 
     def _observe(self, run: AgentRun, event: AgentEvent, final_text: list[str]) -> None:
         if event.type == "turn_end":
@@ -188,12 +332,50 @@ class SubagentManager:
             return
         self._api.notify(
             f"Subagent {run.agent_id} ({run.description}) {run.status}.",
-            "info" if run.status == "completed" else "warning",
+            "info" if run.status in ("completed", "steered") else "warning",
         )
         self._api.send_user_message(
             format_task_notification(run),
             deliver_as="follow_up",
         )
+
+
+def _effective_max_turns(
+    frontmatter: int | None, param: int | None, default: int | None
+) -> int | None:
+    """Resolve the turn limit: frontmatter wins over param wins over default."""
+    if frontmatter is not None:
+        raw = frontmatter
+    elif param is not None:
+        raw = param
+    else:
+        raw = default
+    if raw is None or raw <= 0:
+        return None
+    return max(1, raw)
+
+
+def format_background_spawn(run: AgentRun, max_concurrent: int) -> str:
+    """Format the tool result for a background spawn (started or queued)."""
+    started = run.status != "queued"
+    lines = [
+        "Agent started in background." if started else "Agent queued in background.",
+        f"Agent ID: {run.agent_id}",
+        f"Type: {run.agent_type}",
+        f"Description: {run.description}",
+    ]
+    if not started:
+        lines.append(f"Position: queued (max {max_concurrent} concurrent)")
+    lines.extend(
+        [
+            "",
+            "You will be notified when this agent completes.",
+            "Use get_subagent_result to retrieve full results, or steer_subagent"
+            " to send it messages.",
+            "Do not duplicate this agent's work.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def format_task_notification(run: AgentRun) -> str:
@@ -227,6 +409,11 @@ def setup(tau: ExtensionAPI) -> None:
     manager = SubagentManager(tau)
 
     async def run_agent_tool(arguments, signal=None):  # noqa: ANN001, ANN202
+        await manager.evict_stale()
+        resume_id = arguments.get("resume")
+        if resume_id:
+            return await run_resume(str(resume_id), arguments)
+
         definitions = manager.definitions()
         agent_type = str(arguments.get("subagent_type", "general"))
         definition = definitions.get(agent_type)
@@ -242,22 +429,20 @@ def setup(tau: ExtensionAPI) -> None:
             return _tool_result("agent", ok=False, content="prompt is required")
         description = str(arguments.get("description", "")) or f"{agent_type} agent"
         background = bool(arguments.get("run_in_background", False))
+        max_turns = _coerce_max_turns(arguments.get("max_turns"))
 
         run = manager.spawn(
             agent_type=definition,
             prompt=prompt,
             description=description,
             background=background,
+            max_turns=max_turns,
         )
         if background:
             return _tool_result(
                 "agent",
                 ok=True,
-                content=(
-                    f"Spawned background agent {run.agent_id} ({description}). "
-                    "A <task-notification> will arrive when it finishes; use"
-                    " get_subagent_result to poll or wait explicitly."
-                ),
+                content=format_background_spawn(run, manager.max_concurrent),
             )
 
         assert run.task is not None
@@ -266,24 +451,44 @@ def setup(tau: ExtensionAPI) -> None:
                 if run.session is not None:
                     run.session.cancel()
                 run.task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run.task
+                await manager.close_run(run)
                 return _tool_result("agent", ok=False, content="Subagent cancelled")
             await asyncio.sleep(0.05)
 
-        if run.status == "completed":
-            content = run.result_text or "(subagent produced no output)"
+        return _foreground_result(run)
+
+    async def run_resume(agent_id: str, arguments) -> AgentToolResult:  # noqa: ANN001
+        run = manager.runs.get(agent_id)
+        if run is None:
             return _tool_result(
                 "agent",
-                ok=True,
-                content=f"{format_run_summary(run)}\n\n{content}",
+                ok=False,
+                content=f'Agent not found: "{agent_id}". It may have been cleaned up.',
             )
-        return _tool_result(
-            "agent",
-            ok=False,
-            content=f"{format_run_summary(run)}\n\n{run.error or 'subagent failed'}",
-        )
+        if run.task is not None and not run.task.done():
+            return _tool_result(
+                "agent",
+                ok=False,
+                content=f'Agent "{agent_id}" is still running.'
+                " Use steer_subagent to redirect it.",
+            )
+        if run.session is None:
+            return _tool_result(
+                "agent",
+                ok=False,
+                content=f'Agent "{agent_id}" has no active session to resume.',
+            )
+        prompt = str(arguments.get("prompt", "")).strip()
+        if not prompt:
+            return _tool_result("agent", ok=False, content="prompt is required")
+        await manager.resume(run, prompt)
+        return _foreground_result(run)
 
     async def run_get_result_tool(arguments, signal=None):  # noqa: ANN001, ANN202
         del signal
+        await manager.evict_stale()
         agent_id = str(arguments.get("agent_id", ""))
         run = manager.runs.get(agent_id)
         if run is None:
@@ -293,12 +498,22 @@ def setup(tau: ExtensionAPI) -> None:
                 ok=False,
                 content=f"Unknown agent_id: {agent_id}. Known agents: {known}",
             )
-        if bool(arguments.get("wait", False)) and run.task is not None and not run.task.done():
+        if bool(arguments.get("wait", False)) and run.status in ("running", "queued"):
             # Claim the result before waiting so the background completion
-            # path skips its redundant follow-up notification.
+            # path skips its redundant follow-up notification. Poll on status
+            # rather than the task so a queued run is followed through its
+            # queued -> started -> finished transitions.
             run.result_consumed = True
-            await asyncio.wait({run.task})
-        if run.task is not None and not run.task.done():
+            while run.status in ("running", "queued"):
+                await asyncio.sleep(0.05)
+        if run.status == "queued":
+            return _tool_result(
+                "get_subagent_result",
+                ok=True,
+                content=f"{format_run_summary(run)}\n\n"
+                f"Still queued (max {manager.max_concurrent} concurrent).",
+            )
+        if run.status == "running":
             return _tool_result(
                 "get_subagent_result",
                 ok=True,
@@ -308,8 +523,43 @@ def setup(tau: ExtensionAPI) -> None:
         body = run.error if run.status == "error" else run.result_text
         return _tool_result(
             "get_subagent_result",
-            ok=run.status == "completed",
+            ok=run.status in ("completed", "steered"),
             content=f"{format_run_summary(run)}\n\n{body or '(no output)'}",
+        )
+
+    async def run_steer_tool(arguments, signal=None):  # noqa: ANN001, ANN202
+        del signal
+        agent_id = str(arguments.get("agent_id", ""))
+        message = str(arguments.get("message", ""))
+        run = manager.runs.get(agent_id)
+        if run is None:
+            return _tool_result(
+                "steer_subagent",
+                ok=False,
+                content=f'Agent not found: "{agent_id}". It may have been cleaned up.',
+            )
+        if run.status not in ("running", "queued"):
+            return _tool_result(
+                "steer_subagent",
+                ok=False,
+                content=f'Agent "{agent_id}" is not running (status: {run.status}).'
+                " Cannot steer a non-running agent.",
+            )
+        if run.session is None:
+            run.pending_steers.append(message)
+            return _tool_result(
+                "steer_subagent",
+                ok=True,
+                content=f"Steering message queued for agent {agent_id}."
+                " It will be delivered once the session initializes.",
+            )
+        run.session.queue_steering_message(message)
+        return _tool_result(
+            "steer_subagent",
+            ok=True,
+            content=f"Steering message sent to agent {agent_id}."
+            " The agent will process it after its current tool execution.\n"
+            f"Current state: {run.tool_calls} tool uses",
         )
 
     def agents_command(args: str, context) -> str:  # noqa: ANN001
@@ -326,8 +576,11 @@ def setup(tau: ExtensionAPI) -> None:
         return "\n".join(lines)
 
     async def on_shutdown(event: SessionShutdownEvent) -> None:
-        if event.reason == "quit":
-            await manager.shutdown()
+        # Tear down on every shutdown reason (new/resume/branch/quit): runs
+        # belong to the outgoing transcript and would otherwise leak sessions.
+        del event
+        await manager.shutdown()
+        manager.runs.clear()
 
     type_list = format_agent_type_list(load_agent_definitions(Path.cwd()))
     tau.register_tool(
@@ -337,7 +590,9 @@ def setup(tau: ExtensionAPI) -> None:
                 "Spawn an autonomous subagent to handle a task. The subagent works"
                 " in its own context with its own tools and returns its final"
                 " report. Set run_in_background=true for long tasks; a completion"
-                " notification will arrive when it finishes.\n\nAvailable agent"
+                " notification will arrive when it finishes. Use steer_subagent to"
+                " redirect a running agent, and resume=<id> with a new prompt to"
+                " continue a finished agent's session.\n\nAvailable agent"
                 f" types:\n{type_list}"
             ),
             input_schema={
@@ -358,6 +613,17 @@ def setup(tau: ExtensionAPI) -> None:
                     "run_in_background": {
                         "type": "boolean",
                         "description": "Return immediately and notify on completion.",
+                    },
+                    "max_turns": {
+                        "type": "number",
+                        "minimum": 1,
+                        "description": "Soft turn limit; the agent is asked to wrap"
+                        " up, then hard-cancelled after a grace period.",
+                    },
+                    "resume": {
+                        "type": "string",
+                        "description": "Id of a finished agent to resume with this"
+                        " prompt (always runs foreground).",
                     },
                 },
                 "required": ["prompt", "description"],
@@ -387,12 +653,59 @@ def setup(tau: ExtensionAPI) -> None:
             executor=run_get_result_tool,
         )
     )
+    tau.register_tool(
+        AgentTool(
+            name="steer_subagent",
+            description=(
+                "Send a steering message to a running subagent. It will be"
+                " delivered after the agent's current tool execution and appear as"
+                " a user message in the agent's conversation."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The id of the running agent to steer.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The message to send. This will appear as a"
+                        " user message in the agent's conversation.",
+                    },
+                },
+                "required": ["agent_id", "message"],
+            },
+            executor=run_steer_tool,
+        )
+    )
     tau.register_command(
         "agents",
         agents_command,
         description="List subagent types and runs.",
     )
     tau.on("session_shutdown", on_shutdown)
+
+
+def _foreground_result(run: AgentRun) -> AgentToolResult:
+    if run.status in ("completed", "steered"):
+        content = run.result_text or "(subagent produced no output)"
+        return _tool_result(
+            "agent",
+            ok=True,
+            content=f"{format_run_summary(run)}\n\n{content}",
+        )
+    return _tool_result(
+        "agent",
+        ok=False,
+        content=f"{format_run_summary(run)}\n\n{run.error or 'subagent failed'}",
+    )
+
+
+def _coerce_max_turns(value) -> int | None:  # noqa: ANN001
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
 
 
 def _tool_result(name: str, *, ok: bool, content: str) -> AgentToolResult:
