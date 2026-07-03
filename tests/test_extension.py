@@ -6,6 +6,7 @@ Requires Tau's packages on the import path; run from a Tau checkout:
 """
 
 import asyncio
+import inspect
 import json
 import subprocess
 import sys
@@ -1470,6 +1471,32 @@ async def test_real_usage_accumulates_and_surfaces(tmp_path: Path) -> None:
     await _wait_for(lambda: session.followed_up)
     note = session.followed_up[0]
     assert "<usage><total_tokens>60</total_tokens><tool_uses>0</tool_uses>" in note
+
+
+async def test_foreground_progress_updates(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    provider = FakeProvider(
+        [_tool_call_stream("working", "t1"), _text_stream("Final answer")]
+    )
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    if "on_update" not in inspect.signature(agent_tool.execute).parameters:
+        pytest.skip("tau branch lacks the tool-progress seam")
+    updates: list[tuple[str, dict[str, object] | None]] = []
+
+    def on_update(message: str, data: dict[str, object] | None = None) -> None:
+        updates.append((message, data))
+
+    result = await agent_tool.execute(
+        {"prompt": "go", "description": "d"}, on_update=on_update
+    )
+
+    assert result.ok is True
+    assert any("turn" in message for message, _ in updates)
+    assert any(data is not None and data.get("tool_uses") == 1 for _, data in updates)
 
 
 async def test_consuming_within_nudge_window_suppresses_notification(

@@ -220,6 +220,18 @@ Token figures come in two flavors:
   deterministic chars/4 estimate of the child's current context size. Always
   available; the only token figure on Tau branches without the usage seam.
 
+## Live progress (foreground runs)
+
+On Tau branches with the `tool-progress` seam (branch `tool-progress`; an
+`on_update` callback on tool executors bridged to `ToolExecutionUpdateEvent`),
+the `agent` tool reports child activity live while a foreground run (or
+resume) is executing: one update per child tool start and per completed turn
+(`agent-1: read_file · turn 2 · 3 tool uses`), with structured `data`
+(`agent_id`, `type`, `turns`, `tool_uses`, and `total_tokens` when real usage
+is available). The TUI renders these as the tool call's progress line. On
+branches without the seam the callback is never supplied and runs behave as
+before.
+
 ## Concurrency and the background queue
 
 Only **background** agents count toward a concurrency limit (`maxConcurrent`,
