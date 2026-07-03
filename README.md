@@ -69,8 +69,50 @@ report vulnerabilities with file references.
 
 Project definitions win over user definitions with the same name.
 
-Agent-type frontmatter also supports `max_turns` (a non-negative integer soft
-turn limit; `0` means unlimited).
+Agent-type frontmatter also supports:
+
+- `max_turns` — non-negative integer soft turn limit (`0` = unlimited)
+- `skills` — comma-separated skill names to preload (see below)
+- `prompt_mode` — `replace` (default) or `append` (see below)
+
+## Skill preloading (`skills:` frontmatter)
+
+List skill names in an agent type's frontmatter (`skills: foo, bar`) and each
+is resolved through Tau's skill discovery (`~/.tau/skills/`,
+`<cwd>/.tau/skills/`, `.agents/skills/` — project overrides user) and injected
+into the child's system prompt as a `# Preloaded Skill: <name>` section. A
+missing skill becomes a `(Skill "<name>" not found)` placeholder. Full skill
+inheritance (`skills: true` / `*` / `all`) is not yet supported — those values
+are treated as "no preloaded skills".
+
+## `prompt_mode: append`
+
+By default (`replace`) the agent body becomes the child's base system prompt.
+With `prompt_mode: append` the child instead keeps the parent session's full
+system prompt as a byte-identical prefix, followed by a sub-agent bridge block
+(tool-usage etiquette), an `<active_agent name="..."/>` tag, an environment
+block (cwd, git branch, platform), the agent body wrapped in
+`<agent_instructions>`, and any preloaded skill sections. This makes the child
+behave like the parent with extra instructions layered on. If the parent
+prompt is unavailable, append mode falls back to replace-mode assembly.
+
+## Join modes (background notification batching)
+
+`defaultJoinMode` in settings controls how background completion notifications
+are delivered:
+
+- `smart` (default) / `group` — background agents spawned within a 100ms
+  window form a group; their completion notices are consolidated into one
+  "Background agent group completed" message. If some members are still
+  running 30s after the first finishes, a partial notification is sent
+  (`(partial — others still running)`) and the stragglers re-group on a 15s
+  cadence until everyone reports.
+- `async` — never batched; every agent notifies individually (one
+  `<task-notification>` follow-up each).
+
+Foreground agents never join groups. Members whose results were already read
+via `get_subagent_result` are skipped at delivery time. Groups need at least
+two members — a lone background agent always notifies individually.
 
 ## Concurrency and the background queue
 
@@ -119,7 +161,7 @@ user (missing or malformed files are ignored):
 | `maxConcurrent` | int 1–1024 | 4 | max concurrent background agents |
 | `defaultMaxTurns` | int 0–10000 | unlimited | default turn limit (`0` = unlimited) |
 | `graceTurns` | int 1–1000 | 5 | extra turns allowed after the soft limit |
-| `defaultJoinMode` | `async`\|`group`\|`smart` | `smart` | reserved for notification batching |
+| `defaultJoinMode` | `async`\|`group`\|`smart` | `smart` | background notification batching (see Join modes) |
 
 Out-of-range or wrong-typed values are silently dropped and the field keeps its
 default.

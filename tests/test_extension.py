@@ -101,6 +101,11 @@ def _patch_fake_provider(module: object, *, response: str) -> None:
     )
 
 
+def _prompts_module() -> object:
+    top = _extension_module()
+    return sys.modules[f"{top.__name__}.prompts"]  # type: ignore[attr-defined]
+
+
 def _agent_tool(runtime: ExtensionRuntime):  # noqa: ANN202
     return next(tool for tool in runtime.extension_tools if tool.name == "agent")
 
@@ -234,7 +239,9 @@ async def test_background_queue_limits_concurrency(tmp_path: Path) -> None:
     runtime.bind(session)
     module = _extension_module()
     module.load_subagent_settings = (  # type: ignore[attr-defined]
-        lambda cwd, home=None: module.SubagentSettings(max_concurrent=1)
+        lambda cwd, home=None: module.SubagentSettings(
+            max_concurrent=1, default_join_mode="async"
+        )
     )
     release = asyncio.Event()
     _patch_provider_sequence(
@@ -286,7 +293,9 @@ async def test_steer_queued_run_is_delivered_after_drain(tmp_path: Path) -> None
     runtime.bind(session)
     module = _extension_module()
     module.load_subagent_settings = (  # type: ignore[attr-defined]
-        lambda cwd, home=None: module.SubagentSettings(max_concurrent=1)
+        lambda cwd, home=None: module.SubagentSettings(
+            max_concurrent=1, default_join_mode="async"
+        )
     )
     release = asyncio.Event()
     queued_provider = FakeProvider([_text_stream("first"), _text_stream("second")])
@@ -319,7 +328,9 @@ async def test_get_result_reports_queued_and_wait_follows_drain(tmp_path: Path) 
     runtime.bind(session)
     module = _extension_module()
     module.load_subagent_settings = (  # type: ignore[attr-defined]
-        lambda cwd, home=None: module.SubagentSettings(max_concurrent=1)
+        lambda cwd, home=None: module.SubagentSettings(
+            max_concurrent=1, default_join_mode="async"
+        )
     )
     release = asyncio.Event()
     _patch_provider_sequence(
@@ -428,6 +439,306 @@ async def test_resume_continues_session(tmp_path: Path) -> None:
     unknown = await agent_tool.execute({"resume": "ghost", "prompt": "x"})
     assert unknown.ok is False
     assert 'Agent not found: "ghost". It may have been cleaned up.' in unknown.content
+
+
+async def test_group_join_full_delivery(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    delivered: list[tuple[list[object], bool]] = []
+    join = module.GroupJoinManager(  # type: ignore[attr-defined]
+        lambda records, partial: delivered.append((list(records), partial)),
+        group_timeout=5.0,
+        straggler_timeout=5.0,
+    )
+    first = SimpleNamespace(agent_id="a", result_consumed=False)
+    second = SimpleNamespace(agent_id="b", result_consumed=False)
+    loner = SimpleNamespace(agent_id="x", result_consumed=False)
+
+    join.register_group("g1", ["a", "b"])
+    assert join.on_agent_complete(loner) == "pass"
+    assert join.on_agent_complete(first) == "held"
+    assert join.on_agent_complete(second) == "delivered"
+    assert delivered == [([first, second], False)]
+    join.cancel_all()
+
+
+async def test_group_join_timeout_partial_then_straggler(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    delivered: list[tuple[list[object], bool]] = []
+    join = module.GroupJoinManager(  # type: ignore[attr-defined]
+        lambda records, partial: delivered.append((list(records), partial)),
+        group_timeout=0.05,
+        straggler_timeout=0.02,
+    )
+    first = SimpleNamespace(agent_id="a", result_consumed=False)
+    second = SimpleNamespace(agent_id="b", result_consumed=False)
+
+    join.register_group("g1", ["a", "b"])
+    assert join.on_agent_complete(first) == "held"
+    await asyncio.sleep(0.1)
+    assert delivered == [([first], True)]
+
+    # The remaining member is now a straggler group with its own timeout.
+    assert join.on_agent_complete(second) == "delivered"
+    assert delivered[1] == ([second], False)
+    join.cancel_all()
+
+
+async def test_group_join_skips_consumed_members(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    delivered: list[tuple[list[object], bool]] = []
+    join = module.GroupJoinManager(  # type: ignore[attr-defined]
+        lambda records, partial: delivered.append((list(records), partial)),
+        group_timeout=5.0,
+        straggler_timeout=5.0,
+    )
+    consumed = SimpleNamespace(agent_id="a", result_consumed=True)
+    fresh = SimpleNamespace(agent_id="b", result_consumed=False)
+    join.register_group("g1", ["a", "b"])
+    join.on_agent_complete(consumed)
+    assert join.on_agent_complete(fresh) == "delivered"
+    assert delivered == [([fresh], False)]
+
+    both_consumed = [
+        SimpleNamespace(agent_id="c", result_consumed=True),
+        SimpleNamespace(agent_id="d", result_consumed=True),
+    ]
+    join.register_group("g2", ["c", "d"])
+    for record in both_consumed:
+        join.on_agent_complete(record)
+    assert len(delivered) == 1  # all-consumed delivery is suppressed
+    join.cancel_all()
+
+
+async def test_smart_mode_consolidates_two_background_agents(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    _patch_provider_sequence(
+        module,
+        [
+            FakeProvider([_text_stream("First done")]),
+            FakeProvider([_text_stream("Second done")]),
+        ],
+    )
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "one", "description": "one", "run_in_background": True}
+    )
+    await agent_tool.execute(
+        {"prompt": "two", "description": "two", "run_in_background": True}
+    )
+
+    await _wait_for(lambda: session.followed_up)
+    await asyncio.sleep(0.2)
+    assert len(session.followed_up) == 1
+    note = session.followed_up[0]
+    assert "Background agent group completed: 2 agent(s) finished" in note
+    assert "(partial" not in note
+    assert "<agent-id>agent-1</agent-id>" in note
+    assert "<agent-id>agent-2</agent-id>" in note
+    assert "Use get_subagent_result for full output." in note
+
+
+async def test_async_mode_sends_individual_notifications(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    module.load_subagent_settings = (  # type: ignore[attr-defined]
+        lambda cwd, home=None: module.SubagentSettings(default_join_mode="async")
+    )
+    _patch_provider_sequence(
+        module,
+        [
+            FakeProvider([_text_stream("First done")]),
+            FakeProvider([_text_stream("Second done")]),
+        ],
+    )
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "one", "description": "one", "run_in_background": True}
+    )
+    await agent_tool.execute(
+        {"prompt": "two", "description": "two", "run_in_background": True}
+    )
+
+    await _wait_for(lambda: len(session.followed_up) >= 2)
+    await asyncio.sleep(0.2)
+    assert len(session.followed_up) == 2
+    assert all("<task-notification>" in note for note in session.followed_up)
+    assert not any("agent group completed" in note for note in session.followed_up)
+
+
+async def test_smart_mode_partial_delivery_then_straggler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    monkeypatch.setattr(module, "GROUP_TIMEOUT_SECONDS", 0.15)
+    monkeypatch.setattr(module, "STRAGGLER_TIMEOUT_SECONDS", 0.05)
+    release = asyncio.Event()
+    _patch_provider_sequence(
+        module,
+        [
+            BlockingProvider(release, "Slow done"),
+            FakeProvider([_text_stream("Fast done")]),
+        ],
+    )
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "slow", "description": "slow", "run_in_background": True}
+    )
+    await agent_tool.execute(
+        {"prompt": "fast", "description": "fast", "run_in_background": True}
+    )
+
+    await _wait_for(lambda: session.followed_up)
+    partial_note = session.followed_up[0]
+    assert "1 agent(s) finished (partial — others still running)" in partial_note
+    assert "<agent-id>agent-2</agent-id>" in partial_note
+
+    release.set()
+    await _wait_for(lambda: len(session.followed_up) >= 2)
+    straggler_note = session.followed_up[1]
+    assert "1 agent(s) finished" in straggler_note
+    assert "(partial" not in straggler_note
+    assert "<agent-id>agent-1</agent-id>" in straggler_note
+
+
+async def test_build_child_system_prompt_append_mode(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    prompts = _prompts_module()
+    definition = module.AgentDefinition(  # type: ignore[attr-defined]
+        name="helper",
+        description="d",
+        system_prompt="Do things.",
+        prompt_mode="append",
+    )
+
+    environment = await prompts.detect_environment(tmp_path)  # type: ignore[attr-defined]
+    assert environment == (
+        "# Environment\n"
+        f"Working directory: {tmp_path}\n"
+        "Not a git repository\n"
+        f"Platform: {sys.platform}"
+    )
+
+    prompt = module.build_child_system_prompt(  # type: ignore[attr-defined]
+        definition,
+        parent_prompt="PARENT PROMPT.",
+        environment=environment,
+        skill_blocks=[("foo", "FOO BLOCK")],
+    )
+
+    expected_prefix = (
+        "PARENT PROMPT.\n\n"
+        f"{prompts.SUB_AGENT_BRIDGE}\n\n"  # type: ignore[attr-defined]
+        '<active_agent name="helper"/>\n\n'
+        f"{environment}"
+    )
+    assert prompt.startswith(expected_prefix)
+    assert "<agent_instructions>\nDo things.\n</agent_instructions>" in prompt
+    # pi's extras suffix layout: three newlines before the first skill header.
+    assert prompt.endswith("\n\n\n# Preloaded Skill: foo\nFOO BLOCK")
+
+    # Without a body there is no <agent_instructions> section.
+    bodyless = module.AgentDefinition(  # type: ignore[attr-defined]
+        name="helper", description="d", prompt_mode="append"
+    )
+    prompt = module.build_child_system_prompt(  # type: ignore[attr-defined]
+        bodyless, parent_prompt="PARENT.", environment="ENV", skill_blocks=[]
+    )
+    assert "<agent_instructions>" not in prompt
+
+    # Without a parent prompt, append mode falls back to replace assembly.
+    fallback = module.build_child_system_prompt(  # type: ignore[attr-defined]
+        definition, parent_prompt=None, environment="", skill_blocks=[]
+    )
+    assert fallback == "Do things."
+
+
+async def test_build_child_system_prompt_replace_mode(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    definition = module.AgentDefinition(  # type: ignore[attr-defined]
+        name="helper", description="d", system_prompt="Body."
+    )
+
+    with_skills = module.build_child_system_prompt(  # type: ignore[attr-defined]
+        definition,
+        parent_prompt="PARENT.",
+        environment="",
+        skill_blocks=[("foo", "FOO BLOCK")],
+    )
+    assert with_skills == "Body.\n\n# Preloaded Skill: foo\nFOO BLOCK"
+
+    plain = module.AgentDefinition(name="helper", description="d")  # type: ignore[attr-defined]
+    assert (
+        module.build_child_system_prompt(  # type: ignore[attr-defined]
+            plain, parent_prompt="PARENT.", environment="", skill_blocks=[]
+        )
+        is None
+    )
+
+
+async def test_resolve_skill_blocks(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    cwd = tmp_path / "proj"
+    (cwd / ".tau" / "skills").mkdir(parents=True)
+    (cwd / ".tau" / "skills" / "foo.md").write_text(
+        "---\ndescription: Foo skill\n---\nAlways foo."
+    )
+    home = tmp_path / "empty-home"
+
+    blocks = module.resolve_skill_blocks(("foo", "missing"), cwd, home)  # type: ignore[attr-defined]
+
+    assert blocks[0][0] == "foo"
+    assert '<skill name="foo"' in blocks[0][1]
+    assert "Always foo." in blocks[0][1]
+    assert blocks[1] == ("missing", '(Skill "missing" not found)')
+
+
+async def test_spawn_injects_skills_and_append_prompt(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    (tmp_path / ".tau" / "skills").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "myskill.md").write_text("Skill body here.")
+    (tmp_path / ".tau" / "agents").mkdir(parents=True)
+    (tmp_path / ".tau" / "agents" / "skilled.md").write_text(
+        "---\n"
+        "description: Skilled agent\n"
+        "skills: myskill\n"
+        "prompt_mode: append\n"
+        "---\n"
+        "Use the skill."
+    )
+    provider = FakeProvider([_text_stream("done")])
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "go", "description": "go", "subagent_type": "skilled"}
+    )
+
+    assert result.ok is True
+    system = provider.calls[0][1]
+    assert system.startswith("You are Tau.\n\n<sub_agent_context>")
+    assert "<agent_instructions>\nUse the skill.\n</agent_instructions>" in system
+    assert "# Preloaded Skill: myskill" in system
+    assert '<skill name="myskill"' in system
+    assert "Skill body here." in system
 
 
 def test_extension_loads(tmp_path: Path) -> None:

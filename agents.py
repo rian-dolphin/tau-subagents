@@ -7,7 +7,8 @@ Agent types are markdown files with frontmatter, mirroring pi-subagents:
 
 The filename is the type name, the body is the subagent's system prompt, and
 frontmatter supports `description`, `tools` (comma-separated allow-list of
-built-in tool names, or `*`), and `model`.
+built-in tool names, or `*`), `model`, `max_turns`, `skills` (comma-separated
+skill names to preload), and `prompt_mode` (`replace` or `append`).
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ class AgentDefinition:
     tools: tuple[str, ...] | None = None
     model: str | None = None
     max_turns: int | None = None
+    skills: tuple[str, ...] | None = None
+    prompt_mode: str = "replace"
 
 
 DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
@@ -88,6 +91,8 @@ def _load_definition(path: Path) -> AgentDefinition | None:
         tools=tools,
         model=metadata.get("model") or None,
         max_turns=_parse_max_turns(metadata.get("max_turns")),
+        skills=_parse_skills(metadata.get("skills")),
+        prompt_mode="append" if metadata.get("prompt_mode") == "append" else "replace",
     )
 
 
@@ -95,6 +100,16 @@ def _parse_tools(raw: str | None) -> tuple[str, ...] | None:
     if raw is None or raw.strip() in ("", "*", "all"):
         return None
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _parse_skills(raw: str | None) -> tuple[str, ...] | None:
+    """Parse the `skills:` CSV; full inheritance (`*`/`all`/`true`) not yet supported."""
+    if raw is None:
+        return None
+    stripped = raw.strip().lower()
+    if stripped in ("", "none", "false", "*", "all", "true"):
+        return None
+    return tuple(part.strip() for part in raw.split(",") if part.strip()) or None
 
 
 def _parse_max_turns(raw: str | None) -> int | None:

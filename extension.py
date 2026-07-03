@@ -38,12 +38,19 @@ from tau_coding.provider_runtime import create_model_provider
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
+from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
+from .prompts import build_child_system_prompt, detect_environment, resolve_skill_blocks
 from .settings import SubagentSettings, load_subagent_settings
 
 if TYPE_CHECKING:
     from tau_agent.events import AgentEvent
 
-RESULT_TRUNCATION_CHARS = 4_000
+INDIVIDUAL_RESULT_CHARS = 500
+GROUP_RESULT_CHARS = 300
+TRUNCATION_SUFFIX = "\n...(truncated, use get_subagent_result for full output)"
+BATCH_DEBOUNCE_SECONDS = 0.1
+GROUP_TIMEOUT_SECONDS = DEFAULT_TIMEOUT
+STRAGGLER_TIMEOUT_SECONDS = STRAGGLER_TIMEOUT
 STALE_AFTER_SECONDS = 600.0
 TERMINAL_STATUSES = ("completed", "steered", "aborted", "error", "cancelled")
 SOFT_LIMIT_MESSAGE = (
@@ -90,6 +97,7 @@ class AgentRun:
     soft_limit_reached: bool = False
     aborted: bool = False
     pending_steers: list[str] = field(default_factory=list)
+    join_mode: str | None = None
 
 
 class SubagentManager:
@@ -103,6 +111,10 @@ class SubagentManager:
         self._running_background = 0
         self._queue: list[tuple[AgentRun, AgentDefinition]] = []
         self._shutting_down = False
+        self._batch: list[AgentRun] = []
+        self._batch_timer: asyncio.TimerHandle | None = None
+        self._batch_counter = 0
+        self._group_join: GroupJoinManager | None = None
 
     @property
     def runs(self) -> dict[str, AgentRun]:
@@ -139,12 +151,50 @@ class SubagentManager:
             requested_max_turns=max_turns,
         )
         self._runs[run.agent_id] = run
+        if background:
+            run.join_mode = self._get_settings().default_join_mode
+            if run.join_mode in ("smart", "group"):
+                self._batch.append(run)
+                self._schedule_batch_finalize()
         if background and self._running_background >= self.max_concurrent:
             run.status = "queued"
             self._queue.append((run, agent_type))
             return run
         self._start(run, agent_type)
         return run
+
+    def _get_group_join(self) -> GroupJoinManager:
+        if self._group_join is None:
+            self._group_join = GroupJoinManager(
+                self._deliver_group_notification,
+                group_timeout=GROUP_TIMEOUT_SECONDS,
+                straggler_timeout=STRAGGLER_TIMEOUT_SECONDS,
+            )
+        return self._group_join
+
+    def _schedule_batch_finalize(self) -> None:
+        if self._batch_timer is not None:
+            self._batch_timer.cancel()
+        self._batch_timer = asyncio.get_running_loop().call_later(
+            BATCH_DEBOUNCE_SECONDS, self._finalize_batch
+        )
+
+    def _finalize_batch(self) -> None:
+        self._batch_timer = None
+        batch = self._batch
+        self._batch = []
+        if len(batch) >= 2:
+            self._batch_counter += 1
+            self._get_group_join().register_group(
+                f"batch-{self._batch_counter}", [run.agent_id for run in batch]
+            )
+            for run in batch:
+                if run.status in TERMINAL_STATUSES and run.status != "cancelled":
+                    self._get_group_join().on_agent_complete(run)
+            return
+        for run in batch:
+            if run.status in TERMINAL_STATUSES and run.status != "cancelled":
+                self._deliver_background_result(run)
 
     def _start(self, run: AgentRun, definition: AgentDefinition) -> None:
         run.status = "running"
@@ -189,6 +239,12 @@ class SubagentManager:
     async def shutdown(self) -> None:
         self._shutting_down = True
         try:
+            if self._batch_timer is not None:
+                self._batch_timer.cancel()
+                self._batch_timer = None
+            self._batch.clear()
+            if self._group_join is not None:
+                self._group_join.cancel_all()
             for run, _definition in self._queue:
                 if run.status == "queued":
                     run.status = "cancelled"
@@ -250,8 +306,17 @@ class SubagentManager:
             if run.background:
                 self._running_background -= 1
                 self._drain_queue()
-                if run.status != "cancelled":
-                    self._deliver_background_result(run)
+                self._handle_background_completion(run)
+
+    def _handle_background_completion(self, run: AgentRun) -> None:
+        if run.status == "cancelled":
+            return
+        if run.join_mode in ("smart", "group"):
+            if any(pending is run for pending in self._batch):
+                return  # the batch finalizer will route this completion
+            if self._get_group_join().on_agent_complete(run) != "pass":
+                return
+        self._deliver_background_result(run)
 
     async def _execute(self, run: AgentRun, definition: AgentDefinition) -> None:
         settings = self._get_settings()
@@ -263,13 +328,32 @@ class SubagentManager:
             thinking_level=DEFAULT_THINKING_LEVEL,
         )
         run.provider = provider
+        cwd = self._api.context.cwd
+        skill_blocks = resolve_skill_blocks(definition.skills, cwd)
+        parent_prompt: str | None = None
+        if definition.prompt_mode == "append":
+            try:
+                parent_prompt = self._api.context.system_prompt
+            except Exception:  # noqa: BLE001 - fall back to replace-mode assembly
+                parent_prompt = None
+        environment = ""
+        if definition.prompt_mode == "append" and parent_prompt:
+            environment = await detect_environment(cwd)
+        prompt_text = build_child_system_prompt(
+            definition,
+            parent_prompt=parent_prompt,
+            environment=environment,
+            skill_blocks=skill_blocks,
+        )
+        append_active = definition.prompt_mode == "append" and bool(parent_prompt)
         session = await CodingSession.load(
             CodingSessionConfig(
                 provider=provider,
                 model=selection.model,
-                cwd=self._api.context.cwd,
+                cwd=cwd,
                 storage=_MemoryStorage(),
-                custom_system_prompt=definition.system_prompt,
+                system=prompt_text if append_active else None,
+                custom_system_prompt=None if append_active else prompt_text,
                 provider_name=selection.provider.name,
                 auto_compact_enabled=False,
                 # Subagents load no extensions, so they cannot spawn recursively.
@@ -330,14 +414,26 @@ class SubagentManager:
     def _deliver_background_result(self, run: AgentRun) -> None:
         if run.result_consumed:
             return
-        self._api.notify(
-            f"Subagent {run.agent_id} ({run.description}) {run.status}.",
-            "info" if run.status in ("completed", "steered") else "warning",
-        )
-        self._api.send_user_message(
-            format_task_notification(run),
-            deliver_as="follow_up",
-        )
+        try:
+            self._api.notify(
+                f"Subagent {run.agent_id} ({run.description}) {run.status}.",
+                "info" if run.status in ("completed", "steered") else "warning",
+            )
+            self._api.send_user_message(
+                f"{format_task_notification(run)}\n{COMPLETION_NOTICE}",
+                deliver_as="follow_up",
+            )
+        except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
+            pass
+
+    def _deliver_group_notification(self, records: list[AgentRun], partial: bool) -> None:
+        try:
+            self._api.send_user_message(
+                format_group_notification(records, partial=partial),
+                deliver_as="follow_up",
+            )
+        except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
+            pass
 
 
 def _effective_max_turns(
@@ -378,10 +474,18 @@ def format_background_spawn(run: AgentRun, max_concurrent: int) -> str:
     return "\n".join(lines)
 
 
-def format_task_notification(run: AgentRun) -> str:
-    """Format a background completion notice for the parent conversation."""
+COMPLETION_NOTICE = (
+    "This is an automated subagent completion notice, not a user message. "
+    "Use the result to continue the original task."
+)
+
+
+def format_task_notification(
+    run: AgentRun, max_result_chars: int = INDIVIDUAL_RESULT_CHARS
+) -> str:
+    """Format one run's completion as a <task-notification> block."""
     body = run.error if run.status == "error" else run.result_text
-    truncated = (body or "(no output)")[:RESULT_TRUNCATION_CHARS]
+    truncated = _truncate_result(body or "(no output)", max_result_chars)
     return (
         "<task-notification>\n"
         f"<agent-id>{run.agent_id}</agent-id>\n"
@@ -390,10 +494,29 @@ def format_task_notification(run: AgentRun) -> str:
         f"<status>{run.status}</status>\n"
         f"<turns>{run.turns}</turns>\n"
         f"<result>{truncated}</result>\n"
-        "</task-notification>\n"
-        "This is an automated subagent completion notice, not a user message. "
-        "Use the result to continue the original task."
+        "</task-notification>"
     )
+
+
+def format_group_notification(records: list[AgentRun], *, partial: bool) -> str:
+    """Format a consolidated completion notice for a group of runs."""
+    label = f"{len(records)} agent(s) finished"
+    if partial:
+        label += " (partial — others still running)"
+    blocks = "\n\n".join(
+        format_task_notification(run, GROUP_RESULT_CHARS) for run in records
+    )
+    return (
+        f"Background agent group completed: {label}\n\n"
+        f"{blocks}\n\n"
+        "Use get_subagent_result for full output."
+    )
+
+
+def _truncate_result(body: str, max_chars: int) -> str:
+    if len(body) > max_chars:
+        return body[:max_chars] + TRUNCATION_SUFFIX
+    return body
 
 
 def format_run_summary(run: AgentRun) -> str:
