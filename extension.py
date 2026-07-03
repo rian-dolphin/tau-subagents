@@ -120,6 +120,10 @@ class AgentRun:
     started_at: float | None = None
     completed_at: float | None = None
     context_tokens: int = 0
+    tokens_input: int = 0
+    tokens_output: int = 0
+    tokens_cache_write: int = 0
+    has_usage: bool = False
     requested_model: str | None = None
     requested_thinking: str | None = None
     requested_max_turns: int | None = None
@@ -414,6 +418,7 @@ class SubagentManager:
                     "error": run.error,
                     "turns": run.turns,
                     "tool_calls": run.tool_calls,
+                    "total_tokens": lifetime_tokens(run) if run.has_usage else None,
                 },
             )
         except Exception:  # noqa: BLE001 - record persistence is best-effort
@@ -571,8 +576,19 @@ class SubagentManager:
             run.tool_calls += 1
         elif event.type == "message_end":
             message = event.message
-            if getattr(message, "role", None) == "assistant" and message.content.strip():
-                final_text.append(message.content.strip())
+            if getattr(message, "role", None) == "assistant":
+                # Real billed usage (Tau provider-usage seam). Lifetime sum of
+                # input + output + cache_write per response; cache reads are
+                # excluded because each turn re-reads the whole cached prefix,
+                # so summing them counts the prefix N times (pi issue #38).
+                usage = getattr(message, "usage", None)
+                if usage is not None:
+                    run.tokens_input += getattr(usage, "input", 0) or 0
+                    run.tokens_output += getattr(usage, "output", 0) or 0
+                    run.tokens_cache_write += getattr(usage, "cache_write", 0) or 0
+                    run.has_usage = True
+                if message.content.strip():
+                    final_text.append(message.content.strip())
         elif event.type == "error" and not event.recoverable:
             run.status = "error"
             run.error = event.message
@@ -696,7 +712,10 @@ def format_task_notification(
     output_line = (
         f"<output-file>{run.output_file}</output-file>\n" if run.output_file else ""
     )
-    usage_parts = [f"<tool_uses>{run.tool_calls}</tool_uses>"]
+    usage_parts = []
+    if run.has_usage:
+        usage_parts.append(f"<total_tokens>{lifetime_tokens(run)}</total_tokens>")
+    usage_parts.append(f"<tool_uses>{run.tool_calls}</tool_uses>")
     if run.context_tokens:
         usage_parts.append(
             f"<context_tokens>{run.context_tokens}</context_tokens>"
@@ -747,9 +766,17 @@ def format_run_summary(run: AgentRun) -> str:
     )
 
 
+def lifetime_tokens(run: AgentRun) -> int:
+    """Lifetime billed tokens: input + output + cache_write (pi semantics)."""
+    return run.tokens_input + run.tokens_output + run.tokens_cache_write
+
+
 def format_usage_parts(run: AgentRun) -> str:
     """Format pi-style usage parts joined by middle dots."""
-    parts = [f"{run.tool_calls} tool uses"]
+    parts = []
+    if run.has_usage:
+        parts.append(f"{lifetime_tokens(run)} tokens")
+    parts.append(f"{run.tool_calls} tool uses")
     if run.context_tokens:
         parts.append(f"~{run.context_tokens} context tokens")
     duration = _duration_ms(run)
@@ -944,7 +971,10 @@ def setup(tau: ExtensionAPI) -> None:
                 " It will be delivered once the session initializes.",
             )
         run.session.queue_steering_message(message)
-        state_parts = [f"{run.tool_calls} tool uses"]
+        state_parts = []
+        if run.has_usage:
+            state_parts.append(f"{lifetime_tokens(run)} tokens")
+        state_parts.append(f"{run.tool_calls} tool uses")
         with contextlib.suppress(Exception):
             state_parts.append(
                 f"~{run.session.context_token_estimate} context tokens"
@@ -1105,9 +1135,12 @@ def _foreground_result(run: AgentRun) -> AgentToolResult:
         content = run.result_text or "(subagent produced no output)"
         duration = _duration_ms(run)
         seconds = f"{duration / 1000:.1f}" if duration is not None else "?"
-        tokens_note = (
-            f", ~{run.context_tokens} context tokens" if run.context_tokens else ""
-        )
+        if run.has_usage:
+            tokens_note = f", {lifetime_tokens(run)} tokens"
+        elif run.context_tokens:
+            tokens_note = f", ~{run.context_tokens} context tokens"
+        else:
+            tokens_note = ""
         completed_line = (
             f"Agent completed in {seconds}s"
             f" ({run.tool_calls} tool uses{tokens_note})."

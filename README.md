@@ -200,13 +200,25 @@ cancels the now-redundant notification.
 
 ## Usage reporting
 
-Results and notifications include lightweight usage stats: tool uses, an
-estimated context size in tokens (Tau exposes a deterministic estimate of the
-child's context, not provider-billed token usage), and run duration. They
-appear in the foreground completion line (`Agent completed in <X>s (<N> tool
-uses, ~<K> context tokens).`), the `get_subagent_result` header (`Usage:`),
-the `<usage>` block of task notifications, and the `steer_subagent`
-confirmation's `Current state:` line.
+Results and notifications include usage stats: tool uses, tokens, an
+estimated context size, and run duration. They appear in the foreground
+completion line (`Agent completed in <X>s (<N> tool uses, <K> tokens).`),
+the `get_subagent_result` header (`Usage:`), the `<usage>` block of task
+notifications (`<total_tokens>`), and the `steer_subagent` confirmation's
+`Current state:` line.
+
+Token figures come in two flavors:
+
+- **Real billed tokens** (`<total_tokens>`, `<K> tokens`) — available when Tau
+  has the `provider-usage` seam (branch `provider-usage`; usage fields on
+  `AssistantMessage` populated by the provider adapters). Following pi's
+  semantics, the lifetime total sums `input + output + cache_write` per
+  assistant response; cache *reads* are excluded because each turn re-reads
+  the whole cached prefix, so summing them would count the prefix once per
+  turn (pi issue #38).
+- **Context estimate** (`~<K> context tokens`, `<context_tokens>`) — Tau's
+  deterministic chars/4 estimate of the child's current context size. Always
+  available; the only token figure on Tau branches without the usage seam.
 
 ## Concurrency and the background queue
 

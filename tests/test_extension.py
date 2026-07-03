@@ -15,6 +15,11 @@ from types import SimpleNamespace
 import pytest
 
 from tau_agent.messages import AssistantMessage, UserMessage
+
+try:  # provider-usage seam (tau branch `provider-usage`)
+    from tau_agent.messages import Usage
+except ImportError:  # pragma: no cover - tau branch without the usage seam
+    Usage = None  # type: ignore[assignment, misc]
 from tau_agent.tools import ToolCall
 from tau_ai import (
     FakeProvider,
@@ -1402,6 +1407,69 @@ async def test_usage_surfaced_in_results_and_notifications(tmp_path: Path) -> No
     note = session.followed_up[0]
     assert "<usage><tool_uses>0</tool_uses><context_tokens>" in note
     assert "<duration_ms>" in note
+
+
+def _usage_stream(
+    text: str, input_tokens: int, output: int, cache_write: int
+) -> list[object]:
+    return [
+        ProviderResponseStartEvent(model="fake"),
+        ProviderResponseEndEvent(
+            message=AssistantMessage(
+                content=text,
+                usage=Usage(
+                    input=input_tokens,
+                    output=output,
+                    cache_write=cache_write,
+                    # cache_read must be excluded from lifetime totals.
+                    cache_read=999,
+                ),
+            )
+        ),
+    ]
+
+
+async def test_real_usage_accumulates_and_surfaces(tmp_path: Path) -> None:
+    if Usage is None:
+        pytest.skip("tau branch lacks the provider-usage seam")
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    _patch_provider_sequence(
+        module,
+        [
+            FakeProvider(
+                [
+                    _usage_stream("fg done", 100, 20, 7),
+                    _usage_stream("resumed done", 30, 10, 3),
+                ]
+            ),
+            FakeProvider([_usage_stream("bg done", 50, 10, 0)]),
+        ],
+    )
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute({"prompt": "fg", "description": "fg"})
+    assert "(0 tool uses, 127 tokens)." in result.content
+
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    fetched = await get_result.execute({"agent_id": "agent-1"})
+    assert "Usage: 127 tokens · 0 tool uses" in fetched.content
+
+    # Resume keeps accumulating into the lifetime total (127 + 43 = 170),
+    # matching pi, which preserves lifetimeUsage across resume.
+    resumed = await agent_tool.execute({"resume": "agent-1", "prompt": "more"})
+    assert "(0 tool uses, 170 tokens)." in resumed.content
+
+    await agent_tool.execute(
+        {"prompt": "bg", "description": "bg", "run_in_background": True}
+    )
+    await _wait_for(lambda: session.followed_up)
+    note = session.followed_up[0]
+    assert "<usage><total_tokens>60</total_tokens><tool_uses>0</tool_uses>" in note
 
 
 async def test_consuming_within_nudge_window_suppresses_notification(
