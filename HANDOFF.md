@@ -114,20 +114,28 @@ full-body preloading, `skills: true` pins discovery to the parent cwd
 (only matters under worktree isolation), and `skills: none` cannot disable
 discovery — see README.
 
+Also done since (bdfc94b): usage reporting (context-token estimate +
+tool uses + duration — honest labels, see below), pi's 200ms notification
+debounce, and `skills: none` via a new Tau seam
+(`CodingSessionConfig.skills_enabled`, commit 4aee134 on tau branch
+**`skills-seam`**, stacked on `worktree-extensions` — PR-shaped, gate
+green, **not yet merged or pushed**; the extension feature-detects it and
+degrades gracefully, and named-CSV preloads also disable the native index
+to match pi's `noSkills`).
+
 Smaller parity gaps that remain, roughly in value order:
 
-- **`skills: false` / no-skills mode** — needs a Tau seam (e.g. a
-  `skills_enabled` flag on `CodingSessionConfig` or the prompt builder,
-  mirroring pi's `noSkills`); currently a documented drift.
+- **Real (billed) token usage** — Tau exposes NO provider usage anywhere
+  (`ProviderResponseEndEvent` carries only message + finish_reason; no
+  usage on `AssistantMessage` or session state — verified empirically).
+  pi surfaces lifetime tokens/context %. Needs a Tau seam: usage fields on
+  `ProviderResponseEndEvent`, populated by the provider adapters. Until
+  then the extension reports Tau's chars/4 `context_token_estimate`,
+  labeled `context_tokens`.
 - **`isolated` / `inherit_context` params** — pi's no-extension-tools mode
   (near-moot: our children already load no extensions) and
   parent-conversation forking (blocked: `ExtensionContext` doesn't expose
   parent messages).
-- **Usage/token accounting** — pi surfaces tokens, context %, compactions
-  in notifications and steer results; we only track turns/tool calls.
-  Investigate whether `SessionState` exposes usage.
-- **pi's 200ms nudge debounce** for individual notifications (we deliver
-  directly; group batching covers the main case).
 - **Cron scheduling** — buildable in-extension today, but pi's UX leans on
   settings UI; decide scope first.
 
