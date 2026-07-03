@@ -8,7 +8,8 @@ Agent types are markdown files with frontmatter, mirroring pi-subagents:
 The filename is the type name, the body is the subagent's system prompt, and
 frontmatter supports `description`, `tools` (comma-separated allow-list of
 built-in tool names, or `*`), `model`, `max_turns`, `skills` (comma-separated
-skill names to preload), and `prompt_mode` (`replace` or `append`).
+skill names to preload), `prompt_mode` (`replace` or `append`), `memory`
+(`user`, `project`, or `local`), and `isolation` (`worktree`).
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ class AgentDefinition:
     max_turns: int | None = None
     skills: tuple[str, ...] | None = None
     prompt_mode: str = "replace"
+    memory: str | None = None
+    isolation: str | None = None
 
 
 DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
@@ -93,6 +96,12 @@ def _load_definition(path: Path) -> AgentDefinition | None:
         max_turns=_parse_max_turns(metadata.get("max_turns")),
         skills=_parse_skills(metadata.get("skills")),
         prompt_mode="append" if metadata.get("prompt_mode") == "append" else "replace",
+        memory=(
+            metadata.get("memory")
+            if metadata.get("memory") in ("user", "project", "local")
+            else None
+        ),
+        isolation="worktree" if metadata.get("isolation") == "worktree" else None,
     )
 
 

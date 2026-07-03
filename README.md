@@ -74,6 +74,54 @@ Agent-type frontmatter also supports:
 - `max_turns` — non-negative integer soft turn limit (`0` = unlimited)
 - `skills` — comma-separated skill names to preload (see below)
 - `prompt_mode` — `replace` (default) or `append` (see below)
+- `memory` — `user`, `project`, or `local` persistent memory (see below)
+- `isolation` — `worktree` to run in an isolated git worktree (see below)
+
+## Worktree isolation
+
+Pass `isolation: "worktree"` to the `agent` tool (or set it in agent-type
+frontmatter, which wins) and the subagent runs inside a detached git worktree
+of the current repo instead of your working tree. When the run finishes, any
+changes are committed (`tau-agent: <description>`) and preserved on a
+`tau-agent-<id>` branch in the base repo — the result tells you to
+`git merge tau-agent-<id>`. Clean worktrees are removed without a trace.
+Isolation is strict: if the cwd is not a committed git repo, the spawn fails
+rather than silently running unisolated. Worktree agents cannot be resumed —
+their working directory is removed when the run finishes.
+
+## Output files
+
+Every run streams its child transcript as JSONL to
+`<tmpdir>/tau-subagents-<uid>/<encoded-cwd>/<session>/tasks/<agent-id>.jsonl`
+(first entry is the prompt; new messages are flushed after each turn). The
+path is shown in background spawn results (`Output file: ...`), in completion
+notifications (`<output-file>` tag plus a transcript footer), and in
+`get_subagent_result` output, so you can `tail` a long-running agent from
+outside the conversation.
+
+## Per-agent memory (`memory:` frontmatter)
+
+Set `memory: user|project|local` on an agent type to give it a persistent
+memory directory:
+
+    user      ~/.tau/agent-memory/<name>/
+    project   <cwd>/.tau/agent-memory/<name>/
+    local     <cwd>/.tau/agent-memory-local/<name>/
+
+At spawn, a memory block is injected into the child's system prompt (before
+any preloaded skills) showing the first 200 lines of `MEMORY.md` and
+instructions to keep it as an index linking to detail files. Agents whose
+toolset can write (has `write` or `edit`) get read-write memory — the
+directory is created and read/write/edit tools are ensured; read-only
+toolsets get a read-only memory block and no directory is created.
+
+## Run records
+
+Every terminal transition (completed, steered, aborted, error, cancelled —
+including resumes) appends a compact `subagents:record` entry to the parent
+session log (id, type, description, status, result, error, turns, tool
+calls), so subagent history survives session resume. Persistence is
+best-effort and never fails a run.
 
 ## Skill preloading (`skills:` frontmatter)
 

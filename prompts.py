@@ -73,13 +73,15 @@ def build_child_system_prompt(
     parent_prompt: str | None,
     environment: str,
     skill_blocks: list[tuple[str, str]],
+    memory_block: str | None = None,
 ) -> str | None:
     """Assemble the child system prompt for one agent definition.
 
     Append mode (with a parent prompt available) returns a full system prompt
     override incorporating `environment` (from `detect_environment`).
     Otherwise returns a base prompt for `custom_system_prompt`, or None to
-    keep the default coding prompt.
+    keep the default coding prompt. Extras follow pi's order: memory block
+    first, then skill sections.
     """
     if definition.prompt_mode == "append" and parent_prompt:
         custom_section = ""
@@ -89,12 +91,13 @@ def build_child_system_prompt(
                 f"{definition.system_prompt}\n"
                 "</agent_instructions>"
             )
-        extras_suffix = ""
-        if skill_blocks:
-            extras_suffix = "\n\n" + "\n".join(
-                f"\n# Preloaded Skill: {name}\n{block}"
-                for name, block in skill_blocks
-            )
+        extras: list[str] = []
+        if memory_block:
+            extras.append(memory_block)
+        extras.extend(
+            f"\n# Preloaded Skill: {name}\n{block}" for name, block in skill_blocks
+        )
+        extras_suffix = "\n\n" + "\n".join(extras) if extras else ""
         return (
             f"{parent_prompt}\n\n{SUB_AGENT_BRIDGE}\n\n"
             f'<active_agent name="{definition.name}"/>\n\n'
@@ -103,6 +106,8 @@ def build_child_system_prompt(
     parts: list[str] = []
     if definition.system_prompt:
         parts.append(definition.system_prompt)
+    if memory_block:
+        parts.append(memory_block)
     parts.extend(f"# Preloaded Skill: {name}\n{block}" for name, block in skill_blocks)
     return "\n\n".join(parts) if parts else None
 

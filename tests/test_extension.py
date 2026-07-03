@@ -6,6 +6,8 @@ Requires Tau's packages on the import path; run from a Tau checkout:
 """
 
 import asyncio
+import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +16,12 @@ import pytest
 
 from tau_agent.messages import AssistantMessage, UserMessage
 from tau_agent.tools import ToolCall
-from tau_ai import FakeProvider, ProviderResponseEndEvent, ProviderResponseStartEvent
+from tau_ai import (
+    FakeProvider,
+    ProviderErrorEvent,
+    ProviderResponseEndEvent,
+    ProviderResponseStartEvent,
+)
 from tau_coding import TauResourcePaths
 from tau_coding.extensions import ExtensionRuntime
 
@@ -101,9 +108,32 @@ def _patch_fake_provider(module: object, *, response: str) -> None:
     )
 
 
-def _prompts_module() -> object:
+def _submodule(name: str) -> object:
     top = _extension_module()
-    return sys.modules[f"{top.__name__}.prompts"]  # type: ignore[attr-defined]
+    return sys.modules[f"{top.__name__}.{name}"]  # type: ignore[attr-defined]
+
+
+def _prompts_module() -> object:
+    return _submodule("prompts")
+
+
+def _init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "test@example.com"],
+        ["config", "user.name", "Test"],
+    ):
+        subprocess.run(["git", *args], cwd=path, check=True)
+    (path / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+
+def _git_stdout(args: list[str], cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
+    ).stdout
 
 
 def _agent_tool(runtime: ExtensionRuntime):  # noqa: ANN202
@@ -739,6 +769,394 @@ async def test_spawn_injects_skills_and_append_prompt(tmp_path: Path) -> None:
     assert "# Preloaded Skill: myskill" in system
     assert '<skill name="myskill"' in system
     assert "Skill body here." in system
+
+
+async def test_worktree_create_and_cleanup_dirty(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    worktree_mod = _submodule("worktree")
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    worktree = await worktree_mod.create_worktree(repo, "t1")  # type: ignore[attr-defined]
+    assert worktree is not None
+    assert worktree.branch == "tau-agent-t1"
+    assert worktree.work_path.exists()
+    assert worktree.repo == repo.resolve()
+
+    (worktree.path / "new.txt").write_text("dirty\n")
+    result = await worktree_mod.cleanup_worktree(worktree, "my task")  # type: ignore[attr-defined]
+
+    assert result.has_changes is True
+    assert result.branch == "tau-agent-t1"
+    assert not worktree.path.exists()
+    assert "tau-agent-t1" in _git_stdout(["branch", "--list", "tau-agent-t1"], repo)
+    message = _git_stdout(["log", "-1", "--format=%s", "tau-agent-t1"], repo)
+    assert message.strip() == "tau-agent: my task"
+
+
+async def test_worktree_cleanup_clean_removes_without_branch(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    worktree_mod = _submodule("worktree")
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    worktree = await worktree_mod.create_worktree(repo, "t2")  # type: ignore[attr-defined]
+    assert worktree is not None
+    result = await worktree_mod.cleanup_worktree(worktree, "task")  # type: ignore[attr-defined]
+
+    assert result.has_changes is False
+    assert not worktree.path.exists()
+    assert _git_stdout(["branch", "--list", "tau-agent-t2"], repo).strip() == ""
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert await worktree_mod.create_worktree(plain, "t3") is None  # type: ignore[attr-defined]
+
+
+async def test_worktree_spawn_fails_in_non_git_cwd(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    _patch_provider_factory(module, FakeProvider([_text_stream("unused")]))
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "x", "description": "x", "isolation": "worktree"}
+    )
+
+    assert result.ok is False
+    assert 'Cannot run with isolation: "worktree"' in result.content
+    assert "Initialize git and commit at least once, or omit isolation." in result.content
+
+
+async def test_worktree_isolation_runs_child_in_worktree(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    runtime.bind(RecordingSession(repo))
+    module = _extension_module()
+    provider = FakeProvider(
+        [
+            [
+                ProviderResponseStartEvent(model="fake"),
+                ProviderResponseEndEvent(
+                    message=AssistantMessage(
+                        content="checking",
+                        tool_calls=[
+                            ToolCall(id="c1", name="bash", arguments={"command": "pwd"})
+                        ],
+                    )
+                ),
+            ],
+            _text_stream("done"),
+        ]
+    )
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "where am I", "description": "where", "isolation": "worktree"}
+    )
+
+    assert result.ok is True
+    assert "tau-agent-agent-1" in str(provider.calls[1][2])  # pwd ran in the worktree
+    assert "tau-agent" not in _git_stdout(["worktree", "list"], repo)
+    assert _git_stdout(["branch", "--list", "tau-agent-agent-1"], repo).strip() == ""
+
+
+async def test_background_worktree_failure_delivers_error_notification(
+    tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)  # not a git repo
+    runtime.bind(session)
+    module = _extension_module()
+    _patch_provider_factory(module, FakeProvider([_text_stream("unused")]))
+
+    agent_tool = _agent_tool(runtime)
+    spawn_result = await agent_tool.execute(
+        {
+            "prompt": "x",
+            "description": "x",
+            "isolation": "worktree",
+            "run_in_background": True,
+        }
+    )
+    assert spawn_result.ok is True
+    assert "Agent started in background." in spawn_result.content
+
+    await _wait_for(lambda: session.followed_up)
+    note = session.followed_up[0]
+    assert "<status>error</status>" in note
+    assert 'Cannot run with isolation: "worktree"' in note
+
+
+async def test_resume_blocked_for_worktree_agents(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    runtime.bind(RecordingSession(repo))
+    module = _extension_module()
+    _patch_provider_factory(module, FakeProvider([_text_stream("done")]))
+
+    agent_tool = _agent_tool(runtime)
+    first = await agent_tool.execute(
+        {"prompt": "x", "description": "x", "isolation": "worktree"}
+    )
+    assert first.ok is True
+
+    resumed = await agent_tool.execute({"resume": "agent-1", "prompt": "more"})
+    assert resumed.ok is False
+    assert (
+        'Agent "agent-1" ran in an isolated worktree that has been cleaned up;'
+        " resume is not supported for worktree agents." in resumed.content
+    )
+
+
+async def test_worktree_error_run_surfaces_branch_annotation(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    runtime.bind(RecordingSession(repo))
+    module = _extension_module()
+    provider = FakeProvider(
+        [
+            [
+                ProviderResponseStartEvent(model="fake"),
+                ProviderResponseEndEvent(
+                    message=AssistantMessage(
+                        content="working",
+                        tool_calls=[
+                            ToolCall(
+                                id="c1",
+                                name="bash",
+                                arguments={"command": "echo dirty > newfile.txt"},
+                            )
+                        ],
+                    )
+                ),
+            ],
+            [
+                ProviderResponseStartEvent(model="fake"),
+                ProviderErrorEvent(message="boom"),
+            ],
+        ]
+    )
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "break", "description": "break", "isolation": "worktree"}
+    )
+
+    assert result.ok is False
+    assert "boom" in result.content
+    assert "Changes saved to branch `tau-agent-agent-1`" in result.content
+    assert "tau-agent-agent-1" in _git_stdout(
+        ["branch", "--list", "tau-agent-agent-1"], repo
+    )
+
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    fetched = await get_result.execute({"agent_id": "agent-1"})
+    assert "Changes saved to branch `tau-agent-agent-1`" in fetched.content
+
+
+async def test_output_file_streams_transcript(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    _patch_provider_factory(module, FakeProvider([_text_stream("Answer text")]))
+
+    agent_tool = _agent_tool(runtime)
+    spawn_result = await agent_tool.execute(
+        {"prompt": "Long task", "description": "long", "run_in_background": True}
+    )
+    output_line = next(
+        line for line in spawn_result.content.splitlines()
+        if line.startswith("Output file: ")
+    )
+    output_path = Path(output_line.removeprefix("Output file: "))
+    assert "tau-subagents-" in str(output_path)
+    assert output_path.name == "agent-1.jsonl"
+    output_mod = _submodule("output_file")
+    assert output_mod.encode_cwd("/") == "root"  # type: ignore[attr-defined]
+
+    await _wait_for(lambda: session.followed_up)
+    note = session.followed_up[0]
+    assert f"<output-file>{output_path}</output-file>" in note
+    assert f"Full transcript available at: {output_path}" in note
+
+    entries = [
+        json.loads(line) for line in output_path.read_text().splitlines() if line
+    ]
+    assert entries[0]["type"] == "user"
+    assert entries[0]["isSidechain"] is True
+    assert entries[0]["message"]["content"] == "Long task"
+    assert entries[0]["cwd"] == str(tmp_path)
+    assert any(
+        entry["type"] == "assistant" and "Answer text" in json.dumps(entry["message"])
+        for entry in entries[1:]
+    )
+
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    fetched = await get_result.execute({"agent_id": "agent-1"})
+    assert f"Output file: {output_path}" in fetched.content
+
+
+async def test_memory_dir_layout_and_validation(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    memory = _submodule("memory")
+    home = tmp_path / "home"
+    cwd = tmp_path / "proj"
+
+    resolve = memory.resolve_memory_dir  # type: ignore[attr-defined]
+    assert resolve("user", "helper", cwd, home) == home / ".tau" / "agent-memory" / "helper"
+    assert resolve("project", "helper", cwd, home) == cwd / ".tau" / "agent-memory" / "helper"
+    assert (
+        resolve("local", "helper", cwd, home)
+        == cwd / ".tau" / "agent-memory-local" / "helper"
+    )
+    assert resolve("global", "helper", cwd, home) is None
+    assert resolve("user", "../evil", cwd, home) is None
+    assert resolve("user", ".hidden", cwd, home) is None
+    assert resolve("user", "a" * 129, cwd, home) is None
+
+
+async def test_memory_block_builders(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    memory = _submodule("memory")
+    memory_dir = tmp_path / "mem"
+
+    empty = memory.build_memory_block(memory_dir, "project", None)  # type: ignore[attr-defined]
+    assert empty.startswith("# Agent Memory\n\n")
+    assert "Memory scope: project" in empty
+    assert f"No MEMORY.md exists yet. Create one at {memory_dir}/MEMORY.md" in empty
+    assert "MEMORY.md is your index. Keep it under 200 lines." in empty
+
+    populated = memory.build_memory_block(memory_dir, "user", "my notes")  # type: ignore[attr-defined]
+    assert "## Current MEMORY.md\nmy notes" in populated
+
+    read_only = memory.build_read_only_memory_block(memory_dir, "user", None)  # type: ignore[attr-defined]
+    assert read_only.startswith("# Agent Memory (read-only)")
+    assert "No memory is available yet." in read_only
+    assert "Memory instructions" not in read_only
+
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text("\n".join(f"line{i}" for i in range(250)))
+    content = memory.read_memory_file(memory_dir)  # type: ignore[attr-defined]
+    assert content.endswith("... (truncated at 200 lines)")
+    assert "line199" in content
+    assert "line200\n" not in content
+
+
+async def test_memory_injection_rw_and_ro(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    (tmp_path / ".tau" / "agents").mkdir(parents=True)
+    (tmp_path / ".tau" / "agents" / "memo.md").write_text(
+        "---\ndescription: RW memory agent\nmemory: project\n---\nRemember things."
+    )
+    (tmp_path / ".tau" / "agents" / "memoro.md").write_text(
+        "---\ndescription: RO memory agent\nmemory: project\ntools: read\n---\nRead only."
+    )
+    rw_provider = FakeProvider([_text_stream("done")])
+    ro_provider = FakeProvider([_text_stream("done")])
+    _patch_provider_sequence(module, [rw_provider, ro_provider])
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "go", "description": "go", "subagent_type": "memo"}
+    )
+    rw_system = rw_provider.calls[0][1]
+    assert "# Agent Memory\n" in rw_system
+    assert "read-only" not in rw_system
+    assert (tmp_path / ".tau" / "agent-memory" / "memo").is_dir()
+
+    await agent_tool.execute(
+        {"prompt": "go", "description": "go", "subagent_type": "memoro"}
+    )
+    ro_system = ro_provider.calls[0][1]
+    assert "# Agent Memory (read-only)" in ro_system
+    assert not (tmp_path / ".tau" / "agent-memory" / "memoro").exists()
+    ro_tool_names = {tool.name for tool in ro_provider.calls[0][3]}
+    assert "read" in ro_tool_names
+    assert "write" not in ro_tool_names
+
+
+async def test_memory_block_precedes_skills_in_prompt(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    definition = module.AgentDefinition(  # type: ignore[attr-defined]
+        name="helper", description="d", system_prompt="Body."
+    )
+    combined = module.build_child_system_prompt(  # type: ignore[attr-defined]
+        definition,
+        parent_prompt=None,
+        environment="",
+        skill_blocks=[("s", "SB")],
+        memory_block="MEM",
+    )
+    assert combined == "Body.\n\nMEM\n\n# Preloaded Skill: s\nSB"
+
+
+async def test_agent_frontmatter_memory_and_isolation(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    (tmp_path / ".tau" / "agents").mkdir(parents=True)
+    (tmp_path / ".tau" / "agents" / "iso.md").write_text(
+        "---\ndescription: x\nmemory: local\nisolation: worktree\n---\nBody."
+    )
+    (tmp_path / ".tau" / "agents" / "bad.md").write_text(
+        "---\ndescription: x\nmemory: galactic\nisolation: docker\n---\nBody."
+    )
+
+    definitions = module.load_agent_definitions(tmp_path)  # type: ignore[attr-defined]
+    assert definitions["iso"].memory == "local"
+    assert definitions["iso"].isolation == "worktree"
+    assert definitions["bad"].memory is None
+    assert definitions["bad"].isolation is None
+
+
+async def test_run_records_persisted(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    _patch_provider_sequence(
+        module,
+        [
+            FakeProvider([_text_stream("fg done")]),
+            FakeProvider([_text_stream("bg done")]),
+        ],
+    )
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute({"prompt": "fg", "description": "fg task"})
+    records = [
+        data for namespace, data in session.custom_entries
+        if namespace == "subagents:record"
+    ]
+    assert len(records) == 1
+    assert records[0]["id"] == "agent-1"
+    assert records[0]["status"] == "completed"
+    assert records[0]["result"] == "fg done"
+    assert records[0]["turns"] == 1
+
+    await agent_tool.execute(
+        {"prompt": "bg", "description": "bg task", "run_in_background": True}
+    )
+    await _wait_for(
+        lambda: any(
+            namespace == "subagents:record" and data["id"] == "agent-2"
+            for namespace, data in session.custom_entries
+        )
+    )
 
 
 def test_extension_loads(tmp_path: Path) -> None:

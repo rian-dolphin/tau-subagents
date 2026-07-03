@@ -39,14 +39,24 @@ from tau_coding.thinking import DEFAULT_THINKING_LEVEL
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
+from .memory import prepare_memory
+from .output_file import OutputFileWriter, output_file_path
 from .prompts import build_child_system_prompt, detect_environment, resolve_skill_blocks
 from .settings import SubagentSettings, load_subagent_settings
+from .worktree import (
+    WORKTREE_ERROR_MESSAGE,
+    Worktree,
+    cleanup_worktree,
+    create_worktree,
+    prune_worktrees,
+)
 
 if TYPE_CHECKING:
     from tau_agent.events import AgentEvent
 
 INDIVIDUAL_RESULT_CHARS = 500
 GROUP_RESULT_CHARS = 300
+RECORD_RESULT_CHARS = 4_000
 TRUNCATION_SUFFIX = "\n...(truncated, use get_subagent_result for full output)"
 BATCH_DEBOUNCE_SECONDS = 0.1
 GROUP_TIMEOUT_SECONDS = DEFAULT_TIMEOUT
@@ -98,6 +108,11 @@ class AgentRun:
     aborted: bool = False
     pending_steers: list[str] = field(default_factory=list)
     join_mode: str | None = None
+    requested_isolation: str | None = None
+    worktree: Worktree | None = None
+    used_worktree: bool = False
+    output_writer: OutputFileWriter | None = None
+    output_file: str | None = None
 
 
 class SubagentManager:
@@ -115,6 +130,7 @@ class SubagentManager:
         self._batch_timer: asyncio.TimerHandle | None = None
         self._batch_counter = 0
         self._group_join: GroupJoinManager | None = None
+        self._worktree_repos: set[str] = set()
 
     @property
     def runs(self) -> dict[str, AgentRun]:
@@ -140,6 +156,7 @@ class SubagentManager:
         description: str,
         background: bool,
         max_turns: int | None = None,
+        isolation: str | None = None,
     ) -> AgentRun:
         self._counter += 1
         run = AgentRun(
@@ -149,7 +166,18 @@ class SubagentManager:
             prompt=prompt,
             background=background,
             requested_max_turns=max_turns,
+            requested_isolation=isolation,
         )
+        run.output_writer = OutputFileWriter(
+            output_file_path(
+                self._api.context.cwd,
+                self._api.context.session_id,
+                run.agent_id,
+            ),
+            run.agent_id,
+            self._api.context.cwd,
+        )
+        run.output_file = str(run.output_writer.path)
         self._runs[run.agent_id] = run
         if background:
             run.join_mode = self._get_settings().default_join_mode
@@ -234,6 +262,7 @@ class SubagentManager:
             run.status = "error"
             run.error = str(exc)
         finally:
+            await self._persist_record(run)
             run.completed_at = time.monotonic()
 
     async def shutdown(self) -> None:
@@ -261,6 +290,10 @@ class SubagentManager:
                 await asyncio.gather(*pending, return_exceptions=True)
             for run in self._runs.values():
                 await self.close_run(run)
+            for repo in self._worktree_repos:
+                with contextlib.suppress(Exception):
+                    await prune_worktrees(Path(repo))
+            self._worktree_repos.clear()
         finally:
             self._shutting_down = False
 
@@ -302,11 +335,57 @@ class SubagentManager:
             run.status = "error"
             run.error = str(exc)
         finally:
+            await self._finalize_run(run)
             run.completed_at = time.monotonic()
             if run.background:
                 self._running_background -= 1
                 self._drain_queue()
                 self._handle_background_completion(run)
+
+    async def _finalize_run(self, run: AgentRun) -> None:
+        if run.output_writer is not None and run.session is not None:
+            with contextlib.suppress(Exception):
+                await run.output_writer.flush(run.session.messages)
+        if run.worktree is not None:
+            await self._cleanup_worktree(run)
+        await self._persist_record(run)
+
+    async def _cleanup_worktree(self, run: AgentRun) -> None:
+        worktree = run.worktree
+        run.worktree = None
+        assert worktree is not None
+        try:
+            result = await cleanup_worktree(worktree, run.description)
+        except Exception:  # noqa: BLE001 - worktree cleanup is best-effort
+            return
+        if result.has_changes and result.branch:
+            annotation = (
+                f"\n\n---\nChanges saved to branch `{result.branch}`."
+                f" Merge with: `git merge {result.branch}`"
+            )
+            run.result_text += annotation
+            # Error terminals surface run.error, not result_text — annotate
+            # both so committed work is never invisible.
+            if run.status == "error":
+                run.error = (run.error or "subagent failed") + annotation
+
+    async def _persist_record(self, run: AgentRun) -> None:
+        try:
+            await self._api.append_entry(
+                "subagents:record",
+                {
+                    "id": run.agent_id,
+                    "type": run.agent_type,
+                    "description": run.description,
+                    "status": run.status,
+                    "result": run.result_text[:RECORD_RESULT_CHARS],
+                    "error": run.error,
+                    "turns": run.turns,
+                    "tool_calls": run.tool_calls,
+                },
+            )
+        except Exception:  # noqa: BLE001 - record persistence is best-effort
+            pass
 
     def _handle_background_completion(self, run: AgentRun) -> None:
         if run.status == "cancelled":
@@ -320,6 +399,9 @@ class SubagentManager:
 
     async def _execute(self, run: AgentRun, definition: AgentDefinition) -> None:
         settings = self._get_settings()
+        cwd = self._api.context.cwd
+        # Create the provider before the first await so concurrent spawns
+        # claim providers in spawn order (tests script provider sequences).
         provider_settings = load_provider_settings()
         selection = resolve_provider_selection(provider_settings, model=definition.model)
         provider = create_model_provider(
@@ -328,8 +410,27 @@ class SubagentManager:
             thinking_level=DEFAULT_THINKING_LEVEL,
         )
         run.provider = provider
-        cwd = self._api.context.cwd
+        child_cwd = cwd
+        if (definition.isolation or run.requested_isolation) == "worktree":
+            worktree = await create_worktree(cwd, run.agent_id)
+            if worktree is None:
+                raise RuntimeError(WORKTREE_ERROR_MESSAGE)
+            run.worktree = worktree
+            run.used_worktree = True
+            self._worktree_repos.add(str(worktree.repo))
+            child_cwd = worktree.work_path
+        if run.output_writer is not None:
+            await run.output_writer.write_initial(run.prompt)
         skill_blocks = resolve_skill_blocks(definition.skills, cwd)
+        memory_block: str | None = None
+        memory_rw = False
+        if definition.memory is not None:
+            memory_rw = definition.tools is None or bool(
+                {"write", "edit"} & set(definition.tools)
+            )
+            memory_block = await prepare_memory(
+                definition.name, definition.memory, cwd, read_write=memory_rw
+            )
         parent_prompt: str | None = None
         if definition.prompt_mode == "append":
             try:
@@ -338,19 +439,20 @@ class SubagentManager:
                 parent_prompt = None
         environment = ""
         if definition.prompt_mode == "append" and parent_prompt:
-            environment = await detect_environment(cwd)
+            environment = await detect_environment(child_cwd)
         prompt_text = build_child_system_prompt(
             definition,
             parent_prompt=parent_prompt,
             environment=environment,
             skill_blocks=skill_blocks,
+            memory_block=memory_block,
         )
         append_active = definition.prompt_mode == "append" and bool(parent_prompt)
         session = await CodingSession.load(
             CodingSessionConfig(
                 provider=provider,
                 model=selection.model,
-                cwd=cwd,
+                cwd=child_cwd,
                 storage=_MemoryStorage(),
                 system=prompt_text if append_active else None,
                 custom_system_prompt=None if append_active else prompt_text,
@@ -370,6 +472,8 @@ class SubagentManager:
         run.grace_turns = settings.grace_turns
         if definition.tools is not None:
             allowed = set(definition.tools)
+            if memory_block is not None:
+                allowed |= {"read", "write", "edit"} if memory_rw else {"read"}
             session._harness.config.tools = [  # noqa: SLF001 - scoped tool gating
                 tool for tool in session._harness.config.tools if tool.name in allowed
             ]
@@ -378,6 +482,8 @@ class SubagentManager:
             self._observe(run, event, final_text)
             if event.type == "turn_end":
                 self._enforce_turn_limit(run)
+                if run.output_writer is not None:
+                    await run.output_writer.flush(session.messages)
         run.result_text = final_text[-1] if final_text else ""
         if run.aborted:
             run.status = "aborted"
@@ -419,8 +525,13 @@ class SubagentManager:
                 f"Subagent {run.agent_id} ({run.description}) {run.status}.",
                 "info" if run.status in ("completed", "steered") else "warning",
             )
+            footer = (
+                f"\nFull transcript available at: {run.output_file}"
+                if run.output_file
+                else ""
+            )
             self._api.send_user_message(
-                f"{format_task_notification(run)}\n{COMPLETION_NOTICE}",
+                f"{format_task_notification(run)}\n{COMPLETION_NOTICE}{footer}",
                 deliver_as="follow_up",
             )
         except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
@@ -460,6 +571,8 @@ def format_background_spawn(run: AgentRun, max_concurrent: int) -> str:
         f"Type: {run.agent_type}",
         f"Description: {run.description}",
     ]
+    if run.output_file:
+        lines.append(f"Output file: {run.output_file}")
     if not started:
         lines.append(f"Position: queued (max {max_concurrent} concurrent)")
     lines.extend(
@@ -486,11 +599,15 @@ def format_task_notification(
     """Format one run's completion as a <task-notification> block."""
     body = run.error if run.status == "error" else run.result_text
     truncated = _truncate_result(body or "(no output)", max_result_chars)
+    output_line = (
+        f"<output-file>{run.output_file}</output-file>\n" if run.output_file else ""
+    )
     return (
         "<task-notification>\n"
         f"<agent-id>{run.agent_id}</agent-id>\n"
         f"<type>{run.agent_type}</type>\n"
         f"<description>{run.description}</description>\n"
+        f"{output_line}"
         f"<status>{run.status}</status>\n"
         f"<turns>{run.turns}</turns>\n"
         f"<result>{truncated}</result>\n"
@@ -553,6 +670,9 @@ def setup(tau: ExtensionAPI) -> None:
         description = str(arguments.get("description", "")) or f"{agent_type} agent"
         background = bool(arguments.get("run_in_background", False))
         max_turns = _coerce_max_turns(arguments.get("max_turns"))
+        isolation = (
+            "worktree" if arguments.get("isolation") == "worktree" else None
+        )
 
         run = manager.spawn(
             agent_type=definition,
@@ -560,6 +680,7 @@ def setup(tau: ExtensionAPI) -> None:
             description=description,
             background=background,
             max_turns=max_turns,
+            isolation=isolation,
         )
         if background:
             return _tool_result(
@@ -597,6 +718,13 @@ def setup(tau: ExtensionAPI) -> None:
                 content=f'Agent "{agent_id}" is still running.'
                 " Use steer_subagent to redirect it.",
             )
+        if run.used_worktree:
+            return _tool_result(
+                "agent",
+                ok=False,
+                content=f'Agent "{agent_id}" ran in an isolated worktree that has'
+                " been cleaned up; resume is not supported for worktree agents.",
+            )
         if run.session is None:
             return _tool_result(
                 "agent",
@@ -629,25 +757,28 @@ def setup(tau: ExtensionAPI) -> None:
             run.result_consumed = True
             while run.status in ("running", "queued"):
                 await asyncio.sleep(0.05)
+        header = format_run_summary(run)
+        if run.output_file:
+            header += f"\nOutput file: {run.output_file}"
         if run.status == "queued":
             return _tool_result(
                 "get_subagent_result",
                 ok=True,
-                content=f"{format_run_summary(run)}\n\n"
+                content=f"{header}\n\n"
                 f"Still queued (max {manager.max_concurrent} concurrent).",
             )
         if run.status == "running":
             return _tool_result(
                 "get_subagent_result",
                 ok=True,
-                content=f"{format_run_summary(run)}\n\nStill running.",
+                content=f"{header}\n\nStill running.",
             )
         run.result_consumed = True
         body = run.error if run.status == "error" else run.result_text
         return _tool_result(
             "get_subagent_result",
             ok=run.status in ("completed", "steered"),
-            content=f"{format_run_summary(run)}\n\n{body or '(no output)'}",
+            content=f"{header}\n\n{body or '(no output)'}",
         )
 
     async def run_steer_tool(arguments, signal=None):  # noqa: ANN001, ANN202
@@ -747,6 +878,13 @@ def setup(tau: ExtensionAPI) -> None:
                         "type": "string",
                         "description": "Id of a finished agent to resume with this"
                         " prompt (always runs foreground).",
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["worktree"],
+                        "description": "Set to \"worktree\" to run the agent in an"
+                        " isolated git worktree; changes are saved to a"
+                        " tau-agent-<id> branch.",
                     },
                 },
                 "required": ["prompt", "description"],
