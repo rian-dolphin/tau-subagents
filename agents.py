@@ -7,17 +7,26 @@ Agent types are markdown files with frontmatter, mirroring pi-subagents:
 
 The filename is the type name, the body is the subagent's system prompt, and
 frontmatter supports `description`, `tools` (comma-separated allow-list of
-built-in tool names, or `*`), `model`, `max_turns`, `skills` (comma-separated
-skill names to preload), `prompt_mode` (`replace` or `append`), `memory`
+built-in tool names, or `*`), `model`, `thinking` (a Tau thinking level),
+`max_turns`, `skills`, `prompt_mode` (`replace` or `append`), `memory`
 (`user`, `project`, or `local`), and `isolation` (`worktree`).
+
+Children always discover skills natively through Tau's own machinery.
+`skills: <csv>` additionally preloads the named skills' bodies into the
+system prompt; `skills: true`/`*`/`all` pins resource discovery (skills and
+project context files) to the parent cwd, which only matters under worktree
+isolation; `skills: none`/`false` does not disable native discovery — it only
+skips preloading.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from tau_coding.resources import parse_markdown_resource
+from tau_coding.thinking import THINKING_LEVELS
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,8 +38,9 @@ class AgentDefinition:
     system_prompt: str | None = None
     tools: tuple[str, ...] | None = None
     model: str | None = None
+    thinking: str | None = None
     max_turns: int | None = None
-    skills: tuple[str, ...] | None = None
+    skills: tuple[str, ...] | Literal[True] | None = None
     prompt_mode: str = "replace"
     memory: str | None = None
     isolation: str | None = None
@@ -93,6 +103,11 @@ def _load_definition(path: Path) -> AgentDefinition | None:
         system_prompt=body.strip() or None,
         tools=tools,
         model=metadata.get("model") or None,
+        thinking=(
+            metadata.get("thinking")
+            if metadata.get("thinking") in THINKING_LEVELS
+            else None
+        ),
         max_turns=_parse_max_turns(metadata.get("max_turns")),
         skills=_parse_skills(metadata.get("skills")),
         prompt_mode="append" if metadata.get("prompt_mode") == "append" else "replace",
@@ -111,13 +126,15 @@ def _parse_tools(raw: str | None) -> tuple[str, ...] | None:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-def _parse_skills(raw: str | None) -> tuple[str, ...] | None:
-    """Parse the `skills:` CSV; full inheritance (`*`/`all`/`true`) not yet supported."""
+def _parse_skills(raw: str | None) -> tuple[str, ...] | Literal[True] | None:
+    """Parse `skills:`: CSV = named preload, `true`/`*`/`all` = pin to parent cwd."""
     if raw is None:
         return None
     stripped = raw.strip().lower()
-    if stripped in ("", "none", "false", "*", "all", "true"):
+    if stripped in ("", "none", "false"):
         return None
+    if stripped in ("*", "all", "true"):
+        return True
     return tuple(part.strip() for part in raw.split(",") if part.strip()) or None
 
 

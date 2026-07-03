@@ -206,6 +206,29 @@ def _patch_provider_sequence(module: object, providers: list[object]) -> None:
     )
 
 
+def _patch_recording_provider(
+    module: object, providers: list[object]
+) -> tuple[list[object], list[object]]:
+    """Patch provider factories, recording model and thinking_level per spawn."""
+    models: list[object] = []
+    thinking_levels: list[object] = []
+    module.load_provider_settings = lambda: None  # type: ignore[attr-defined]
+
+    def fake_resolve(settings, model=None):  # noqa: ANN001, ANN202
+        models.append(model)
+        return SimpleNamespace(provider=SimpleNamespace(name="fake"), model="fake")
+
+    provider_iter = iter(providers)
+
+    def fake_create(provider, model, thinking_level):  # noqa: ANN001, ANN202
+        thinking_levels.append(thinking_level)
+        return next(provider_iter)
+
+    module.resolve_provider_selection = fake_resolve  # type: ignore[attr-defined]
+    module.create_model_provider = fake_create  # type: ignore[attr-defined]
+    return models, thinking_levels
+
+
 async def _wait_for(condition, *, tries: int = 500) -> None:  # noqa: ANN001
     for _ in range(tries):
         if condition():
@@ -1157,6 +1180,107 @@ async def test_run_records_persisted(tmp_path: Path) -> None:
             for namespace, data in session.custom_entries
         )
     )
+
+
+async def test_model_and_thinking_param_precedence(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    (tmp_path / ".tau" / "agents").mkdir(parents=True)
+    (tmp_path / ".tau" / "agents" / "pinned.md").write_text(
+        "---\ndescription: Pinned agent\nmodel: pinned-model\nthinking: low\n---\nBody."
+    )
+    models, thinking_levels = _patch_recording_provider(
+        module, [FakeProvider([_text_stream("done")]) for _ in range(3)]
+    )
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "x", "description": "x", "model": "haiku", "thinking": "high"}
+    )
+    assert models[-1] == "haiku"  # param used when frontmatter has none
+    assert thinking_levels[-1] == "high"
+
+    await agent_tool.execute({"prompt": "x", "description": "x"})
+    assert models[-1] is None  # parent default
+    assert thinking_levels[-1] == "medium"  # DEFAULT_THINKING_LEVEL
+
+    await agent_tool.execute(
+        {
+            "prompt": "x",
+            "description": "x",
+            "subagent_type": "pinned",
+            "model": "haiku",
+            "thinking": "high",
+        }
+    )
+    assert models[-1] == "pinned-model"  # frontmatter beats the param
+    assert thinking_levels[-1] == "low"
+
+
+async def test_invalid_thinking_rejected(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "x", "description": "x", "thinking": "ultra"}
+    )
+
+    assert result.ok is False
+    assert "Invalid thinking level: ultra." in result.content
+    assert "Valid options: off, minimal, low, medium, high, xhigh" in result.content
+
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    unknown = await get_result.execute({"agent_id": "agent-1"})
+    assert unknown.ok is False  # nothing was spawned
+
+
+async def test_skills_true_pins_discovery_to_parent_cwd_under_worktree(
+    tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    runtime.bind(RecordingSession(repo))
+    module = _extension_module()
+    # Created AFTER the commit: the parent cwd has this skill, but a detached
+    # worktree checkout of HEAD does not.
+    (repo / ".tau" / "skills").mkdir(parents=True)
+    (repo / ".tau" / "skills" / "parentskill.md").write_text(
+        "---\ndescription: Parent-only skill\n---\nDo parent things."
+    )
+    (repo / ".tau" / "agents").mkdir(exist_ok=True)
+    (repo / ".tau" / "agents" / "pinned.md").write_text(
+        "---\ndescription: Pins skills\nskills: true\nisolation: worktree\n---\nBody."
+    )
+    (repo / ".tau" / "agents" / "unpinned.md").write_text(
+        "---\ndescription: Default discovery\nisolation: worktree\n---\nBody."
+    )
+    pinned_provider = FakeProvider([_text_stream("done")])
+    unpinned_provider = FakeProvider([_text_stream("done")])
+    _patch_provider_sequence(module, [pinned_provider, unpinned_provider])
+
+    agent_tool = _agent_tool(runtime)
+    pinned = await agent_tool.execute(
+        {"prompt": "go", "description": "go", "subagent_type": "pinned"}
+    )
+    unpinned = await agent_tool.execute(
+        {"prompt": "go", "description": "go", "subagent_type": "unpinned"}
+    )
+
+    assert pinned.ok is True
+    assert unpinned.ok is True
+    pinned_system = pinned_provider.calls[0][1]
+    unpinned_system = unpinned_provider.calls[0][1]
+    # skills: true resolves resources against the parent cwd, so the child
+    # sees the uncommitted parent skill; default discovery resolves against
+    # the worktree copy, which lacks it.
+    assert "<name>parentskill</name>" in pinned_system
+    assert "# Preloaded Skill:" not in pinned_system  # native index, not blocks
+    assert "<name>parentskill</name>" not in unpinned_system
 
 
 def test_extension_loads(tmp_path: Path) -> None:

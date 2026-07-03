@@ -123,15 +123,40 @@ session log (id, type, description, status, result, error, turns, tool
 calls), so subagent history survives session resume. Persistence is
 best-effort and never fails a run.
 
-## Skill preloading (`skills:` frontmatter)
+## Skills (`skills:` frontmatter)
 
-List skill names in an agent type's frontmatter (`skills: foo, bar`) and each
-is resolved through Tau's skill discovery (`~/.tau/skills/`,
-`<cwd>/.tau/skills/`, `.agents/skills/` — project overrides user) and injected
-into the child's system prompt as a `# Preloaded Skill: <name>` section. A
-missing skill becomes a `(Skill "<name>" not found)` placeholder. Full skill
-inheritance (`skills: true` / `*` / `all`) is not yet supported — those values
-are treated as "no preloaded skills".
+Children always inherit Tau's native skill discovery: every subagent session
+discovers skills on its own (`~/.tau/skills/`, `~/.agents/`, and the child
+cwd's `.tau/skills/`) and gets an `<available_skills>` index in its prompt
+plus on-demand skill expansion. The `skills:` frontmatter layers on top of
+that:
+
+- `skills: foo, bar` — **additionally preloads** the named skills' full
+  bodies into the child's system prompt as `# Preloaded Skill: <name>`
+  sections (a missing name becomes a `(Skill "<name>" not found)`
+  placeholder), so the child doesn't have to read them on demand.
+- `skills: true` (or `*` / `all`) — pins the child's resource discovery
+  (skills **and** project context files such as AGENTS.md) to the **parent**
+  working directory. This only makes a difference under
+  `isolation: worktree`, where default discovery would otherwise resolve
+  against the worktree copy — e.g. uncommitted project skills would be
+  invisible to the isolated child.
+- `skills: none` / `false` — currently does **not** disable native discovery
+  (a known drift from pi, where `false` means no skills; disabling would need
+  a Tau-side seam). It only means "no preloaded skill blocks".
+
+In `prompt_mode: append` the parent prompt prefix already carries the
+parent's skill index verbatim.
+
+## Model and thinking overrides
+
+The `agent` tool accepts `model` (fuzzy or full model selection for the
+subagent; default is the agent type's `model`, else the parent's) and
+`thinking` (one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`;
+default `medium`). Agent-type frontmatter `model:` and `thinking:` win over
+the tool params, matching pi's precedence. Note: a typo'd frontmatter
+`thinking:` value is silently ignored (falls back to the param/default),
+unlike the tool param, which errors.
 
 ## `prompt_mode: append`
 

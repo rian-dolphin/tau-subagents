@@ -35,13 +35,18 @@ from tau_coding import (
 )
 from tau_coding.extensions import ExtensionAPI, SessionShutdownEvent
 from tau_coding.provider_runtime import create_model_provider
-from tau_coding.thinking import DEFAULT_THINKING_LEVEL
+from tau_coding.thinking import DEFAULT_THINKING_LEVEL, THINKING_LEVELS
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
 from .output_file import OutputFileWriter, output_file_path
-from .prompts import build_child_system_prompt, detect_environment, resolve_skill_blocks
+from .prompts import (
+    build_child_system_prompt,
+    detect_environment,
+    inherited_resource_paths,
+    resolve_skill_blocks,
+)
 from .settings import SubagentSettings, load_subagent_settings
 from .worktree import (
     WORKTREE_ERROR_MESSAGE,
@@ -101,6 +106,8 @@ class AgentRun:
     provider: object | None = None
     result_consumed: bool = False
     completed_at: float | None = None
+    requested_model: str | None = None
+    requested_thinking: str | None = None
     requested_max_turns: int | None = None
     max_turns: int | None = None
     grace_turns: int = 5
@@ -157,6 +164,8 @@ class SubagentManager:
         background: bool,
         max_turns: int | None = None,
         isolation: str | None = None,
+        model: str | None = None,
+        thinking: str | None = None,
     ) -> AgentRun:
         self._counter += 1
         run = AgentRun(
@@ -165,6 +174,8 @@ class SubagentManager:
             description=description,
             prompt=prompt,
             background=background,
+            requested_model=model,
+            requested_thinking=thinking,
             requested_max_turns=max_turns,
             requested_isolation=isolation,
         )
@@ -402,12 +413,17 @@ class SubagentManager:
         cwd = self._api.context.cwd
         # Create the provider before the first await so concurrent spawns
         # claim providers in spawn order (tests script provider sequences).
+        # Frontmatter wins over the tool param, per pi precedence.
         provider_settings = load_provider_settings()
-        selection = resolve_provider_selection(provider_settings, model=definition.model)
+        selection = resolve_provider_selection(
+            provider_settings, model=definition.model or run.requested_model
+        )
         provider = create_model_provider(
             selection.provider,
             model=selection.model,
-            thinking_level=DEFAULT_THINKING_LEVEL,
+            thinking_level=(
+                definition.thinking or run.requested_thinking or DEFAULT_THINKING_LEVEL
+            ),
         )
         run.provider = provider
         child_cwd = cwd
@@ -421,7 +437,9 @@ class SubagentManager:
             child_cwd = worktree.work_path
         if run.output_writer is not None:
             await run.output_writer.write_initial(run.prompt)
-        skill_blocks = resolve_skill_blocks(definition.skills, cwd)
+        skill_blocks = resolve_skill_blocks(
+            definition.skills if isinstance(definition.skills, tuple) else None, cwd
+        )
         memory_block: str | None = None
         memory_rw = False
         if definition.memory is not None:
@@ -456,6 +474,15 @@ class SubagentManager:
                 storage=_MemoryStorage(),
                 system=prompt_text if append_active else None,
                 custom_system_prompt=None if append_active else prompt_text,
+                # Children always discover skills natively (Tau defaults
+                # resource paths from the session cwd). skills: true pins
+                # discovery to the PARENT cwd, which matters under worktree
+                # isolation where the default would use the worktree copy.
+                resource_paths=(
+                    inherited_resource_paths(cwd)
+                    if definition.skills is True
+                    else None
+                ),
                 provider_name=selection.provider.name,
                 auto_compact_enabled=False,
                 # Subagents load no extensions, so they cannot spawn recursively.
@@ -673,6 +700,17 @@ def setup(tau: ExtensionAPI) -> None:
         isolation = (
             "worktree" if arguments.get("isolation") == "worktree" else None
         )
+        model = str(arguments.get("model")) if arguments.get("model") else None
+        thinking = arguments.get("thinking")
+        if thinking is not None:
+            thinking = str(thinking)
+            if thinking not in THINKING_LEVELS:
+                return _tool_result(
+                    "agent",
+                    ok=False,
+                    content=f"Invalid thinking level: {thinking}."
+                    f" Valid options: {', '.join(THINKING_LEVELS)}",
+                )
 
         run = manager.spawn(
             agent_type=definition,
@@ -681,6 +719,8 @@ def setup(tau: ExtensionAPI) -> None:
             background=background,
             max_turns=max_turns,
             isolation=isolation,
+            model=model,
+            thinking=thinking,
         )
         if background:
             return _tool_result(
@@ -867,6 +907,17 @@ def setup(tau: ExtensionAPI) -> None:
                     "run_in_background": {
                         "type": "boolean",
                         "description": "Return immediately and notify on completion.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model for the subagent (default: the agent"
+                        " type's model, else the parent's).",
+                    },
+                    "thinking": {
+                        "type": "string",
+                        "enum": list(THINKING_LEVELS),
+                        "description": "Reasoning effort for the subagent"
+                        " (default: medium).",
                     },
                     "max_turns": {
                         "type": "number",

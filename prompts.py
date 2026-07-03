@@ -43,8 +43,13 @@ You are operating as a sub-agent invoked to handle a specific task.
 
 def load_available_skills(cwd: Path, home: Path | None = None) -> list[Skill]:
     """Load skills visible from cwd (project `.tau/skills` overrides user)."""
+    return load_skills(inherited_resource_paths(cwd, home))
+
+
+def inherited_resource_paths(cwd: Path, home: Path | None = None) -> TauResourcePaths:
+    """Resource paths for a child that inherits skills natively (skills: true)."""
     home_dir = home if home is not None else Path.home()
-    return load_skills(TauResourcePaths(root=home_dir / ".tau", cwd=cwd))
+    return TauResourcePaths(root=home_dir / ".tau", cwd=cwd)
 
 
 def resolve_skill_blocks(
