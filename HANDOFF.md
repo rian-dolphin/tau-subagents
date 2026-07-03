@@ -93,25 +93,41 @@ Buildable **now** with Tau's current extension API:
 - **Persist run records** — `await tau.append_entry("subagents:record", …)`
   so runs survive resume (pi does this).
 
-**Blocked on Tau capabilities** (would need changes in the tau repo first —
-the design doc's non-goals list is the authoritative tracker):
+**Currently blocked on Tau capabilities** — but not dead ends. If a feature
+here is limited by Tau's extension implementation, **extend Tau**: branch
+off `worktree-extensions` in the tau repo, make the edits that enable the
+capability (with tests, keeping the `tau_agent` purity boundary and the
+existing gate green), and build the feature in this repo against that
+branch. The design doc's non-goals list is the tracker for what's missing,
+not a fence. Known gaps and where they'd land:
 
-- Live progress for foreground agents — needs partial tool-result streaming
-  (`ToolExecutionUpdateEvent` emission in `tau_agent`'s loop + an
-  `on_update` seam in executors).
-- Custom rendering of the `<task-notification>` — needs message renderers.
+- Live progress for foreground agents — needs partial tool-result streaming:
+  emit the already-defined `ToolExecutionUpdateEvent` from `tau_agent`'s
+  loop and add an `on_update` seam to executors, then surface it through
+  the runtime's wrapper and the TUI adapter.
+- Custom rendering of the `<task-notification>` — needs message renderers
+  registered through the extension API and consumed by the TUI transcript.
 - Interactive `/agents` menu, live agent widget, conversation viewer —
-  needs extension UI surfaces (dialogs/widgets/overlays).
-- Cron scheduling — buildable in-extension, but pi's UX leans on settings
-  UI; decide scope first.
+  needs extension UI surfaces on the `UiBridge` (dialogs first: `select` /
+  `confirm` / `input`; widgets/overlays after).
+- Cron scheduling — buildable in-extension today, but pi's UX leans on
+  settings UI; decide scope first.
 
 ## Working agreement with the tau repo
 
 - The extension must keep working against the `worktree-extensions` branch
-  of the fork. If a bug traces back to Tau's extension runtime
+  of the fork (pushed to `origin`, so it survives worktree cleanup). If a
+  bug traces back to Tau's extension runtime
   (`src/tau_coding/extensions/`), fix it **in the tau repo** on that branch
   (or a branch off it), with a test in `tests/test_extensions.py` — don't
   work around it here.
+- The same applies to missing capabilities, not just bugs: when a
+  pi-subagents feature can't be built on the current extension API, branch
+  off `worktree-extensions` and extend Tau to enable it, rather than
+  shipping a degraded version here. Keep such branches PR-shaped:
+  `worktree-extensions` is a clean candidate for upstreaming (personal
+  tweaks were deliberately rebased out), so capability work should stay
+  cleanly stacked on it.
 - Tau's verification gate: `uv run pytest && uv run ruff check . && uv run mypy`
   (4 pre-existing mypy errors in `tui/widgets.py`/`tui/app.py` are known;
   2 pre-existing ruff errors in `tests/test_coding_session.py` /
