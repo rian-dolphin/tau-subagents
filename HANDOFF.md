@@ -106,18 +106,26 @@ prompt assembly + skills), `group_join.py` (notification batching),
 
 ## Gap analysis vs pi-subagents
 
-Everything from the original "buildable now" list is done (see above).
-Smaller parity gaps that remain buildable in-extension, roughly in value
-order:
+Everything from the original "buildable now" list is done (see above), plus
+per-call `model`/`thinking` params (7390b43). Important discovery from that
+batch: Tau children **always** discover skills natively (Tau defaults
+resource paths from the session cwd), so `skills:` CSV means *additional*
+full-body preloading, `skills: true` pins discovery to the parent cwd
+(only matters under worktree isolation), and `skills: none` cannot disable
+discovery — see README.
 
-- **`skills: true` / full skill inheritance** — inherit all discovered
-  skills into the child (we only support named CSV preloading).
-- **Per-call `model`/`thinking` params on the `agent` tool** — pi lets the
-  caller pick (frontmatter still wins); we only honor frontmatter `model`.
+Smaller parity gaps that remain, roughly in value order:
+
+- **`skills: false` / no-skills mode** — needs a Tau seam (e.g. a
+  `skills_enabled` flag on `CodingSessionConfig` or the prompt builder,
+  mirroring pi's `noSkills`); currently a documented drift.
 - **`isolated` / `inherit_context` params** — pi's no-extension-tools mode
-  and parent-conversation forking.
+  (near-moot: our children already load no extensions) and
+  parent-conversation forking (blocked: `ExtensionContext` doesn't expose
+  parent messages).
 - **Usage/token accounting** — pi surfaces tokens, context %, compactions
   in notifications and steer results; we only track turns/tool calls.
+  Investigate whether `SessionState` exposes usage.
 - **pi's 200ms nudge debounce** for individual notifications (we deliver
   directly; group batching covers the main case).
 - **Cron scheduling** — buildable in-extension today, but pi's UX leans on
