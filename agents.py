@@ -44,6 +44,7 @@ class AgentDefinition:
     prompt_mode: str = "replace"
     memory: str | None = None
     isolation: str | None = None
+    inherit_context: bool | None = None
 
 
 DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
@@ -117,7 +118,19 @@ def _load_definition(path: Path) -> AgentDefinition | None:
             else None
         ),
         isolation="worktree" if metadata.get("isolation") == "worktree" else None,
+        inherit_context=_parse_bool(metadata.get("inherit_context")),
     )
+
+
+def _parse_bool(raw: str | None) -> bool | None:
+    if raw is None:
+        return None
+    stripped = str(raw).strip().lower()
+    if stripped in ("true", "yes", "1"):
+        return True
+    if stripped in ("false", "no", "0"):
+        return False
+    return None
 
 
 def _parse_tools(raw: str | None) -> tuple[str, ...] | None:

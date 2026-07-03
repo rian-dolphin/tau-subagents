@@ -41,6 +41,42 @@ You are operating as a sub-agent invoked to handle a specific task.
 </sub_agent_context>"""
 
 
+PARENT_CONTEXT_HEADER = """# Parent Conversation Context
+The following is the conversation history from the parent session that spawned you.
+Use this context to understand what has been discussed and decided so far.
+
+"""
+
+PARENT_CONTEXT_FOOTER = """
+
+---
+# Your Task (below)
+"""
+
+
+def build_parent_context(transcript: object) -> str:
+    """Text digest of the parent conversation (pi's buildParentContext).
+
+    Keeps user and assistant text turns; drops tool results (too verbose for
+    context, matching pi). Tau folds compaction summaries into user messages
+    during replay, so they appear as [User] turns rather than pi's [Summary]
+    framing. Returns "" when there is nothing to inherit.
+    """
+    parts: list[str] = []
+    for message in transcript or ():  # type: ignore[union-attr]
+        role = getattr(message, "role", None)
+        content = getattr(message, "content", None)
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        text = content.strip()
+        if text:
+            label = "User" if role == "user" else "Assistant"
+            parts.append(f"[{label}]: {text}")
+    if not parts:
+        return ""
+    return PARENT_CONTEXT_HEADER + "\n\n".join(parts) + PARENT_CONTEXT_FOOTER
+
+
 def load_available_skills(cwd: Path, home: Path | None = None) -> list[Skill]:
     """Load skills visible from cwd (project `.tau/skills` overrides user)."""
     return load_skills(inherited_resource_paths(cwd, home))

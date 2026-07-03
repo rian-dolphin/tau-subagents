@@ -266,6 +266,22 @@ finished agent's session — its full conversation history is kept alive. Resume
 always runs in the foreground and returns the new final answer inline. (Turn
 limits are not re-enforced on resume.)
 
+## Inheriting the parent conversation (`inherit_context`)
+
+By default a subagent starts with fresh context. Pass `inherit_context: true`
+on the `agent` tool (or set it in agent frontmatter; the param wins) to
+prepend a digest of the parent conversation to the child's prompt, following
+pi's design: user and assistant text turns as `[User]:` / `[Assistant]:`
+lines (tool results are dropped as too verbose), wrapped in pi's verbatim
+`# Parent Conversation Context` framing. The digest is captured at spawn
+time, so queued background runs see the conversation as of the tool call.
+Compaction summaries appear as `[User]` turns (Tau folds them into user
+messages during replay) rather than pi's `[Summary]:` framing.
+
+Requires a Tau build with the `parent-context` seam
+(`tau.context.transcript`); without it the tool call fails with an
+explanatory error rather than silently spawning without context.
+
 ## Settings
 
 Settings are read from two JSON files and shallow-merged, project overriding
@@ -287,9 +303,12 @@ default.
 ## Notes and limits
 
 - Subagents run with `extensions_enabled=False`, so they cannot spawn
-  subagents recursively.
-- Foreground subagents are silent while they work — Tau does not yet stream
-  partial tool results. Prefer background mode for long tasks.
+  subagents recursively. This also means children never receive extension or
+  MCP tools — pi's `isolated` param (which strips them) has nothing to strip
+  here and is deliberately not ported.
+- Foreground subagents report live progress on Tau builds with the
+  `tool-progress` seam (see "Live progress"); on older builds they are silent
+  while they work — prefer background mode for long tasks there.
 - `/reload` rebuilds extension state; background runs in flight at reload
   time are orphaned.
 

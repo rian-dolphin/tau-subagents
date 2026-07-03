@@ -46,6 +46,7 @@ from .memory import prepare_memory
 from .output_file import OutputFileWriter, output_file_path
 from .prompts import (
     build_child_system_prompt,
+    build_parent_context,
     detect_environment,
     inherited_resource_paths,
     resolve_skill_blocks,
@@ -848,6 +849,27 @@ def setup(tau: ExtensionAPI) -> None:
         isolation = (
             "worktree" if arguments.get("isolation") == "worktree" else None
         )
+        inherit = arguments.get("inherit_context")
+        if inherit is None:
+            inherit = definition.inherit_context
+        if inherit:
+            # Captured at spawn time (pi semantics): the digest reflects the
+            # parent conversation as of this tool call, even for queued runs.
+            context = getattr(tau, "context", None)
+            transcript = (
+                getattr(context, "transcript", None) if context is not None else None
+            )
+            if transcript is None:
+                return _tool_result(
+                    "agent",
+                    ok=False,
+                    content="inherit_context requires a Tau build with the"
+                    " parent-context seam (the parent transcript is not"
+                    " exposed to extensions here).",
+                )
+            parent_context = build_parent_context(transcript)
+            if parent_context:
+                prompt = parent_context + prompt
         model = str(arguments.get("model")) if arguments.get("model") else None
         thinking = arguments.get("thinking")
         if thinking is not None:
@@ -1054,8 +1076,9 @@ def setup(tau: ExtensionAPI) -> None:
                 " report. Set run_in_background=true for long tasks; a completion"
                 " notification will arrive when it finishes. Use steer_subagent to"
                 " redirect a running agent, and resume=<id> with a new prompt to"
-                " continue a finished agent's session.\n\nAvailable agent"
-                f" types:\n{type_list}"
+                " continue a finished agent's session. Use inherit_context if"
+                " the agent needs the parent conversation history.\n\nAvailable"
+                f" agent types:\n{type_list}"
             ),
             input_schema={
                 "type": "object",
@@ -1104,6 +1127,12 @@ def setup(tau: ExtensionAPI) -> None:
                         "description": "Set to \"worktree\" to run the agent in an"
                         " isolated git worktree; changes are saved to a"
                         " tau-agent-<id> branch.",
+                    },
+                    "inherit_context": {
+                        "type": "boolean",
+                        "description": "If true, prepend the parent conversation"
+                        " history to the agent's prompt. Default: false"
+                        " (fresh context).",
                     },
                 },
                 "required": ["prompt", "description"],

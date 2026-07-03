@@ -62,6 +62,7 @@ class RecordingSession:
         self.steered: list[str] = []
         self.followed_up: list[str] = []
         self.custom_entries: list[tuple[str, dict[str, object]]] = []
+        self.messages: list[object] = []
 
     def queue_steering_message(self, content: str) -> None:
         self.steered.append(content)
@@ -1497,6 +1498,57 @@ async def test_foreground_progress_updates(tmp_path: Path) -> None:
     assert result.ok is True
     assert any("turn" in message for message, _ in updates)
     assert any(data is not None and data.get("tool_uses") == 1 for _, data in updates)
+
+
+async def test_inherit_context_prepends_parent_conversation(tmp_path: Path) -> None:
+    try:
+        from tau_coding.extensions.api import ExtensionContext
+    except ImportError:
+        pytest.skip("tau branch lacks the parent-context seam")
+    if not hasattr(ExtensionContext, "transcript"):
+        pytest.skip("tau branch lacks the parent-context seam")
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    session.messages = [
+        UserMessage(content="parent question"),
+        AssistantMessage(content="parent answer"),
+    ]
+    runtime.bind(session)
+    module = _extension_module()
+    provider = FakeProvider([_text_stream("done")])
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "child task", "description": "d", "inherit_context": True}
+    )
+
+    assert result.ok is True
+    child_messages = provider.calls[0][2]
+    first = child_messages[0]
+    assert first.content.startswith("# Parent Conversation Context")
+    assert "[User]: parent question" in first.content
+    assert "[Assistant]: parent answer" in first.content
+    assert "# Your Task (below)\nchild task" in first.content
+
+
+async def test_inherit_context_skips_empty_parent(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    provider = FakeProvider([_text_stream("done")])
+    _patch_provider_factory(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        {"prompt": "child task", "description": "d", "inherit_context": True}
+    )
+
+    if not result.ok:
+        assert "parent-context seam" in result.content
+        pytest.skip("tau branch lacks the parent-context seam")
+    first = provider.calls[0][2][0]
+    assert first.content == "child task"
 
 
 async def test_consuming_within_nudge_window_suppresses_notification(
