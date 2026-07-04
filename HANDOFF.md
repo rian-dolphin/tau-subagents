@@ -107,7 +107,7 @@ gate green at every tip, purity boundary (`tau_agent` ⊬ `tau_coding`) held:
   future picker-style screen must be added to those allowlists** or arrows
   silently don't work (tests must use real `pilot.press`, not
   `action_cursor_down()`, which masks the bug).
-- `message-renderers` (9af29e6) — `register_message_renderer` +
+- `message-renderers` (9af29e6 + 19cf9fc) — `register_message_renderer` +
   `send_custom_message`; `custom_type`/`details` metadata on `UserMessage`
   (lighter than Pi's separate custom role — Ruling records why); renderers
   return Rich-markup strings, never widgets; consumed by all render paths
@@ -115,9 +115,10 @@ gate green at every tip, purity boundary (`tau_agent` ⊬ `tau_coding`) held:
 
 An adversarial review pass ran on every seam and extension batch this
 session; all confirmed findings were fixed (dialog arrow-nav, cron
-zero-interval hot loop, steer-line token parity). A review of
-`message-renderers` (the broadest seam) was still in flight at handoff
-time — check for unapplied verdicts before building on it.
+zero-interval hot loop, steer-line token parity, and the renderers
+forward-compat break — 19cf9fc makes unset custom metadata absent on the
+wire so plain new sessions stay old-binary-readable; downgrade with custom
+messages present is explicitly unsupported per the corrected Ruling).
 
 ## Remaining gaps (all small or blocked on new UI surfaces)
 
