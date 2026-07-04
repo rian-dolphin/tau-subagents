@@ -63,12 +63,29 @@ class RecordingSession:
         self.followed_up: list[str] = []
         self.custom_entries: list[tuple[str, dict[str, object]]] = []
         self.messages: list[object] = []
+        self.followed_up_custom: list[
+            tuple[str | None, dict[str, object] | None]
+        ] = []
 
-    def queue_steering_message(self, content: str) -> None:
+    def queue_steering_message(
+        self,
+        content: str,
+        *,
+        custom_type: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        del custom_type, details
         self.steered.append(content)
 
-    def queue_follow_up_message(self, content: str) -> None:
+    def queue_follow_up_message(
+        self,
+        content: str,
+        *,
+        custom_type: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
         self.followed_up.append(content)
+        self.followed_up_custom.append((custom_type, details))
 
     async def append_custom_entry(self, namespace: str, data: dict[str, object]) -> None:
         self.custom_entries.append((namespace, data))
@@ -1530,6 +1547,74 @@ async def test_inherit_context_prepends_parent_conversation(tmp_path: Path) -> N
     assert "[User]: parent question" in first.content
     assert "[Assistant]: parent answer" in first.content
     assert "# Your Task (below)\nchild task" in first.content
+
+
+def test_notification_renderer_formats_details(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    render = _submodule("notification_render").render_notification
+    details = {
+        "description": "deploy watch",
+        "status": "completed",
+        "turn_count": 3,
+        "max_turns": 10,
+        "tool_uses": 2,
+        "total_tokens": 1500,
+        "duration_ms": 2300,
+        "output_file": "/tmp/t.jsonl",
+        "error": None,
+        "result_preview": "line one\nline two",
+    }
+    view = SimpleNamespace(details=details)
+
+    collapsed = render(view, SimpleNamespace(expanded=False))
+    assert "[green]✓[/green]" in collapsed
+    assert "[bold]deploy watch[/bold]" in collapsed
+    assert "3/10 turns" in collapsed
+    assert "1.5k tokens" in collapsed
+    assert "⎿  line one" in collapsed
+    assert "line two" not in collapsed
+    assert "transcript: /tmp/t.jsonl" in collapsed
+
+    expanded = render(view, SimpleNamespace(expanded=True))
+    assert "line two" in expanded
+
+    error_view = SimpleNamespace(details={**details, "status": "error"})
+    assert "[red]✗[/red]" in render(error_view, SimpleNamespace(expanded=False))
+
+    grouped = SimpleNamespace(
+        details={**details, "others": [{**details, "description": "second run"}]}
+    )
+    both = render(grouped, SimpleNamespace(expanded=False))
+    assert "deploy watch" in both
+    assert "second run" in both
+
+    assert render(SimpleNamespace(details=None), SimpleNamespace(expanded=False)) is None
+
+
+async def test_notification_delivered_as_custom_message(tmp_path: Path) -> None:
+    try:
+        from tau_coding.extensions import CustomMessageView  # noqa: F401
+    except ImportError:
+        pytest.skip("tau branch lacks the message-renderers seam")
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    _patch_provider_factory(_extension_module(), FakeProvider([_text_stream("done")]))
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        {"prompt": "bg", "description": "bg task", "run_in_background": True}
+    )
+    await _wait_for(lambda: session.followed_up)
+
+    custom_type, details = session.followed_up_custom[0]
+    assert custom_type == "subagent-notification"
+    assert details is not None
+    assert details["description"] == "bg task"
+    assert details["status"] == "completed"
+    assert details["result_preview"] == "done"
+    # The raw XML content still enters context for the model.
+    assert "<task-notification>" in session.followed_up[0]
 
 
 class ScriptedUi:

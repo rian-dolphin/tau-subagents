@@ -48,6 +48,7 @@ from .agents import AgentDefinition, format_agent_type_list, load_agent_definiti
 from .agents_menu import show_agents_menu, supports_menu
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
+from .notification_render import render_notification
 from .output_file import OutputFileWriter, output_file_path
 from .prompts import (
     build_child_system_prompt,
@@ -678,9 +679,9 @@ class SubagentManager:
                 if run.output_file
                 else ""
             )
-            self._api.send_user_message(
+            self._deliver_notification(
                 f"{format_task_notification(run)}\n{COMPLETION_NOTICE}{footer}",
-                deliver_as="follow_up",
+                build_notification_details(run),
             )
         except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
             pass
@@ -690,12 +691,32 @@ class SubagentManager:
         if not unconsumed:
             return
         try:
-            self._api.send_user_message(
+            details = build_notification_details(unconsumed[0], GROUP_RESULT_CHARS)
+            details["others"] = [
+                build_notification_details(run, GROUP_RESULT_CHARS)
+                for run in unconsumed[1:]
+            ]
+            self._deliver_notification(
                 format_group_notification(unconsumed, partial=partial),
-                deliver_as="follow_up",
+                details,
             )
         except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
             pass
+
+    def _deliver_notification(
+        self, content: str, details: dict[str, object]
+    ) -> None:
+        """Send via the message-renderers seam when present, else raw."""
+        send_custom = getattr(self._api, "send_custom_message", None)
+        if send_custom is not None:
+            send_custom(
+                content,
+                custom_type="subagent-notification",
+                details=details,
+                deliver_as="follow_up",
+            )
+        else:
+            self._api.send_user_message(content, deliver_as="follow_up")
 
 
 def _effective_max_turns(
@@ -778,6 +799,28 @@ def format_task_notification(
     )
 
 
+def build_notification_details(
+    run: AgentRun, result_max_chars: int = INDIVIDUAL_RESULT_CHARS
+) -> dict[str, object]:
+    """Structured details for the custom renderer (pi's buildNotificationDetails)."""
+    body = run.error if run.status == "error" else run.result_text
+    preview = body or "No output."
+    if len(preview) > result_max_chars:
+        preview = preview[:result_max_chars] + "…"
+    return {
+        "description": run.description,
+        "status": run.status,
+        "turn_count": run.turns,
+        "max_turns": run.max_turns,
+        "tool_uses": run.tool_calls,
+        "total_tokens": lifetime_tokens(run) if run.has_usage else 0,
+        "duration_ms": _duration_ms(run) or 0,
+        "output_file": run.output_file,
+        "error": run.error,
+        "result_preview": preview,
+    }
+
+
 def format_group_notification(records: list[AgentRun], *, partial: bool) -> str:
     """Format a consolidated completion notice for a group of runs."""
     label = f"{len(records)} agent(s) finished"
@@ -835,6 +878,10 @@ def _duration_ms(run: AgentRun) -> int | None:
 def setup(tau: ExtensionAPI) -> None:
     """Register subagent tools, the /agents command, and shutdown cleanup."""
     manager = SubagentManager(tau)
+    if hasattr(tau, "register_message_renderer"):
+        # message-renderers seam: notifications render as pi-style cards
+        # instead of raw <task-notification> XML bubbles.
+        tau.register_message_renderer("subagent-notification", render_notification)
     scheduler = SubagentScheduler(manager)
 
     def start_scheduler() -> None:

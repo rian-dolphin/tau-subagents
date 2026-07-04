@@ -239,6 +239,16 @@ is available). The TUI renders these as the tool call's progress line. On
 branches without the seam the callback is never supplied and runs behave as
 before.
 
+## Notification rendering
+
+On Tau builds with the `message-renderers` seam, background completion
+notifications render as pi-style cards (status icon, bold description, dim
+stats line with turns/tools/tokens/duration, collapsed result preview,
+transcript path) instead of raw `<task-notification>` XML bubbles — the raw
+XML still enters the model's context unchanged. Group notifications stack
+one card per run. Without the seam, notifications arrive as plain user
+messages exactly as before.
+
 ## Concurrency and the background queue
 
 Only **background** agents count toward a concurrency limit (`maxConcurrent`,
