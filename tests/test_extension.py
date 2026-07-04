@@ -1532,6 +1532,114 @@ async def test_inherit_context_prepends_parent_conversation(tmp_path: Path) -> N
     assert "# Your Task (below)\nchild task" in first.content
 
 
+class ScriptedUi:
+    """Scripted DialogUi fake for menu tests."""
+
+    def __init__(self, selects, confirms=(), inputs=()) -> None:  # noqa: ANN001
+        self.selects = list(selects)
+        self.confirms = list(confirms)
+        self.inputs = list(inputs)
+        self.select_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.notifications: list[str] = []
+
+    @property
+    def has_ui(self) -> bool:
+        return True
+
+    def notify(self, message: str, level: str = "info") -> None:
+        self.notifications.append(message)
+
+    async def select(self, title, options, *, timeout=None):  # noqa: ANN001, ANN202
+        self.select_calls.append((title, tuple(options)))
+        answer = self.selects.pop(0)
+        return answer(options) if callable(answer) else answer
+
+    async def confirm(self, title, message, *, timeout=None):  # noqa: ANN001, ANN202
+        return self.confirms.pop(0)
+
+    async def input(self, title, placeholder="", *, timeout=None):  # noqa: ANN001, ANN202
+        return self.inputs.pop(0)
+
+
+def _menu_run(module, **overrides):  # noqa: ANN001, ANN202
+    defaults = {
+        "agent_id": "agent-1",
+        "agent_type": "general",
+        "description": "task",
+        "prompt": "p",
+        "background": True,
+    }
+    defaults.update(overrides)
+    return module.AgentRun(**defaults)
+
+
+async def test_agents_menu_stops_running_agent(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    run = _menu_run(_extension_module(), status="running")
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+    ui = ScriptedUi(
+        selects=[
+            lambda options: options[0],  # top: Running agents (…)
+            lambda options: options[0],  # the run
+            "Stop",
+            None,  # leave run list
+            None,  # leave top menu
+        ],
+        confirms=[True],
+    )
+
+    await menu.show_agents_menu(manager, ui)
+
+    assert run.aborted is True
+    assert any("Stopped" in note for note in ui.notifications)
+
+
+async def test_agents_menu_steers_queued_agent(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    run = _menu_run(_extension_module(), status="queued")
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+    ui = ScriptedUi(
+        selects=[
+            lambda options: options[0],
+            lambda options: options[0],
+            "Steer…",
+            None,
+            None,
+        ],
+        inputs=["focus on tests"],
+    )
+
+    await menu.show_agents_menu(manager, ui)
+
+    assert run.pending_steers == ["focus on tests"]
+
+
+async def test_agents_menu_shows_finished_result(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    run = _menu_run(
+        _extension_module(), status="completed", result_text="All done here"
+    )
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+    ui = ScriptedUi(
+        selects=[
+            lambda options: options[0],
+            lambda options: options[0],
+            "View result",
+            None,
+            None,
+        ],
+    )
+
+    await menu.show_agents_menu(manager, ui)
+
+    assert any("All done here" in note for note in ui.notifications)
+    assert menu.supports_menu(ui) is True
+    assert menu.supports_menu(None) is False
+
+
 async def test_inherit_context_skips_empty_parent(tmp_path: Path) -> None:
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))

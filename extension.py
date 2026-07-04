@@ -41,6 +41,7 @@ from tau_coding.provider_runtime import create_model_provider
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL, THINKING_LEVELS
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
+from .agents_menu import show_agents_menu, supports_menu
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
 from .output_file import OutputFileWriter, output_file_path
@@ -1046,8 +1047,23 @@ def setup(tau: ExtensionAPI) -> None:
             f"Current state: {' · '.join(state_parts)}",
         )
 
+    menu_tasks: set[asyncio.Task[None]] = set()
+
     def agents_command(args: str, context) -> str:  # noqa: ANN001
         del args, context
+        ui = getattr(getattr(tau, "context", None), "ui", None)
+        if supports_menu(ui):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                # Sync handlers can't await dialogs; drive the menu from a
+                # loop task (the documented ui-dialogs pattern).
+                task = loop.create_task(show_agents_menu(manager, ui))
+                menu_tasks.add(task)
+                task.add_done_callback(menu_tasks.discard)
+                return "Opening agents menu…"
         definitions = manager.definitions()
         lines = ["Agent types:", format_agent_type_list(definitions)]
         if manager.runs:

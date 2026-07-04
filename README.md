@@ -46,6 +46,13 @@ Ask the model to delegate:
 > Spawn an explore subagent to find where slash commands are registered,
 > run it in the background.
 
+`/agents` manages agents. On Tau builds with the `ui-dialogs` seam it opens
+an interactive menu (ported from pi's showAgentsMenu): browse runs (view a
+finished run's result, steer or stop an active one via dialogs) and agent
+types. pi's create wizard, settings menu, and full conversation-viewer
+overlay are not ported yet (Tau has select/confirm/input dialogs only).
+Without the seam — or headless — it prints the plain-text list instead.
+
 ## Agent types
 
 Two built-in types ship with the extension:
