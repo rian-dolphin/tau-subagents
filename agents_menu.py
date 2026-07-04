@@ -13,10 +13,13 @@ Navigation matches pi: submenus loop back to their parent, escape backs out.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from .extension import AgentRun, SubagentManager
+    from .schedule import SubagentScheduler
+    from .schedule_store import ScheduledSubagent
 
 RESULT_PREVIEW_CHARS = 600
 ACTIVE_STATUSES = ("running", "queued")
@@ -49,8 +52,12 @@ def supports_menu(ui: object) -> bool:
     )
 
 
-async def show_agents_menu(manager: SubagentManager, ui: DialogUi) -> None:
-    """Top-level menu (pi's showAgentsMenu): runs, then agent types."""
+async def show_agents_menu(
+    manager: SubagentManager,
+    ui: DialogUi,
+    scheduler: SubagentScheduler | None = None,
+) -> None:
+    """Top-level menu (pi's showAgentsMenu): runs, agent types, scheduled jobs."""
     while True:
         runs = list(manager.runs.values())
         definitions = manager.definitions()
@@ -62,6 +69,9 @@ async def show_agents_menu(manager: SubagentManager, ui: DialogUi) -> None:
                 f"Running agents ({len(runs)}) — {running} running, {done} done"
             )
         options.append(f"Agent types ({len(definitions)})")
+        scheduler_active = scheduler is not None and scheduler.is_active()
+        if scheduler_active:
+            options.append(f"Scheduled jobs ({len(scheduler.list())})")
         choice = await ui.select("Agents", options)
         if choice is None:
             return
@@ -69,6 +79,8 @@ async def show_agents_menu(manager: SubagentManager, ui: DialogUi) -> None:
             await show_running_agents(manager, ui)
         elif choice.startswith("Agent types ("):
             await show_agent_types(manager, ui)
+        elif scheduler_active and choice.startswith("Scheduled jobs ("):
+            await show_schedules_menu(scheduler, ui)
         else:
             return
 
@@ -140,6 +152,83 @@ async def show_agent_types(manager: SubagentManager, ui: DialogUi) -> None:
         if definition.max_turns is not None:
             lines.append(f"max_turns: {definition.max_turns}")
         ui.notify("\n".join(lines), "info")
+
+
+async def show_schedules_menu(scheduler: SubagentScheduler, ui: DialogUi) -> None:
+    """List scheduled jobs; selecting one opens a cancel-confirm (pi's port)."""
+    jobs = scheduler.list()
+    if not jobs:
+        ui.notify("No scheduled jobs.", "info")
+        return
+    labels = [_format_job(job, scheduler) for job in jobs]
+    choice = await ui.select(
+        f"Scheduled jobs ({len(jobs)}) — select to cancel", labels
+    )
+    if choice is None:
+        return
+    index = labels.index(choice)
+    job = jobs[index]
+    if await ui.confirm(f'Cancel "{job.name}"?', _format_job_details(job, scheduler)):
+        scheduler.remove_job(job.id)
+        ui.notify(f'Cancelled "{job.name}".', "info")
+
+
+def _status_icon(job: ScheduledSubagent) -> str:
+    if not job.enabled:
+        return "x"
+    if job.last_status == "error":
+        return "!"
+    if job.last_status == "running":
+        return "~"
+    return "ok"
+
+
+def _format_job(job: ScheduledSubagent, scheduler: SubagentScheduler) -> str:
+    return (
+        f"{_status_icon(job)}  {job.name[:18]:<18}  {job.schedule[:14]:<14}"
+        f"  [{job.subagent_type}]  next {_rel_time(scheduler.get_next_run(job.id))}"
+        f"  last {_rel_time(job.last_run)}  runs {job.run_count}"
+    )
+
+
+def _format_job_details(job: ScheduledSubagent, scheduler: SubagentScheduler) -> str:
+    prompt = job.prompt[:200] + ("..." if len(job.prompt) > 200 else "")
+    return "\n".join(
+        [
+            f"name:      {job.name}",
+            f"schedule:  {job.schedule} ({job.schedule_type})",
+            f"agent:     {job.subagent_type}",
+            f"prompt:    {prompt}",
+            f"created:   {job.created_at}",
+            f"last run:  {job.last_run or '-'} ({job.last_status or '-'})",
+            f"next run:  {scheduler.get_next_run(job.id) or '-'}",
+            f"runs:      {job.run_count}",
+        ]
+    )
+
+
+def _rel_time(iso: str | None, now: datetime | None = None) -> str:
+    """Format an ISO timestamp as relative time ("in 4h", "2d ago", "-")."""
+    if not iso:
+        return "-"
+    try:
+        moment = datetime.fromisoformat(iso)
+    except ValueError:
+        return "-"
+    now = now or datetime.now()
+    diff = (moment - now).total_seconds()
+    future = diff > 0
+    seconds = abs(diff)
+    if seconds < 60:
+        return "in <1m" if future else "<1m ago"
+    if seconds < 3600:
+        value = round(seconds / 60)
+        return f"in {value}m" if future else f"{value}m ago"
+    if seconds < 86400:
+        value = round(seconds / 3600)
+        return f"in {value}h" if future else f"{value}h ago"
+    value = round(seconds / 86400)
+    return f"in {value}d" if future else f"{value}d ago"
 
 
 def steer_run(run: AgentRun, message: str) -> None:

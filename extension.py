@@ -36,7 +36,11 @@ from tau_coding import (
     load_provider_settings,
     resolve_provider_selection,
 )
-from tau_coding.extensions import ExtensionAPI, SessionShutdownEvent
+from tau_coding.extensions import (
+    ExtensionAPI,
+    SessionShutdownEvent,
+    SessionStartEvent,
+)
 from tau_coding.provider_runtime import create_model_provider
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL, THINKING_LEVELS
 
@@ -52,6 +56,8 @@ from .prompts import (
     inherited_resource_paths,
     resolve_skill_blocks,
 )
+from .schedule import SubagentScheduler
+from .schedule_store import ScheduleStore, resolve_store_path
 from .settings import SubagentSettings, load_subagent_settings
 from .worktree import (
     WORKTREE_ERROR_MESSAGE,
@@ -188,6 +194,7 @@ class SubagentManager:
         isolation: str | None = None,
         model: str | None = None,
         thinking: str | None = None,
+        bypass_queue: bool = False,
     ) -> AgentRun:
         self._counter += 1
         run = AgentRun(
@@ -217,7 +224,11 @@ class SubagentManager:
             if run.join_mode in ("smart", "group"):
                 self._batch.append(run)
                 self._schedule_batch_finalize()
-        if background and self._running_background >= self.max_concurrent:
+        if (
+            background
+            and not bypass_queue
+            and self._running_background >= self.max_concurrent
+        ):
             run.status = "queued"
             self._queue.append((run, agent_type))
             return run
@@ -824,9 +835,31 @@ def _duration_ms(run: AgentRun) -> int | None:
 def setup(tau: ExtensionAPI) -> None:
     """Register subagent tools, the /agents command, and shutdown cleanup."""
     manager = SubagentManager(tau)
+    scheduler = SubagentScheduler(manager)
+
+    def start_scheduler() -> None:
+        # Session-scoped: the store is built once the session id is available
+        # (mirrors pi, which constructs it in session_start). Scheduling is
+        # non-essential — swallow failures so an unwritable .tau/ can't break
+        # the rest of the extension.
+        try:
+            session_id = tau.context.session_id
+            if not session_id:
+                return  # id not yet available — retry on the next session_start
+            store = ScheduleStore(resolve_store_path(tau.context.cwd, session_id))
+            scheduler.start(store)
+        except Exception:  # noqa: BLE001 - scheduling must never break the session
+            pass
+
+    async def on_session_start(event: SessionStartEvent) -> None:
+        del event
+        if not scheduler.is_active():
+            start_scheduler()
 
     async def run_agent_tool(arguments, signal=None, *, on_update=None):  # noqa: ANN001, ANN202
         await manager.evict_stale()
+        if arguments.get("schedule"):
+            return await run_schedule(arguments)
         resume_id = arguments.get("resume")
         if resume_id:
             return await run_resume(str(resume_id), arguments, on_update)
@@ -957,6 +990,88 @@ def setup(tau: ExtensionAPI) -> None:
             run.on_update = None
         return _foreground_result(run)
 
+    async def run_schedule(arguments) -> AgentToolResult:  # noqa: ANN001
+        # Guards mirror pi: a scheduled job creates a fresh background agent at
+        # fire time, so it is incompatible with resume, inherit_context, and a
+        # foreground run.
+        if arguments.get("resume"):
+            return _tool_result(
+                "agent",
+                ok=False,
+                content="Cannot combine `schedule` with `resume` —"
+                " schedules create fresh agents.",
+            )
+        if arguments.get("inherit_context"):
+            return _tool_result(
+                "agent",
+                ok=False,
+                content="Cannot combine `schedule` with `inherit_context` —"
+                " there is no parent conversation at fire time.",
+            )
+        if arguments.get("run_in_background") is False:
+            return _tool_result(
+                "agent",
+                ok=False,
+                content="Cannot combine `schedule` with `run_in_background: false`"
+                " — scheduled jobs always run in background.",
+            )
+        if not scheduler.is_active():
+            return _tool_result(
+                "agent",
+                ok=False,
+                content="Scheduler is not active in this session yet."
+                " Try again after the session has fully started.",
+            )
+        definitions = manager.definitions()
+        agent_type = str(arguments.get("subagent_type", "general"))
+        definition = definitions.get(agent_type)
+        if definition is None:
+            available = ", ".join(sorted(definitions))
+            return _tool_result(
+                "agent",
+                ok=False,
+                content=f"Unknown subagent_type: {agent_type}. Available: {available}",
+            )
+        prompt = str(arguments.get("prompt", "")).strip()
+        if not prompt:
+            return _tool_result("agent", ok=False, content="prompt is required")
+        description = str(arguments.get("description", "")) or f"{agent_type} agent"
+        thinking = arguments.get("thinking")
+        if thinking is not None:
+            thinking = str(thinking)
+            if thinking not in THINKING_LEVELS:
+                return _tool_result(
+                    "agent",
+                    ok=False,
+                    content=f"Invalid thinking level: {thinking}."
+                    f" Valid options: {', '.join(THINKING_LEVELS)}",
+                )
+        isolation = "worktree" if arguments.get("isolation") == "worktree" else None
+        try:
+            job = scheduler.add_job(
+                name=description,
+                description=description,
+                schedule=str(arguments.get("schedule")),
+                subagent_type=agent_type,
+                prompt=prompt,
+                model=str(arguments.get("model")) if arguments.get("model") else None,
+                thinking=thinking,
+                max_turns=_coerce_max_turns(arguments.get("max_turns")),
+                isolation=isolation,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return _tool_result("agent", ok=False, content=str(exc))
+        next_run = scheduler.get_next_run(job.id) or "(unknown)"
+        return _tool_result(
+            "agent",
+            ok=True,
+            content=(
+                f'Scheduled "{job.name}" (id: {job.id}, type: {job.schedule_type}).'
+                f" Next run: {next_run}."
+                " Manage via /agents -> Scheduled jobs."
+            ),
+        )
+
     async def run_get_result_tool(arguments, signal=None):  # noqa: ANN001, ANN202
         del signal
         await manager.evict_stale()
@@ -1060,7 +1175,7 @@ def setup(tau: ExtensionAPI) -> None:
             if loop is not None:
                 # Sync handlers can't await dialogs; drive the menu from a
                 # loop task (the documented ui-dialogs pattern).
-                task = loop.create_task(show_agents_menu(manager, ui))
+                task = loop.create_task(show_agents_menu(manager, ui, scheduler))
                 menu_tasks.add(task)
                 task.add_done_callback(menu_tasks.discard)
                 return "Opening agents menu…"
@@ -1079,6 +1194,7 @@ def setup(tau: ExtensionAPI) -> None:
         # Tear down on every shutdown reason (new/resume/branch/quit): runs
         # belong to the outgoing transcript and would otherwise leak sessions.
         del event
+        scheduler.stop()
         await manager.shutdown()
         manager.runs.clear()
 
@@ -1150,6 +1266,15 @@ def setup(tau: ExtensionAPI) -> None:
                         " history to the agent's prompt. Default: false"
                         " (fresh context).",
                     },
+                    "schedule": {
+                        "type": "string",
+                        "description": "Opt-in only — fire later instead of now."
+                        " Omit to run immediately (the default, almost always"
+                        ' correct). Formats: 5-field cron ("0 9 * * 1" = 9am Mon),'
+                        ' interval ("5m"/"1h"), one-shot ("+10m" or ISO). Forces'
+                        " run_in_background; incompatible with inherit_context and"
+                        " resume. Returns a job ID.",
+                    },
                 },
                 "required": ["prompt", "description"],
             },
@@ -1209,6 +1334,7 @@ def setup(tau: ExtensionAPI) -> None:
         agents_command,
         description="List subagent types and runs.",
     )
+    tau.on("session_start", on_session_start)
     tau.on("session_shutdown", on_shutdown)
 
 

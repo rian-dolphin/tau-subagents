@@ -273,6 +273,21 @@ finished agent's session — its full conversation history is kept alive. Resume
 always runs in the foreground and returns the new final answer inline. (Turn
 limits are not re-enforced on resume.)
 
+## Scheduling agents (`schedule`)
+
+Pass `schedule` on the `agent` tool to run it later or repeatedly, ported
+from pi's scheduler. Formats: 5-field cron (`0 9 * * 1` — numeric fields
+only; `*`, lists, ranges, `*/n`; minimum granularity one minute), intervals
+(`5m`, `1h`; minimum 5s), and one-shots (`+10m` relative or an ISO
+timestamp). Scheduled spawns are always background, bypass the concurrency
+queue, and deliver the normal completion notification; `schedule` is
+incompatible with `resume`, `inherit_context`, and `run_in_background:
+false`, matching pi. Jobs persist per session in
+`<cwd>/.tau/subagent-schedules/<session_id>.json` (PID-locked, atomic);
+missed fires are skipped, past one-shots are disabled. Manage jobs via
+`/agents → Scheduled jobs` (list + cancel). Times are naive local time —
+across a DST transition a fire can land up to an hour off.
+
 ## Inheriting the parent conversation (`inherit_context`)
 
 By default a subagent starts with fresh context. Pass `inherit_context: true`
