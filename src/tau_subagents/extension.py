@@ -1211,7 +1211,7 @@ def setup(tau: ExtensionAPI) -> None:
 
     menu_tasks: set[asyncio.Task[None]] = set()
 
-    def agents_command(args: str, context) -> str:  # noqa: ANN001
+    def agents_command(args: str, context) -> str | None:  # noqa: ANN001
         del args, context
         ui = getattr(getattr(tau, "context", None), "ui", None)
         if supports_menu(ui):
@@ -1221,11 +1221,13 @@ def setup(tau: ExtensionAPI) -> None:
                 loop = None
             if loop is not None:
                 # Sync handlers can't await dialogs; drive the menu from a
-                # loop task (the documented ui-dialogs pattern).
+                # loop task (the documented ui-dialogs pattern). Return no
+                # message: any text would open a modal the user must dismiss
+                # before the menu appears.
                 task = loop.create_task(show_agents_menu(manager, ui, scheduler))
                 menu_tasks.add(task)
                 task.add_done_callback(menu_tasks.discard)
-                return "Opening agents menu…"
+                return None
         definitions = manager.definitions()
         lines = ["Agent types:", format_agent_type_list(definitions)]
         if manager.runs:
