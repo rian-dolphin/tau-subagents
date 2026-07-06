@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from tau_agent.messages import UserMessage
 from tau_agent.session import SessionEntry
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding import (
@@ -41,11 +42,21 @@ from tau_coding.extensions import (
     SessionShutdownEvent,
     SessionStartEvent,
 )
+
+try:  # tau's transcript-sources seam (agents strip); older tau lacks it
+    from tau_coding.extensions import TranscriptSource
+except ImportError:  # pragma: no cover - exercised only on older tau branches
+    TranscriptSource = None  # type: ignore[assignment, misc]
 from tau_coding.provider_runtime import create_model_provider
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL, THINKING_LEVELS
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
-from .agents_menu import show_agents_menu, supports_menu
+from .agents_menu import (
+    run_snapshot_messages,
+    show_agents_menu,
+    steer_run,
+    supports_menu,
+)
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
 from .notification_render import render_notification
@@ -122,6 +133,7 @@ class AgentRun:
     error: str | None = None
     turns: int = 0
     tool_calls: int = 0
+    revision: int = 0
     task: asyncio.Task[None] | None = None
     session: CodingSession | None = None
     provider: object | None = None
@@ -167,6 +179,15 @@ class SubagentManager:
         self._group_join: GroupJoinManager | None = None
         self._worktree_repos: set[str] = set()
         self._nudge_timers: dict[str, asyncio.TimerHandle] = {}
+        # Host signal (tau's transcript-sources seam): fired when the run
+        # list or a run's status changes so the agents strip refreshes.
+        self.sources_changed: Callable[[], None] | None = None
+
+    def _notify_sources(self) -> None:
+        callback = self.sources_changed
+        if callback is not None:
+            with contextlib.suppress(Exception):
+                callback()
 
     @property
     def runs(self) -> dict[str, AgentRun]:
@@ -232,8 +253,10 @@ class SubagentManager:
         ):
             run.status = "queued"
             self._queue.append((run, agent_type))
+            self._notify_sources()
             return run
         self._start(run, agent_type)
+        self._notify_sources()
         return run
 
     def _get_group_join(self) -> GroupJoinManager:
@@ -298,6 +321,7 @@ class SubagentManager:
         run.soft_limit_reached = False
         run.started_at = time.monotonic()
         run.completed_at = None
+        self._notify_sources()
         final_text: list[str] = []
         try:
             async for event in session.prompt(prompt):
@@ -312,6 +336,7 @@ class SubagentManager:
         finally:
             await self._persist_record(run)
             run.completed_at = time.monotonic()
+            self._notify_sources()
 
     async def shutdown(self) -> None:
         self._shutting_down = True
@@ -347,6 +372,7 @@ class SubagentManager:
             self._worktree_repos.clear()
         finally:
             self._shutting_down = False
+            self._notify_sources()
 
     async def evict_stale(self) -> None:
         """Close sessions of consumed terminal runs older than the staleness cap."""
@@ -388,6 +414,7 @@ class SubagentManager:
         finally:
             await self._finalize_run(run)
             run.completed_at = time.monotonic()
+            self._notify_sources()
             if run.background:
                 self._running_background -= 1
                 self._drain_queue()
@@ -585,6 +612,7 @@ class SubagentManager:
             run.session.cancel()
 
     def _observe(self, run: AgentRun, event: AgentEvent, final_text: list[str]) -> None:
+        run.revision += 1
         if event.type == "turn_end":
             run.turns += 1
         elif event.type == "tool_execution_start":
@@ -876,6 +904,51 @@ def _duration_ms(run: AgentRun) -> int | None:
 
 
 STEER_CALL_PREVIEW_CHARS = 60
+
+# AgentRun statuses → tau's TranscriptSource status vocabulary.
+SOURCE_STATUS = {
+    "running": "running",
+    "queued": "queued",
+    "completed": "done",
+    "steered": "done",
+    "error": "error",
+    "cancelled": "cancelled",
+    "aborted": "cancelled",
+}
+
+
+def run_transcript_source(run: AgentRun):  # noqa: ANN201 - TranscriptSource when available
+    """Map one run onto tau's TranscriptSource (the agents-strip seam)."""
+
+    def messages():  # noqa: ANN202 - tuple[AgentMessage, ...] | None
+        session = run.session
+        if session is not None:
+            try:
+                return tuple(session.messages)
+            except Exception:  # noqa: BLE001 - a closing session must not break the strip
+                return None
+        if run.status == "queued":
+            return (UserMessage(content=run.prompt),)
+        if run.status in TERMINAL_STATUSES:
+            # Session closed or evicted: the run record still tells the story.
+            return run_snapshot_messages(run)
+        return None
+
+    steer = None
+    if run.status in ("running", "queued"):
+
+        def steer(text: str, _run: AgentRun = run) -> None:
+            steer_run(_run, text)
+
+    return TranscriptSource(
+        id=run.agent_id,
+        label=run.agent_type,
+        detail=run.description,
+        status=SOURCE_STATUS.get(run.status, "running"),
+        messages=messages,
+        revision=run.revision,
+        steer=steer,
+    )
 
 
 def render_agent_call(arguments: Mapping[str, object]) -> str:
@@ -1277,6 +1350,7 @@ def setup(tau: ExtensionAPI) -> None:
         scheduler.stop()
         await manager.shutdown()
         manager.runs.clear()
+        manager._notify_sources()  # noqa: SLF001 - same-module teardown signal
 
     type_list = format_agent_type_list(load_agent_definitions(Path.cwd()))
     tau.register_tool(
@@ -1412,6 +1486,16 @@ def setup(tau: ExtensionAPI) -> None:
             render_call=render_steer_call,
         )
     )
+    set_source_provider = getattr(tau, "set_transcript_source_provider", None)
+    if TranscriptSource is not None and callable(set_source_provider):
+
+        def transcript_sources():  # noqa: ANN202 - tuple of TranscriptSource
+            return tuple(
+                run_transcript_source(run) for run in manager.runs.values()
+            )
+
+        set_source_provider(transcript_sources)
+        manager.sources_changed = tau.notify_transcript_sources_changed
     tau.register_command(
         "agents",
         agents_command,

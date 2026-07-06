@@ -1821,6 +1821,96 @@ async def test_agents_menu_transcript_synthesizes_when_session_gone(tmp_path: Pa
     assert messages[1].content == "Final report"
 
 
+def test_run_transcript_source_maps_live_and_terminal_runs() -> None:
+    extension = _extension_module()
+
+    live = _menu_run(extension, status="running")
+    steered: list[str] = []
+    live.session = SimpleNamespace(
+        messages=[UserMessage(content="child prompt")],
+        queue_steering_message=steered.append,
+    )
+    live.revision = 7
+    source = extension.run_transcript_source(live)
+    assert (source.id, source.label, source.detail) == ("agent-1", "general", "task")
+    assert source.status == "running"
+    assert source.revision == 7
+    assert source.messages() == (UserMessage(content="child prompt"),)
+    source.steer("focus on tests")
+    assert steered == ["focus on tests"]
+
+    done = _menu_run(extension, status="completed", result_text="Final report")
+    source = extension.run_transcript_source(done)
+    assert source.status == "done"
+    assert source.steer is None
+    snapshot = source.messages()
+    assert snapshot is not None
+    assert snapshot[0].content == "p"
+    assert snapshot[1].content == "Final report"
+
+    queued = _menu_run(extension, status="queued")
+    source = extension.run_transcript_source(queued)
+    assert source.status == "queued"
+    assert source.messages() == (UserMessage(content="p"),)
+    source.steer("get ahead of it")
+    assert queued.pending_steers == ["get ahead of it"]
+
+    aborted = _menu_run(extension, status="aborted")
+    assert extension.run_transcript_source(aborted).status == "cancelled"
+
+
+async def test_transcript_sources_published_and_signalled(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    fired: list[int] = []
+    runtime.set_transcript_sources_changed_callback(lambda: fired.append(1))
+    _patch_provider_factory(_extension_module(), FakeProvider([_text_stream("done")]))
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute({"prompt": "task", "description": "map the code"})
+
+    assert fired  # spawn + completion pushed the sources-changed signal
+    sources = runtime.transcript_sources()
+    assert len(sources) == 1
+    assert sources[0].id == "agent-1"
+    assert sources[0].status == "done"
+    assert sources[0].detail == "map the code"
+    messages = sources[0].messages()
+    assert messages is not None and len(messages) >= 2
+
+
+async def test_agents_menu_prefers_in_place_view(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    run = _menu_run(_extension_module(), status="running")
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+
+    class InPlaceUi(TranscriptScriptedUi):
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            super().__init__(*args, **kwargs)
+            self.viewed: list[str] = []
+
+        async def view_transcript(self, source_id: str) -> bool:
+            self.viewed.append(source_id)
+            return True
+
+    ui = InPlaceUi(
+        selects=[
+            lambda options: options[0],  # top: Running agents (…)
+            lambda options: options[0],  # the run → switches the main view
+        ],
+    )
+
+    await menu.show_agents_menu(manager, ui)
+
+    # The whole menu unwound so the user lands in the in-place view; the
+    # modal fallback and the action submenu never opened.
+    assert ui.viewed == ["agent-1"]
+    assert ui.transcript_calls == []
+    assert len(ui.select_calls) == 2
+
+
 def test_render_call_lines() -> None:
     extension = _extension_module()
 

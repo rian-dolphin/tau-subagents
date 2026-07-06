@@ -88,7 +88,8 @@ async def show_agents_menu(
         if choice is None:
             return
         if choice.startswith("Running agents ("):
-            await show_running_agents(manager, ui)
+            if await show_running_agents(manager, ui):
+                return
         elif choice.startswith("Agent types ("):
             await show_agent_types(manager, ui)
         elif scheduler_active and choice.startswith("Scheduled jobs ("):
@@ -97,13 +98,13 @@ async def show_agents_menu(
             return
 
 
-async def show_running_agents(manager: SubagentManager, ui: DialogUi) -> None:
-    """Run list (pi's showRunningAgents), looping back after each action."""
+async def show_running_agents(manager: SubagentManager, ui: DialogUi) -> bool:
+    """Run list (pi's showRunningAgents); True when the whole menu should close."""
     while True:
         runs = list(manager.runs.values())
         if not runs:
             ui.notify("No agents.", "info")
-            return
+            return False
         options = [
             f"{run.agent_type} ({run.description}) · {run.tool_calls} tools"
             f" · {run.status} · {_format_duration(run)}"
@@ -111,23 +112,36 @@ async def show_running_agents(manager: SubagentManager, ui: DialogUi) -> None:
         ]
         choice = await ui.select("Running agents", options)
         if choice is None:
-            return
+            return False
         index = options.index(choice)
         run = runs[index]
-        if await view_run_conversation(ui, run):
+        outcome = await view_run_conversation(ui, run)
+        if outcome == "exit":
+            return True
+        if outcome == "actions":
             await show_run_actions(ui, run)
 
 
-async def view_run_conversation(ui: DialogUi, run: AgentRun) -> bool:
-    """Show the run's session as a live transcript (pi's conversation viewer).
+async def view_run_conversation(ui: DialogUi, run: AgentRun) -> str:
+    """Open the run's conversation; returns "exit", "actions", or "back".
 
-    Returns True when the user asked for the action submenu (Enter inside the
-    viewer), and also when the host UI predates the `show_transcript` seam,
-    so the caller falls back to the submenu directly.
+    Prefers the host's in-place agent view (tau's `view_transcript`, the
+    agents-strip seam): on success the whole menu closes ("exit") so the
+    user lands in the view. Hosts without it fall back to the modal
+    transcript viewer ("actions" when accepted with Enter, "back" on
+    Escape), and hosts without either go straight to the action submenu.
     """
+    view = getattr(ui, "view_transcript", None)
+    if view is not None:
+        try:
+            opened = bool(await view(run.agent_id))
+        except Exception:  # noqa: BLE001 - fall back to the modal path
+            opened = False
+        if opened:
+            return "exit"
     show = getattr(ui, "show_transcript", None)
     if show is None:
-        return True
+        return "actions"
     title = f"{run.agent_id} [{run.status}] {run.description}"
 
     def poll() -> tuple[AgentMessage, ...] | None:
@@ -139,8 +153,10 @@ async def view_run_conversation(ui: DialogUi, run: AgentRun) -> bool:
     messages = poll()
     if messages is None:
         # Session closed or evicted: show what the run still remembers.
-        return bool(await show(title, run_snapshot_messages(run)))
-    return bool(await show(title, messages, poll=poll))
+        accepted = bool(await show(title, run_snapshot_messages(run)))
+    else:
+        accepted = bool(await show(title, messages, poll=poll))
+    return "actions" if accepted else "back"
 
 
 def run_snapshot_messages(run: AgentRun) -> tuple[AgentMessage, ...]:
