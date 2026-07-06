@@ -153,7 +153,6 @@ class AgentRun:
     soft_limit_reached: bool = False
     aborted: bool = False
     pending_steers: list[str] = field(default_factory=list)
-    on_update: Callable[[str, dict[str, object] | None], None] | None = None
     join_mode: str | None = None
     requested_isolation: str | None = None
     worktree: Worktree | None = None
@@ -635,33 +634,6 @@ class SubagentManager:
         elif event.type == "error" and not event.recoverable:
             run.status = "error"
             run.error = event.message
-        self._emit_progress(run, event)
-
-    def _emit_progress(self, run: AgentRun, event: AgentEvent) -> None:
-        """Relay child activity to a live on_update consumer (foreground runs)."""
-        if run.on_update is None:
-            return
-        if event.type == "tool_execution_start":
-            message = (
-                f"{run.agent_id}: {event.tool_call.name}"
-                f" · turn {run.turns + 1} · {run.tool_calls} tool uses"
-            )
-        elif event.type == "turn_end":
-            message = (
-                f"{run.agent_id}: turn {run.turns} done · {run.tool_calls} tool uses"
-            )
-        else:
-            return
-        data: dict[str, object] = {
-            "agent_id": run.agent_id,
-            "type": run.agent_type,
-            "turns": run.turns,
-            "tool_uses": run.tool_calls,
-        }
-        if run.has_usage:
-            data["total_tokens"] = lifetime_tokens(run)
-        with contextlib.suppress(Exception):
-            run.on_update(message, data)
 
     def _deliver_background_result(self, run: AgentRun) -> None:
         if run.result_consumed:
@@ -1007,13 +979,13 @@ def setup(tau: ExtensionAPI) -> None:
         if not scheduler.is_active():
             start_scheduler()
 
-    async def run_agent_tool(arguments, signal=None, *, on_update=None):  # noqa: ANN001, ANN202
+    async def run_agent_tool(arguments, signal=None):  # noqa: ANN001, ANN202
         await manager.evict_stale()
         if arguments.get("schedule"):
             return await run_schedule(arguments)
         resume_id = arguments.get("resume")
         if resume_id:
-            return await run_resume(str(resume_id), arguments, on_update)
+            return await run_resume(str(resume_id), arguments)
 
         definitions = manager.definitions()
         agent_type = str(arguments.get("subagent_type", "general"))
@@ -1084,9 +1056,6 @@ def setup(tau: ExtensionAPI) -> None:
                 content=format_background_spawn(run, manager.max_concurrent),
             )
 
-        # Live progress: only valid while this tool call is executing, so
-        # foreground-only, cleared before returning.
-        run.on_update = on_update
         assert run.task is not None
         while not run.task.done():
             if signal is not None and signal.is_cancelled():
@@ -1096,14 +1065,12 @@ def setup(tau: ExtensionAPI) -> None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await run.task
                 await manager.close_run(run)
-                run.on_update = None
                 return _tool_result("agent", ok=False, content="Subagent cancelled")
             await asyncio.sleep(0.05)
 
-        run.on_update = None
         return _foreground_result(run)
 
-    async def run_resume(agent_id: str, arguments, on_update=None) -> AgentToolResult:  # noqa: ANN001
+    async def run_resume(agent_id: str, arguments) -> AgentToolResult:  # noqa: ANN001
         run = manager.runs.get(agent_id)
         if run is None:
             return _tool_result(
@@ -1134,11 +1101,7 @@ def setup(tau: ExtensionAPI) -> None:
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
             return _tool_result("agent", ok=False, content="prompt is required")
-        run.on_update = on_update
-        try:
-            await manager.resume(run, prompt)
-        finally:
-            run.on_update = None
+        await manager.resume(run, prompt)
         return _foreground_result(run)
 
     async def run_schedule(arguments) -> AgentToolResult:  # noqa: ANN001
