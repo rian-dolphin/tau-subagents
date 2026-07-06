@@ -65,7 +65,15 @@ definitions), `agents_menu.py` (interactive /agents menu), `settings.py`,
 `group_join.py`, `worktree.py`, `memory.py`, `output_file.py`, `cron.py`
 (vendored 5-field matcher), `schedule.py` + `schedule_store.py` (pi's
 scheduler), `notification_render.py` (pi-style notification cards).
-73 tests.
+81 tests.
+
+Added 2026-07-06 (this session): `render_call` friendly tool lines on all
+three tools; runs published as `TranscriptSource`s (agents strip, in-place
+views, steer-by-typing — see the not-yet-extracted seams below); /agents
+run selection jumps into the in-place view (modal → submenu fallbacks);
+the per-event foreground progress relay (`on_update`/`_emit_progress`) was
+REMOVED — the spinner+timer on the tool row is the live signal now, so the
+`tool-progress` seam currently has no consumer in this extension.
 
 Everything in the 2026-07-03 handoff's feature list still holds, plus, all
 new this session (each feature-detects its Tau seam and degrades on plain
@@ -77,8 +85,9 @@ new this session (each feature-detects its Tau seam and degrades on plain
   `get_subagent_result`, `steer_subagent` state line, and run records;
   totals survive resume. Falls back to the chars/4 `context_tokens`
   estimate without the seam.
-- **Live foreground progress** — the `agent` tool opts into `on_update`;
-  one update per child tool start / completed turn with structured data.
+- ~~Live foreground progress~~ — REMOVED 2026-07-06: the `on_update`
+  relay's per-event text lines were transcript noise once tau core grew
+  the pending-tool spinner + elapsed timer and the in-place agent views.
 - **`inherit_context`** (param or frontmatter, param wins) — pi's verbatim
   parent-context digest (`[User]:`/`[Assistant]:`, tool results dropped)
   prepended to the child prompt, captured at spawn time. Errors clearly
@@ -134,6 +143,30 @@ gate green at every tip, purity boundary (`tau_agent` ⊬ `tau_coding`) held:
   return Rich-markup strings, never widgets; consumed by all render paths
   incl. resume and print mode.
 
+NOT yet extracted to stack branches (2026-07-06, live only on
+`subagents-integration` — extract before upstreaming):
+
+- **tool-call renderers** (aa96ed8) — `AgentTool.render_call` (pi's
+  `renderCall`): friendly one-line invocations. Resolution is LAZY at render
+  time via `runtime.render_tool_call` reading the unwrapped registry —
+  session messages load before the runtime connects, so eager resolution
+  misses restored calls.
+- **show_transcript modal** (aa96ed8) — `ui.show_transcript(title, messages,
+  poll=)`: modal TranscriptScreen. Now the /agents FALLBACK path only
+  (superseded by the strip); candidate for removal once the strip proves out.
+- **agents strip / transcript sources** (0fbba26, 2c9303c) —
+  `TranscriptSource` + `set_transcript_source_provider` +
+  `notify_transcript_sources_changed` + `ui.view_transcript(id)`. Strip under
+  the prompt; in-place agent views on a second display-toggled
+  TranscriptView; input steers the viewed agent; Esc precedence strip → view
+  → cancel; push-for-membership, 0.5s revision-gated poll for the open view;
+  finished agents leave the strip; rows clickable.
+- **pending-tool spinner + timer** (bd89ad6, a7e936b, this session) — braille
+  spinner replaces the `→`/`▸` marker on the executing tool row plus a live
+  elapsed `(1m 23s)` after 1s, driven by the existing activity timer; rows
+  update IN PLACE (`refresh_invocation`) — remounting per tick caused visible
+  transcript flicker (regression-tested via widget identity).
+
 An adversarial review pass ran on every seam and extension batch this
 session; all confirmed findings were fixed (dialog arrow-nav, cron
 zero-interval hot loop, steer-line token parity, and the renderers
@@ -146,10 +179,13 @@ messages present is explicitly unsupported per the corrected Ruling).
 - **Real cost reporting** — `Usage.cost` is always None; Tau has no
   per-model pricing table (Pi's `models.ts` `calculateCost`). Port one if
   billed-dollar figures are wanted.
-- **pi /agents surfaces not ported**: create-agent wizard, settings
-  submenu (incl. the scheduling on/off toggle), and the full
-  conversation-viewer overlay — the viewer needs Pi's `ctx.ui.custom`
-  (arbitrary component overlay), a bigger Tau UI surface than dialogs.
+- **pi /agents surfaces not ported**: create-agent wizard and settings
+  submenu (incl. the scheduling on/off toggle). The conversation viewer IS
+  ported and superseded: runs open as in-place agent views (agents strip /
+  `view_transcript`), with the modal `show_transcript` as fallback.
+- **Agent-view v2 ideas**: typing at a *finished* agent could resume it
+  (the resume plumbing exists); the modal `show_transcript` seam can be
+  removed once the strip has proven out.
 - **Pi renderer sub-features**: `display:false` (hide-but-keep-in-context)
   and `registerEntryRenderer`/`appendEntry` cards — deliberately out of
   scope of the message-renderers seam v1.

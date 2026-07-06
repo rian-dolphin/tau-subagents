@@ -14,7 +14,10 @@ Also registers:
 
 - `get_subagent_result` — poll a background agent, or `wait=true` to block for it
 - `steer_subagent` — inject a message into a running (or queued) agent
-- `/agents` — list agent types and every run's status
+- `/agents` — interactive menu over agent types, runs, and scheduled jobs
+- an **agents strip** under the prompt (Tau builds with the
+  transcript-sources seam): live subagent list with in-place conversation
+  views and steer-by-typing (see "The agents strip")
 
 ## Install
 
@@ -49,11 +52,27 @@ Ask the model to delegate:
 > run it in the background.
 
 `/agents` manages agents. On Tau builds with the `ui-dialogs` seam it opens
-an interactive menu (ported from pi's showAgentsMenu): browse runs (view a
-finished run's result, steer or stop an active one via dialogs) and agent
-types. pi's create wizard, settings menu, and full conversation-viewer
-overlay are not ported yet (Tau has select/confirm/input dialogs only).
-Without the seam — or headless — it prints the plain-text list instead.
+an interactive menu (ported from pi's showAgentsMenu): selecting a run jumps
+into its in-place conversation view (see "The agents strip"), falling back
+to a modal transcript viewer, then to a dialog submenu (view result / steer
+/ stop) on older Tau builds. pi's create wizard and settings menu are not
+ported yet. Without the seam — or headless — it prints the plain-text list
+instead.
+
+## The agents strip
+
+On Tau builds with the transcript-sources seam, spawning a subagent shows a
+strip under the prompt listing `main` plus every queued/running agent (the
+Claude Code pattern). `←` in an empty prompt enters the strip (↑/↓ + Enter),
+or click a row: the main transcript swaps to that agent's conversation in
+place — its prompt as the user message, then thinking, tool calls, and
+responses, live-updating while it runs. While a view is open the input talks
+to that agent: submissions become steering messages (the prompt prefix and
+placeholder make the target explicit); Esc returns to main without
+cancelling anything. Finished agents leave the strip — `/agents` still
+reaches their transcripts. The agent tool-call row in the main transcript
+shows a braille spinner and a live elapsed timer while the run executes
+(Tau core behavior, driven by this extension's `render_call` lines).
 
 ## Agent types
 
@@ -229,17 +248,13 @@ Token figures come in two flavors:
   deterministic chars/4 estimate of the child's current context size. Always
   available; the only token figure on Tau branches without the usage seam.
 
-## Live progress (foreground runs)
+## Live activity
 
-On Tau branches with the `tool-progress` seam (branch `tool-progress`; an
-`on_update` callback on tool executors bridged to `ToolExecutionUpdateEvent`),
-the `agent` tool reports child activity live while a foreground run (or
-resume) is executing: one update per child tool start and per completed turn
-(`agent-1: read_file · turn 2 · 3 tool uses`), with structured `data`
-(`agent_id`, `type`, `turns`, `tool_uses`, and `total_tokens` when real usage
-is available). The TUI renders these as the tool call's progress line. On
-branches without the seam the callback is never supplied and runs behave as
-before.
+While an agent runs, its tool-call row in the transcript animates: a braille
+spinner in place of the `▸` marker plus a live elapsed timer (Tau core's
+pending-tool rendering). For richer live detail, open the agent's view from
+the strip or `/agents` — per-event textual progress lines were deliberately
+removed as transcript noise.
 
 ## Notification rendering
 
@@ -264,7 +279,9 @@ Queued runs show up in `/agents` with status `queued`.
 `steer_subagent` sends a message to a running agent; it is delivered after the
 agent's current tool execution and appears as a user message in the agent's
 conversation. Messages sent to a **queued** agent (one with no live session
-yet) are held and flushed the moment its session initializes.
+yet) are held and flushed the moment its session initializes. Typing inside
+an agent's in-place view (see "The agents strip") and the `/agents` steer
+dialog use the same path.
 
 ## Turn limits (`max_turns`)
 
@@ -340,9 +357,10 @@ default.
   subagents recursively. This also means children never receive extension or
   MCP tools — pi's `isolated` param (which strips them) has nothing to strip
   here and is deliberately not ported.
-- Foreground subagents report live progress on Tau builds with the
-  `tool-progress` seam (see "Live progress"); on older builds they are silent
-  while they work — prefer background mode for long tasks there.
+- Live activity while a subagent works is the spinner + elapsed timer on its
+  tool row and the in-place view (see "Live activity"); on older Tau builds
+  without those seams, runs are silent while they work — prefer background
+  mode for long tasks there.
 - `/reload` rebuilds extension state; background runs in flight at reload
   time are orphaned.
 
