@@ -1,5 +1,20 @@
 # Handoff: audit the tau ↔ tau-subagents boundary
 
+> **RESOLVED (2026-07-06).** The audit ran, a fresh-context reviewer
+> pressure-tested it, and the changes were applied. Verdict: no logic leaks
+> — no `tau_subagents` imports in core, no tool-name special-casing, status
+> handling stays inside the seam enum with safe fallbacks. The agent-first
+> naming in core (AgentStrip etc.) was kept as product language (option 2);
+> the pi-style component seam (option 3) was rejected — it would reopen the
+> strings-not-widgets Ruling. One accepted coupling to record: core's strip
+> hint text hardcodes `/agents` and the word "agents" (`_render_agent_strip`)
+> — presentation-level coupling to an extension-owned command name.
+> Applied: removed the `show_transcript` modal seam + `TranscriptScreen`
+> from tau (5ae8dec) and the extension's fallback path; /agents now degrades
+> straight to the action submenu on hosts without the strip seam. Known gap
+> logged in HANDOFF.md: Steer/Stop submenu is unreachable for running agents
+> on strip-capable hosts (pre-existing, not a removal regression).
+
 ## The question you are being asked to answer
 
 Recent sessions built subagent UX (friendly tool lines, an agents strip with

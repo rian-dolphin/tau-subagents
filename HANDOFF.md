@@ -151,9 +151,11 @@ NOT yet extracted to stack branches (2026-07-06, live only on
   time via `runtime.render_tool_call` reading the unwrapped registry —
   session messages load before the runtime connects, so eager resolution
   misses restored calls.
-- **show_transcript modal** (aa96ed8) — `ui.show_transcript(title, messages,
-  poll=)`: modal TranscriptScreen. Now the /agents FALLBACK path only
-  (superseded by the strip); candidate for removal once the strip proves out.
+- **show_transcript modal** (aa96ed8) — REMOVED by the boundary audit
+  (5ae8dec in tau): superseded by the strip's `view_transcript`; /agents now
+  degrades straight to the action submenu on hosts without the strip seam.
+  When extracting aa96ed8's capability to a stack branch, extract
+  `render_call` only — don't replay the add+remove pair.
 - **agents strip / transcript sources** (0fbba26, 2c9303c) —
   `TranscriptSource` + `set_transcript_source_provider` +
   `notify_transcript_sources_changed` + `ui.view_transcript(id)`. Strip under
@@ -182,10 +184,12 @@ messages present is explicitly unsupported per the corrected Ruling).
 - **pi /agents surfaces not ported**: create-agent wizard and settings
   submenu (incl. the scheduling on/off toggle). The conversation viewer IS
   ported and superseded: runs open as in-place agent views (agents strip /
-  `view_transcript`), with the modal `show_transcript` as fallback.
+  `view_transcript`); hosts without the seam get the action submenu.
 - **Agent-view v2 ideas**: typing at a *finished* agent could resume it
-  (the resume plumbing exists); the modal `show_transcript` seam can be
-  removed once the strip has proven out.
+  (the resume plumbing exists). Gap surfaced by the boundary audit: on
+  strip-capable hosts a successful view returns "exit", so the menu's
+  Steer/Stop submenu is unreachable for running agents (steer works by
+  typing in the view; Stop currently has no path).
 - **Pi renderer sub-features**: `display:false` (hide-but-keep-in-context)
   and `registerEntryRenderer`/`appendEntry` cards — deliberately out of
   scope of the message-renderers seam v1.

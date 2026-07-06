@@ -54,8 +54,8 @@ Ask the model to delegate:
 `/agents` manages agents. On Tau builds with the `ui-dialogs` seam it opens
 an interactive menu (ported from pi's showAgentsMenu): selecting a run jumps
 into its in-place conversation view (see "The agents strip"), falling back
-to a modal transcript viewer, then to a dialog submenu (view result / steer
-/ stop) on older Tau builds. pi's create wizard and settings menu are not
+to a dialog submenu (view result / steer / stop) on older Tau builds. pi's
+create wizard and settings menu are not
 ported yet. Without the seam — or headless — it prints the plain-text list
 instead.
 

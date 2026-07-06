@@ -2,8 +2,8 @@
 
 Driven by Tau's extension UI dialogs (`ui-dialogs` seam: async select /
 confirm / input on `tau.context.ui`). Selecting a run opens its conversation
-as a live transcript (pi's conversation-viewer overlay, via Tau's
-`show_transcript` seam); Enter inside the viewer opens the action submenu
+in the host's in-place agent view (tau's `view_transcript`, the agents-strip
+seam); hosts without that seam go straight to the action submenu
 (steer / stop / view result). pi's create wizard and settings entries are
 not ported yet.
 
@@ -13,7 +13,6 @@ Navigation matches pi: submenus loop back to their parent, escape backs out.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
@@ -42,15 +41,6 @@ class DialogUi(Protocol):
     async def input(
         self, title: str, placeholder: str = "", *, timeout: float | None = None
     ) -> str | None: ...
-
-    async def show_transcript(
-        self,
-        title: str,
-        messages: Sequence[AgentMessage],
-        *,
-        poll: Callable[[], Sequence[AgentMessage] | None] | None = None,
-        timeout: float | None = None,
-    ) -> bool: ...
 
     def notify(self, message: str, level: str = "info") -> None: ...
 
@@ -123,40 +113,22 @@ async def show_running_agents(manager: SubagentManager, ui: DialogUi) -> bool:
 
 
 async def view_run_conversation(ui: DialogUi, run: AgentRun) -> str:
-    """Open the run's conversation; returns "exit", "actions", or "back".
+    """Open the run's conversation; returns "exit" or "actions".
 
-    Prefers the host's in-place agent view (tau's `view_transcript`, the
+    Uses the host's in-place agent view (tau's `view_transcript`, the
     agents-strip seam): on success the whole menu closes ("exit") so the
-    user lands in the view. Hosts without it fall back to the modal
-    transcript viewer ("actions" when accepted with Enter, "back" on
-    Escape), and hosts without either go straight to the action submenu.
+    user lands in the view. Hosts without the seam — or when the source
+    is gone — go straight to the action submenu ("actions").
     """
     view = getattr(ui, "view_transcript", None)
     if view is not None:
         try:
             opened = bool(await view(run.agent_id))
-        except Exception:  # noqa: BLE001 - fall back to the modal path
+        except Exception:  # noqa: BLE001 - degrade to the action submenu
             opened = False
         if opened:
             return "exit"
-    show = getattr(ui, "show_transcript", None)
-    if show is None:
-        return "actions"
-    title = f"{run.agent_id} [{run.status}] {run.description}"
-
-    def poll() -> tuple[AgentMessage, ...] | None:
-        session = run.session
-        if session is None:
-            return None
-        return tuple(session.messages)
-
-    messages = poll()
-    if messages is None:
-        # Session closed or evicted: show what the run still remembers.
-        accepted = bool(await show(title, run_snapshot_messages(run)))
-    else:
-        accepted = bool(await show(title, messages, poll=poll))
-    return "actions" if accepted else "back"
+    return "actions"
 
 
 def run_snapshot_messages(run: AgentRun) -> tuple[AgentMessage, ...]:
