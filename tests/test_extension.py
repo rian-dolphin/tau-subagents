@@ -1725,6 +1725,139 @@ async def test_agents_menu_shows_finished_result(tmp_path: Path) -> None:
     assert menu.supports_menu(None) is False
 
 
+class TranscriptScriptedUi(ScriptedUi):
+    """ScriptedUi that also supports the show_transcript seam."""
+
+    def __init__(self, *args, transcript_results=(), **kwargs) -> None:  # noqa: ANN001, ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        self.transcript_results = list(transcript_results)
+        self.transcript_calls: list[tuple[str, tuple, object]] = []
+
+    async def show_transcript(self, title, messages, *, poll=None, timeout=None):  # noqa: ANN001, ANN202
+        self.transcript_calls.append((title, tuple(messages), poll))
+        return self.transcript_results.pop(0)
+
+
+async def test_agents_menu_opens_live_transcript_on_run_selection(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    child_messages = [
+        UserMessage(content="child prompt"),
+        AssistantMessage(content="child progress"),
+    ]
+    run = _menu_run(_extension_module(), status="running")
+    run.session = SimpleNamespace(messages=child_messages)
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+    ui = TranscriptScriptedUi(
+        selects=[
+            lambda options: options[0],  # top: Running agents (…)
+            lambda options: options[0],  # the run → opens the transcript
+            None,  # leave run list
+            None,  # leave top menu
+        ],
+        transcript_results=[False],  # Escape: back to the run list, no actions
+    )
+
+    await menu.show_agents_menu(manager, ui)
+
+    (title, messages, poll) = ui.transcript_calls[0]
+    assert "agent-1" in title
+    assert messages == tuple(child_messages)
+    assert poll is not None
+    assert poll() == tuple(child_messages)
+    # Escape must not open the action submenu.
+    assert not any(title.startswith("agent-1 [") for title, _ in ui.select_calls)
+
+
+async def test_agents_menu_transcript_enter_opens_actions(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    run = _menu_run(_extension_module(), status="completed", result_text="All done here")
+    run.session = SimpleNamespace(messages=[UserMessage(content="p")])
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+    ui = TranscriptScriptedUi(
+        selects=[
+            lambda options: options[0],  # top: Running agents (…)
+            lambda options: options[0],  # the run → opens the transcript
+            "View result",  # action submenu, reached via Enter
+            None,  # leave run list
+            None,  # leave top menu
+        ],
+        transcript_results=[True],  # Enter: open the action submenu
+    )
+
+    await menu.show_agents_menu(manager, ui)
+
+    assert any("All done here" in note for note in ui.notifications)
+
+
+async def test_agents_menu_transcript_synthesizes_when_session_gone(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    run = _menu_run(
+        _extension_module(),
+        status="completed",
+        result_text="Final report",
+        prompt="original task",
+    )
+    assert run.session is None
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+    ui = TranscriptScriptedUi(
+        selects=[
+            lambda options: options[0],
+            lambda options: options[0],
+            None,
+            None,
+        ],
+        transcript_results=[False],
+    )
+
+    await menu.show_agents_menu(manager, ui)
+
+    (_, messages, poll) = ui.transcript_calls[0]
+    assert poll is None
+    assert [type(m).__name__ for m in messages] == ["UserMessage", "AssistantMessage"]
+    assert messages[0].content == "original task"
+    assert messages[1].content == "Final report"
+
+
+def test_render_call_lines() -> None:
+    extension = _extension_module()
+
+    assert (
+        extension.render_agent_call(
+            {"subagent_type": "explore", "description": "Summarize codebase"}
+        )
+        == "▸ explore agent · Summarize codebase"
+    )
+    assert extension.render_agent_call({"prompt": "x"}) == "▸ general agent"
+    assert (
+        extension.render_agent_call(
+            {"description": "Daily check", "schedule": "0 9 * * 1"}
+        )
+        == "▸ general agent (scheduled 0 9 * * 1) · Daily check"
+    )
+    assert (
+        extension.render_get_result_call({"agent_id": "agent-3", "wait": True})
+        == "▸ get result · agent-3 (wait)"
+    )
+    steer_line = extension.render_steer_call(
+        {"agent_id": "agent-3", "message": "focus " * 30}
+    )
+    assert steer_line.startswith("▸ steer agent-3 · focus")
+    assert len(steer_line) < 90
+
+
+def test_registered_tools_carry_render_call(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+
+    line = runtime.render_tool_call(
+        "agent", {"subagent_type": "explore", "description": "Summarize codebase"}
+    )
+
+    assert line == "▸ explore agent · Summarize codebase"
+
+
 async def test_inherit_context_skips_empty_parent(tmp_path: Path) -> None:
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))

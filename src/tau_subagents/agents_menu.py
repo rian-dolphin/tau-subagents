@@ -1,11 +1,11 @@
 """Interactive /agents menu, ported from pi-subagents' showAgentsMenu.
 
 Driven by Tau's extension UI dialogs (`ui-dialogs` seam: async select /
-confirm / input on `tau.context.ui`). pi's menu also offers a create wizard,
-settings, scheduled jobs, and a full conversation-viewer overlay
-(`ctx.ui.custom`); Tau v1 has dialogs only, so runs get a select-driven
-action submenu (view result / steer / stop) instead of the overlay, and the
-wizard/settings entries are not ported yet.
+confirm / input on `tau.context.ui`). Selecting a run opens its conversation
+as a live transcript (pi's conversation-viewer overlay, via Tau's
+`show_transcript` seam); Enter inside the viewer opens the action submenu
+(steer / stop / view result). pi's create wizard and settings entries are
+not ported yet.
 
 Navigation matches pi: submenus loop back to their parent, escape backs out.
 """
@@ -13,8 +13,11 @@ Navigation matches pi: submenus loop back to their parent, escape backs out.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
+
+from tau_agent.messages import AgentMessage, AssistantMessage, UserMessage
 
 if TYPE_CHECKING:
     from .extension import AgentRun, SubagentManager
@@ -39,6 +42,15 @@ class DialogUi(Protocol):
     async def input(
         self, title: str, placeholder: str = "", *, timeout: float | None = None
     ) -> str | None: ...
+
+    async def show_transcript(
+        self,
+        title: str,
+        messages: Sequence[AgentMessage],
+        *,
+        poll: Callable[[], Sequence[AgentMessage] | None] | None = None,
+        timeout: float | None = None,
+    ) -> bool: ...
 
     def notify(self, message: str, level: str = "info") -> None: ...
 
@@ -101,11 +113,47 @@ async def show_running_agents(manager: SubagentManager, ui: DialogUi) -> None:
         if choice is None:
             return
         index = options.index(choice)
-        await show_run_actions(ui, runs[index])
+        run = runs[index]
+        if await view_run_conversation(ui, run):
+            await show_run_actions(ui, run)
+
+
+async def view_run_conversation(ui: DialogUi, run: AgentRun) -> bool:
+    """Show the run's session as a live transcript (pi's conversation viewer).
+
+    Returns True when the user asked for the action submenu (Enter inside the
+    viewer), and also when the host UI predates the `show_transcript` seam,
+    so the caller falls back to the submenu directly.
+    """
+    show = getattr(ui, "show_transcript", None)
+    if show is None:
+        return True
+    title = f"{run.agent_id} [{run.status}] {run.description}"
+
+    def poll() -> tuple[AgentMessage, ...] | None:
+        session = run.session
+        if session is None:
+            return None
+        return tuple(session.messages)
+
+    messages = poll()
+    if messages is None:
+        # Session closed or evicted: show what the run still remembers.
+        return bool(await show(title, run_snapshot_messages(run)))
+    return bool(await show(title, messages, poll=poll))
+
+
+def run_snapshot_messages(run: AgentRun) -> tuple[AgentMessage, ...]:
+    """Reconstruct a minimal transcript for a run whose session is gone."""
+    body = run.error if run.status == "error" else run.result_text
+    return (
+        UserMessage(content=run.prompt),
+        AssistantMessage(content=body or "(no output)"),
+    )
 
 
 async def show_run_actions(ui: DialogUi, run: AgentRun) -> None:
-    """Dialog-based stand-in for pi's conversation-viewer overlay."""
+    """Action submenu for one run: steer / stop while active, else view result."""
     active = run.status in ACTIVE_STATUSES
     options: list[str] = []
     if not active:

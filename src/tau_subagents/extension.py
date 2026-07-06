@@ -23,7 +23,7 @@ import contextlib
 import dataclasses
 import functools
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -875,6 +875,37 @@ def _duration_ms(run: AgentRun) -> int | None:
     return max(0, int((run.completed_at - run.started_at) * 1000))
 
 
+STEER_CALL_PREVIEW_CHARS = 60
+
+
+def render_agent_call(arguments: Mapping[str, object]) -> str:
+    """Friendly invocation line for the agent tool (pi's renderCall port)."""
+    agent_type = str(arguments.get("subagent_type") or "general")
+    description = str(arguments.get("description") or "").strip()
+    line = f"▸ {agent_type} agent"
+    schedule = arguments.get("schedule")
+    if schedule:
+        line += f" (scheduled {schedule})"
+    return f"{line} · {description}" if description else line
+
+
+def render_get_result_call(arguments: Mapping[str, object]) -> str:
+    """Friendly invocation line for get_subagent_result."""
+    line = f"▸ get result · {arguments.get('agent_id') or '?'}"
+    if arguments.get("wait"):
+        line += " (wait)"
+    return line
+
+
+def render_steer_call(arguments: Mapping[str, object]) -> str:
+    """Friendly invocation line for steer_subagent."""
+    message = " ".join(str(arguments.get("message") or "").split())
+    if len(message) > STEER_CALL_PREVIEW_CHARS:
+        message = message[:STEER_CALL_PREVIEW_CHARS].rstrip() + "…"
+    line = f"▸ steer {arguments.get('agent_id') or '?'}"
+    return f"{line} · {message}" if message else line
+
+
 def setup(tau: ExtensionAPI) -> None:
     """Register subagent tools, the /agents command, and shutdown cleanup."""
     manager = SubagentManager(tau)
@@ -1329,6 +1360,7 @@ def setup(tau: ExtensionAPI) -> None:
             },
             executor=run_agent_tool,
             prompt_snippet="Spawn an autonomous subagent for delegated tasks.",
+            render_call=render_agent_call,
         )
     )
     tau.register_tool(
@@ -1350,6 +1382,7 @@ def setup(tau: ExtensionAPI) -> None:
                 "required": ["agent_id"],
             },
             executor=run_get_result_tool,
+            render_call=render_get_result_call,
         )
     )
     tau.register_tool(
@@ -1376,6 +1409,7 @@ def setup(tau: ExtensionAPI) -> None:
                 "required": ["agent_id", "message"],
             },
             executor=run_steer_tool,
+            render_call=render_steer_call,
         )
     )
     tau.register_command(
