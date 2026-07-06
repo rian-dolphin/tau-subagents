@@ -18,7 +18,7 @@ still loads and passes tests against plain `worktree-extensions`).
 |---|---|
 | This repo | `~/Documents/personal-projects/tau-subagents` · [rian-dolphin/tau-subagents](https://github.com/rian-dolphin/tau-subagents) (private) |
 | Tau fork (main clone) | `~/Documents/personal-projects/tau` · [rian-dolphin/tau](https://github.com/rian-dolphin/tau) |
-| Tau capability stack | branches (each pushed, PR-shaped, stacked in order): `worktree-extensions` → `skills-seam` → `provider-usage` → `tool-progress` → `parent-context` → `ui-dialogs` → `message-renderers`; integration branch `subagents-integration` at the tip, checked out in the worktree at `~/.herdr/worktrees/tau/worktree-extensions` (worktrees are ephemeral — if gone, check out `subagents-integration` anywhere) |
+| Tau capability stack | branches (each pushed, PR-shaped, stacked in order): `worktree-extensions` → `skills-seam` → `provider-usage` → `tool-progress` → `parent-context` → `ui-dialogs` → `message-renderers` → `extension-manifest` → `session-start-ui-order`; integration branch `subagents-integration` at the tip, checked out in the worktree at `~/.herdr/worktrees/tau/worktree-extensions` (worktrees are ephemeral — if gone, check out `subagents-integration` anywhere). NOTE (2026-07-04): `subagents-integration` is the chain cherry-picked onto the current upstream/main tip (not a merge — integrate new seam branches by cherry-pick). It gets rebased locally (e.g. fixup autosquashes), so pushing it usually needs `git push --force-with-lease` — which sessions cannot run; ask Rian. A provider-usage fixup (openai_compatible.py usage) exists only squashed into this branch, not on the standalone `provider-usage` chain branch. |
 | Tau upstream | [huggingface/tau](https://github.com/huggingface/tau) — roadmap is [issue #1](https://github.com/huggingface/tau/issues/1); Phase 21 (extensions) is what the fork implemented |
 | Pi clone (read-only reference) | `reference/pi` in this repo (gitignored) · [earendil-works/pi](https://github.com/earendil-works/pi) |
 | pi-subagents clone (read-only reference) | `reference/pi-subagents` in this repo (gitignored) · [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents) |
@@ -48,6 +48,16 @@ git clone --depth 20 https://github.com/tintinweb/pi-subagents.git reference/pi-
    and `src/core/extensions/{types,loader,runner}.ts`.
 
 ## Current state of this extension
+
+The implementation is the `src/tau_subagents/` package (uv/src layout since
+2026-07-04; the root `pyproject.toml` resolves Tau from the integration
+worktree via a `[tool.uv.sources]` path — update that path if the worktree
+moves). The entry point is declared through Tau's extension manifest
+(`[tool.tau] extensions = ["src/tau_subagents/extension.py"]` in
+`pyproject.toml` — the tau branch `extension-manifest`, a port of pi's
+`package.json` `pi.extensions`), so `tau -x` works on the repo root or on
+`src/tau_subagents` directly, with no root shim. On tau branches without the
+manifest seam, point `-x` at `src/tau_subagents`.
 
 Modules: `extension.py` (orchestration), `agents.py` (agent-type
 definitions), `agents_menu.py` (interactive /agents menu), `settings.py`,
@@ -107,6 +117,17 @@ gate green at every tip, purity boundary (`tau_agent` ⊬ `tau_coding`) held:
   future picker-style screen must be added to those allowlists** or arrows
   silently don't work (tests must use real `pilot.press`, not
   `action_cursor_down()`, which masks the bug).
+- `extension-manifest` (d7faaa3) — `[tool.tau] extensions = [...]` in an
+  extension directory's `pyproject.toml` declares entry files (port of pi's
+  `package.json` `pi.extensions`); manifest wins over sibling `extension.py`,
+  entries load as packages rooted at their parent dir. Lets src-layout
+  extension repos (like this one) load from the repo root without a shim.
+- `session-start-ui-order` (672e093) — `session_start` is deferred out of
+  `CodingSession.load`; hosts release it via the idempotent
+  `session.emit_pending_session_start()` after `set_ui_bridge()` (TUI
+  `on_mount`, print mode after `StderrUiBridge`). Pi's ordering — UI first —
+  so `session_start` handlers can notify/open dialogs. Any session fake used
+  with the TUI must grow an async `emit_pending_session_start()`.
 - `message-renderers` (9af29e6 + 19cf9fc) — `register_message_renderer` +
   `send_custom_message`; `custom_type`/`details` metadata on `UserMessage`
   (lighter than Pi's separate custom role — Ruling records why); renderers
@@ -166,6 +187,8 @@ Unchanged from the previous handoff, and it worked well this session:
 
 ```bash
 cd ~/Documents/personal-projects/tau-subagents
+uv run pytest          # repo's own env; Tau comes from the pyproject path source
+# or, borrowing Tau's env (still supported):
 uv run --project ~/.herdr/worktrees/tau/worktree-extensions pytest tests/
 ```
 

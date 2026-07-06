@@ -18,8 +18,10 @@ Also registers:
 
 ## Install
 
-The extension is this directory (Tau loads any directory containing an
-`extension.py`). Either try it per-run:
+The implementation lives in `src/tau_subagents/`; `pyproject.toml` declares
+the entry point via Tau's extension manifest (`[tool.tau]
+extensions = ["src/tau_subagents/extension.py"]`), so the repo itself is
+loadable as a Tau extension. Either try it per-run:
 
 ```bash
 tau -x /path/to/tau-subagents
@@ -346,7 +348,15 @@ default.
 
 ## Tests
 
-The tests need Tau's packages importable. From a Tau checkout's environment:
+The tests need Tau's packages importable. The repo's own environment resolves
+Tau via the path source in `pyproject.toml` (`[tool.uv.sources]` — edit it if
+your Tau checkout lives elsewhere):
+
+```bash
+uv run pytest
+```
+
+Borrowing a Tau checkout's environment also still works:
 
 ```bash
 uv run --project /path/to/tau pytest /path/to/tau-subagents/tests

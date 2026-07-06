@@ -1,8 +1,8 @@
 """Tests for the tau-subagents extension.
 
-Requires Tau's packages on the import path; run from a Tau checkout:
-
-    uv run --project /path/to/tau pytest tests/
+Requires Tau's packages on the import path. With this repo's own env
+(tau resolved via the pyproject path source): `uv run pytest`. Or borrow
+a Tau checkout's env: `uv run --project /path/to/tau pytest tests/`.
 """
 
 import asyncio
@@ -33,7 +33,7 @@ from tau_coding.extensions import ExtensionRuntime
 
 pytestmark = pytest.mark.anyio
 
-EXTENSION_DIR = Path(__file__).resolve().parent.parent
+EXTENSION_DIR = Path(__file__).resolve().parent.parent / "src" / "tau_subagents"
 
 
 @pytest.fixture
@@ -1832,7 +1832,7 @@ async def test_shutdown_cancels_pending_nudges(
 def test_extension_loads(tmp_path: Path) -> None:
     runtime = _load_runtime(tmp_path)
 
-    assert runtime.extension_names == ("tau-subagents",)
+    assert runtime.extension_names == ("tau_subagents",)
     assert {tool.name for tool in runtime.extension_tools} == {
         "agent",
         "get_subagent_result",
