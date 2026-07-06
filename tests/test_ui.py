@@ -558,3 +558,25 @@ async def test_setup_skips_components_on_null_host(tmp_path) -> None:  # noqa: A
     assert runtime.ui.supports_components is False
     # Must not raise, and nothing to assert beyond a clean session_start.
     await runtime.emit_session_start("startup")
+
+
+async def test_setup_survives_component_less_core(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # Simulate an OLDER tau whose ``context.ui`` predates the component seam:
+    # the ``components`` attribute is absent entirely (not merely a no-op
+    # bridge). The extension's getattr-guard must degrade to dialog-only rather
+    # than crash session_start (constraint 8).
+    from tau_coding.extensions.api import ExtensionUi
+
+    monkeypatch.delattr(ExtensionUi, "components", raising=True)
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+
+    bridge = FakeComponentBridge()  # a real component host is present…
+    runtime.set_ui_bridge(bridge)
+    # …but the facade no longer exposes `.components`, so the guard sees None.
+    await runtime.emit_session_start("startup")
+
+    # No strip / interceptor installed, and no exception surfaced.
+    assert bridge.slot_calls == []
+    assert bridge.interceptors == []

@@ -1,5 +1,16 @@
 # Handoff: fleshing out tau-subagents
 
+> **Superseded on branch `component-seam-experiment` (2026-07-06).** The agents
+> strip / conversation view described below as tau's *transcript-sources* seam
+> (`TranscriptSource`, `set_transcript_source_provider`,
+> `notify_transcript_sources_changed`, `ui.view_transcript`) has been REMOVED
+> from tau core on this branch and re-implemented as extension-owned Textual
+> widgets over a generic *component seam* (`context.ui.components`). See
+> `README.md` ("The agents strip") and, in the tau repo,
+> `dev-notes/design/component-seam-experiment.md`. Sections below that reference
+> the transcript-sources symbols describe the pre-experiment architecture and
+> are accurate again only if this experiment is discarded.
+
 **Mission:** evolve this extension toward feature parity with
 [pi-subagents](https://github.com/tintinweb/pi-subagents) (the extension it
 ports), within the capabilities of Tau's extension system — and extend Tau
