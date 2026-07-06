@@ -28,7 +28,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tau_agent.messages import UserMessage
 from tau_agent.session import SessionEntry
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding import (
@@ -42,19 +41,12 @@ from tau_coding.extensions import (
     SessionShutdownEvent,
     SessionStartEvent,
 )
-
-try:  # tau's transcript-sources seam (agents strip); older tau lacks it
-    from tau_coding.extensions import TranscriptSource
-except ImportError:  # pragma: no cover - exercised only on older tau branches
-    TranscriptSource = None  # type: ignore[assignment, misc]
 from tau_coding.provider_runtime import create_model_provider
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL, THINKING_LEVELS
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
 from .agents_menu import (
-    run_snapshot_messages,
     show_agents_menu,
-    steer_run,
     supports_menu,
 )
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
@@ -92,6 +84,12 @@ GROUP_TIMEOUT_SECONDS = DEFAULT_TIMEOUT
 STRAGGLER_TIMEOUT_SECONDS = STRAGGLER_TIMEOUT
 STALE_AFTER_SECONDS = 600.0
 TERMINAL_STATUSES = ("completed", "steered", "aborted", "error", "cancelled")
+# Event types that change what a viewer would show (session.messages / status).
+# Streaming deltas are skipped: they never touch session.messages, so pushing on
+# them would redraw identical content on every token.
+RUN_PUSH_EVENTS = frozenset(
+    {"message_end", "tool_execution_start", "tool_execution_end", "turn_end", "error"}
+)
 SOFT_LIMIT_MESSAGE = (
     "You have reached your turn limit. Wrap up immediately — provide your"
     " final answer now."
@@ -159,6 +157,12 @@ class AgentRun:
     used_worktree: bool = False
     output_writer: OutputFileWriter | None = None
     output_file: str | None = None
+    # Per-run push listeners (component seam): fired when this run's content or
+    # status changes so an open conversation viewer can re-render. The direct
+    # analog of pi's ``session.subscribe(() => tui.requestRender())``. Safe to
+    # call widget methods from here because runs are asyncio tasks on the TUI
+    # event loop (see the design's push-refresh invariant).
+    listeners: list[Callable[[], None]] = field(default_factory=list)
 
 
 class SubagentManager:
@@ -187,6 +191,12 @@ class SubagentManager:
         if callback is not None:
             with contextlib.suppress(Exception):
                 callback()
+
+    def _notify_run(self, run: AgentRun) -> None:
+        """Fire a run's per-run listeners (viewer push); guarded per listener."""
+        for listener in tuple(run.listeners):
+            with contextlib.suppress(Exception):
+                listener()
 
     @property
     def runs(self) -> dict[str, AgentRun]:
@@ -321,6 +331,7 @@ class SubagentManager:
         run.started_at = time.monotonic()
         run.completed_at = None
         self._notify_sources()
+        self._notify_run(run)
         final_text: list[str] = []
         try:
             async for event in session.prompt(prompt):
@@ -336,6 +347,7 @@ class SubagentManager:
             await self._persist_record(run)
             run.completed_at = time.monotonic()
             self._notify_sources()
+            self._notify_run(run)
 
     async def shutdown(self) -> None:
         self._shutting_down = True
@@ -414,6 +426,7 @@ class SubagentManager:
             await self._finalize_run(run)
             run.completed_at = time.monotonic()
             self._notify_sources()
+            self._notify_run(run)
             if run.background:
                 self._running_background -= 1
                 self._drain_queue()
@@ -634,6 +647,8 @@ class SubagentManager:
         elif event.type == "error" and not event.recoverable:
             run.status = "error"
             run.error = event.message
+        if event.type in RUN_PUSH_EVENTS:
+            self._notify_run(run)
 
     def _deliver_background_result(self, run: AgentRun) -> None:
         if run.result_consumed:
@@ -877,51 +892,6 @@ def _duration_ms(run: AgentRun) -> int | None:
 
 STEER_CALL_PREVIEW_CHARS = 60
 
-# AgentRun statuses → tau's TranscriptSource status vocabulary.
-SOURCE_STATUS = {
-    "running": "running",
-    "queued": "queued",
-    "completed": "done",
-    "steered": "done",
-    "error": "error",
-    "cancelled": "cancelled",
-    "aborted": "cancelled",
-}
-
-
-def run_transcript_source(run: AgentRun):  # noqa: ANN201 - TranscriptSource when available
-    """Map one run onto tau's TranscriptSource (the agents-strip seam)."""
-
-    def messages():  # noqa: ANN202 - tuple[AgentMessage, ...] | None
-        session = run.session
-        if session is not None:
-            try:
-                return tuple(session.messages)
-            except Exception:  # noqa: BLE001 - a closing session must not break the strip
-                return None
-        if run.status == "queued":
-            return (UserMessage(content=run.prompt),)
-        if run.status in TERMINAL_STATUSES:
-            # Session closed or evicted: the run record still tells the story.
-            return run_snapshot_messages(run)
-        return None
-
-    steer = None
-    if run.status in ("running", "queued"):
-
-        def steer(text: str, _run: AgentRun = run) -> None:
-            steer_run(_run, text)
-
-    return TranscriptSource(
-        id=run.agent_id,
-        label=run.agent_type,
-        detail=run.description,
-        status=SOURCE_STATUS.get(run.status, "running"),
-        messages=messages,
-        revision=run.revision,
-        steer=steer,
-    )
-
 
 def render_agent_call(arguments: Mapping[str, object]) -> str:
     """Friendly invocation line for the agent tool (pi's renderCall port)."""
@@ -974,10 +944,37 @@ def setup(tau: ExtensionAPI) -> None:
         except Exception:  # noqa: BLE001 - scheduling must never break the session
             pass
 
+    # Component seam (experimental): the extension owns the agents strip and the
+    # conversation viewer as Textual widgets mounted through the component
+    # bridge. Installed lazily on session_start — NOT in setup() — because the
+    # host attaches its UI bridge (making supports_components True) only after
+    # CodingSession.load has already run setup() with the print-mode NullUiBridge.
+    ui_controller: list[object] = []  # 0 or 1 element (a nonlocal-friendly cell)
+
+    def _install_ui_components() -> None:
+        if ui_controller:
+            return
+        # getattr-guard keeps the extension loadable on an older tau without the
+        # component seam (constraint 8): it then runs dialog-only, no strip.
+        components = getattr(getattr(tau, "context", None), "ui", None)
+        components = getattr(components, "components", None)
+        if components is None or not getattr(components, "supports_components", False):
+            return
+        from .ui import SubagentUiController
+
+        controller = SubagentUiController(manager, components)
+        controller.install()
+        manager.sources_changed = controller.on_change
+        ui_controller.append(controller)
+
+    def _current_controller():  # noqa: ANN202 - SubagentUiController | None
+        return ui_controller[0] if ui_controller else None
+
     async def on_session_start(event: SessionStartEvent) -> None:
         del event
         if not scheduler.is_active():
             start_scheduler()
+        _install_ui_components()
 
     async def run_agent_tool(arguments, signal=None):  # noqa: ANN001, ANN202
         await manager.evict_stale()
@@ -1291,7 +1288,11 @@ def setup(tau: ExtensionAPI) -> None:
                 # loop task (the documented ui-dialogs pattern). Return no
                 # message: any text would open a modal the user must dismiss
                 # before the menu appears.
-                task = loop.create_task(show_agents_menu(manager, ui, scheduler))
+                task = loop.create_task(
+                    show_agents_menu(
+                        manager, ui, scheduler, controller=_current_controller()
+                    )
+                )
                 menu_tasks.add(task)
                 task.add_done_callback(menu_tasks.discard)
                 return None
@@ -1311,6 +1312,12 @@ def setup(tau: ExtensionAPI) -> None:
         # belong to the outgoing transcript and would otherwise leak sessions.
         del event
         scheduler.stop()
+        controller = _current_controller()
+        if controller is not None:
+            # pi parity: the extension clears its own widgets on shutdown (the
+            # host also force-clears as a safety net on the next bridge install).
+            controller.teardown()
+            ui_controller.clear()
         await manager.shutdown()
         manager.runs.clear()
         manager._notify_sources()  # noqa: SLF001 - same-module teardown signal
@@ -1449,16 +1456,6 @@ def setup(tau: ExtensionAPI) -> None:
             render_call=render_steer_call,
         )
     )
-    set_source_provider = getattr(tau, "set_transcript_source_provider", None)
-    if TranscriptSource is not None and callable(set_source_provider):
-
-        def transcript_sources():  # noqa: ANN202 - tuple of TranscriptSource
-            return tuple(
-                run_transcript_source(run) for run in manager.runs.values()
-            )
-
-        set_source_provider(transcript_sources)
-        manager.sources_changed = tau.notify_transcript_sources_changed
     tau.register_command(
         "agents",
         agents_command,

@@ -2,8 +2,8 @@
 
 Driven by Tau's extension UI dialogs (`ui-dialogs` seam: async select /
 confirm / input on `tau.context.ui`). Selecting a run opens its conversation
-in the host's in-place agent view (tau's `view_transcript`, the agents-strip
-seam); hosts without that seam go straight to the action submenu
+in the extension's own conversation viewer via the component seam (the
+`SubagentUiController`); component-less hosts go straight to the action submenu
 (steer / stop / view result). pi's create wizard and settings entries are
 not ported yet.
 
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .extension import AgentRun, SubagentManager
     from .schedule import SubagentScheduler
     from .schedule_store import ScheduledSubagent
+    from .ui import SubagentUiController
 
 RESULT_PREVIEW_CHARS = 600
 ACTIVE_STATUSES = ("running", "queued")
@@ -58,6 +59,8 @@ async def show_agents_menu(
     manager: SubagentManager,
     ui: DialogUi,
     scheduler: SubagentScheduler | None = None,
+    *,
+    controller: SubagentUiController | None = None,
 ) -> None:
     """Top-level menu (pi's showAgentsMenu): runs, agent types, scheduled jobs."""
     while True:
@@ -78,7 +81,7 @@ async def show_agents_menu(
         if choice is None:
             return
         if choice.startswith("Running agents ("):
-            if await show_running_agents(manager, ui):
+            if await show_running_agents(manager, ui, controller=controller):
                 return
         elif choice.startswith("Agent types ("):
             await show_agent_types(manager, ui)
@@ -88,7 +91,12 @@ async def show_agents_menu(
             return
 
 
-async def show_running_agents(manager: SubagentManager, ui: DialogUi) -> bool:
+async def show_running_agents(
+    manager: SubagentManager,
+    ui: DialogUi,
+    *,
+    controller: SubagentUiController | None = None,
+) -> bool:
     """Run list (pi's showRunningAgents); True when the whole menu should close."""
     while True:
         runs = list(manager.runs.values())
@@ -105,29 +113,30 @@ async def show_running_agents(manager: SubagentManager, ui: DialogUi) -> bool:
             return False
         index = options.index(choice)
         run = runs[index]
-        outcome = await view_run_conversation(ui, run)
+        outcome = view_run_conversation(run, controller)
         if outcome == "exit":
             return True
         if outcome == "actions":
             await show_run_actions(ui, run)
 
 
-async def view_run_conversation(ui: DialogUi, run: AgentRun) -> str:
-    """Open the run's conversation; returns "exit" or "actions".
+def view_run_conversation(
+    run: AgentRun, controller: SubagentUiController | None
+) -> str:
+    """Open the run's conversation via the component seam; "exit" or "actions".
 
-    Uses the host's in-place agent view (tau's `view_transcript`, the
-    agents-strip seam): on success the whole menu closes ("exit") so the
-    user lands in the view. Hosts without the seam — or when the source
-    is gone — go straight to the action submenu ("actions").
+    With a component-capable host the extension opens its own conversation
+    viewer (the widget seam that replaced tau's removed ``view_transcript``):
+    on success the whole menu closes ("exit") so the user lands in the view.
+    Component-less hosts (print mode / older tau) fall to the action submenu
+    ("actions"), exactly as the old ``view_transcript``-missing branch did.
     """
-    view = getattr(ui, "view_transcript", None)
-    if view is not None:
+    if controller is not None:
         try:
-            opened = bool(await view(run.agent_id))
+            if controller.open_conversation(run):
+                return "exit"
         except Exception:  # noqa: BLE001 - degrade to the action submenu
-            opened = False
-        if opened:
-            return "exit"
+            pass
     return "actions"
 
 

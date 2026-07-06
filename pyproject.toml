@@ -7,10 +7,14 @@ name = "tau-subagents"
 version = "0.1.0"
 description = "Subagents extension for Tau (a port of pi-subagents)."
 requires-python = ">=3.14"
-dependencies = ["tau-ai"]
+# textual is a direct dependency on the component-seam-experiment branch: the
+# extension's agents strip and conversation viewer are real Textual widgets
+# mounted through tau's component seam (previously it reached textual only
+# transitively via tau).
+dependencies = ["tau-ai", "textual>=1.0"]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "anyio>=4.0"]
 
 # Tau extension manifest (tau branch `extension-manifest`, ported from pi's
 # package.json "pi.extensions"): lets `tau -x` on this repo root find the
