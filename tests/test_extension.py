@@ -1568,12 +1568,30 @@ def test_notification_renderer_formats_details(tmp_path: Path) -> None:
     assert "[bold]deploy watch[/bold]" in collapsed
     assert "3/10 turns" in collapsed
     assert "1.5k tokens" in collapsed
-    assert "⎿  line one" in collapsed
+    assert "2.3s" in collapsed
+    # A multi-line preview collapses to its first line plus an ellipsis, and
+    # the transcript path stays out of the collapsed card.
+    assert "⎿  line one…" in collapsed
     assert "line two" not in collapsed
-    assert "transcript: /tmp/t.jsonl" in collapsed
+    assert "transcript:" not in collapsed
 
     expanded = render(view, SimpleNamespace(expanded=True))
     assert "line two" in expanded
+    assert "transcript: /tmp/t.jsonl" in expanded
+
+    # Long first lines cut at a word boundary, never mid-word.
+    long_view = SimpleNamespace(
+        details={**details, "result_preview": ("word " * 40).strip()}
+    )
+    long_collapsed = render(long_view, SimpleNamespace(expanded=False))
+    preview_line = next(
+        line for line in long_collapsed.split("\n") if "⎿" in line
+    )
+    assert preview_line.rstrip("[/dim]").endswith("word…")
+
+    # Durations of a minute or more switch to the elapsed style.
+    slow_view = SimpleNamespace(details={**details, "duration_ms": 83_200})
+    assert "1m 23s" in render(slow_view, SimpleNamespace(expanded=False))
 
     error_view = SimpleNamespace(details={**details, "status": "error"})
     assert "[red]✗[/red]" in render(error_view, SimpleNamespace(expanded=False))

@@ -50,13 +50,17 @@ def _render_one(details: dict, expanded: bool) -> str:  # noqa: ANN001
     if expanded:
         for preview_line in preview.split("\n")[:EXPANDED_RESULT_LINES]:
             line += f"\n  [dim]{_escape(preview_line)}[/dim]"
+        # The transcript path is long and rarely needed at a glance; it only
+        # appears here in the expanded view.
+        output_file = details.get("output_file")
+        if output_file:
+            line += f"\n  [dim]transcript: {_escape(str(output_file))}[/dim]"
     else:
-        first = preview.split("\n")[0][:COLLAPSED_PREVIEW_CHARS]
+        lines = preview.split("\n")
+        first = _ellipsize(lines[0], COLLAPSED_PREVIEW_CHARS)
+        if len(lines) > 1 and not first.endswith("…"):
+            first += "…"
         line += f"\n  [dim]⎿  {_escape(first)}[/dim]"
-
-    output_file = details.get("output_file")
-    if output_file:
-        line += f"\n  [dim]transcript: {_escape(str(output_file))}[/dim]"
     return line
 
 
@@ -74,12 +78,33 @@ def _stat_parts(details: dict) -> list[str]:  # noqa: ANN001
         parts.append(_format_tokens(tokens))
     duration = int(details.get("duration_ms") or 0)
     if duration > 0:
-        parts.append(f"{duration / 1000:.1f}s")
+        parts.append(_format_duration(duration))
     return parts
 
 
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _format_duration(ms: int) -> str:
+    """Match the running tool row's timer: 50.9s under a minute, then 1m 23s."""
+    seconds = ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _ellipsize(text: str, max_chars: int) -> str:
+    """Cut at a word boundary and mark the cut with an ellipsis."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    head, _, _ = cut.rpartition(" ")
+    return (head or cut).rstrip() + "…"
 
 
 def _format_tokens(total: int) -> str:
