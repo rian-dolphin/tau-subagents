@@ -328,3 +328,198 @@ async def test_real_spawn_lights_strip_and_keyboard_opens_viewer(tmp_path) -> No
         # Let the stalled run finish so teardown is clean.
         release.set()
         await pilot.pause()
+
+
+async def _settle(pilot) -> None:  # noqa: ANN001
+    """Pump through an async component swap (deferred remove -> mount)."""
+    for _ in range(4):
+        await asyncio.sleep(0)
+        await pilot.pause()
+
+
+def _seed_run(strip, agent_id: str, *, agent_type: str, description: str):  # noqa: ANN001, ANN202
+    run = _run(
+        agent_id,
+        agent_type=agent_type,
+        description=description,
+        status="running",
+        session=SimpleNamespace(messages=()),
+    )
+    strip._manager.runs[agent_id] = run
+    return run
+
+
+# --- Regression: the deferred-remove DuplicateIds race (bug fix 2) -----------
+# These capture the two user-reported crashes the crash spike diagnosed:
+# opening a second agent's viewer while one is open, and a same-tick extension
+# teardown+reinstall (session rebind). With the host sequencing swaps after
+# removals drain, both land exactly one widget with zero component failures.
+
+
+async def test_rapid_viewer_switch_mounts_exactly_one_viewer(tmp_path) -> None:  # noqa: ANN001
+    """Opening a second viewer the same tick a first opens -> one viewer, no crash."""
+    app, _session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        strip = app.query_one("#below-prompt-slot", Container).query(AgentStripWidget).first()
+        controller = strip._open_conversation.__self__  # the SubagentUiController
+        run_a = _seed_run(strip, "agent-1", agent_type="explore", description="A")
+        run_b = _seed_run(strip, "agent-2", agent_type="general", description="B")
+        strip._manager.sources_changed()
+        await pilot.pause()
+
+        # Same tick: open A, then immediately B (the reported second-viewer action).
+        assert controller.open_conversation(run_a) is True
+        assert controller.open_conversation(run_b) is True
+        await _settle(pilot)
+
+        viewers = app.query(ConversationViewer)
+        assert len(viewers) == 1, "rapid switch left more than one viewer mounted"
+        assert viewers.first()._run.agent_id == "agent-2"  # last-writer wins
+        assert app.query_one("#transcript", TranscriptView).display is False
+        assert app._extension_component_failures_reported == set()
+
+
+async def test_rapid_viewer_switch_a_b_c(tmp_path) -> None:  # noqa: ANN001
+    """Three viewer opens in one tick collapse to the last, no DuplicateIds."""
+    app, _session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        strip = app.query_one("#below-prompt-slot", Container).query(AgentStripWidget).first()
+        controller = strip._open_conversation.__self__
+        run_a = _seed_run(strip, "agent-1", agent_type="explore", description="A")
+        run_b = _seed_run(strip, "agent-2", agent_type="general", description="B")
+        run_c = _seed_run(strip, "agent-3", agent_type="plan", description="C")
+        strip._manager.sources_changed()
+        await pilot.pause()
+
+        controller.open_conversation(run_a)
+        controller.open_conversation(run_b)
+        controller.open_conversation(run_c)
+        await _settle(pilot)
+
+        viewers = app.query(ConversationViewer)
+        assert len(viewers) == 1
+        assert viewers.first()._run.agent_id == "agent-3"
+        assert app._extension_component_failures_reported == set()
+
+
+async def test_same_tick_teardown_reinstall_yields_one_strip(tmp_path) -> None:  # noqa: ANN001
+    """Tearing the controller down and reinstalling in one tick -> one strip."""
+    app, _session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        strip = app.query_one("#below-prompt-slot", Container).query(AgentStripWidget).first()
+        controller = strip._open_conversation.__self__
+
+        controller.teardown()
+        controller.install()
+        await _settle(pilot)
+
+        strips = app.query(AgentStripWidget)
+        assert len(strips) == 1, "same-tick teardown+reinstall left a duplicate strip"
+        assert app._extension_component_failures_reported == set()
+
+
+async def test_session_rebind_keeps_single_strip(tmp_path) -> None:  # noqa: ANN001
+    """The real /new,/resume rebind sequence (shutdown then start) keeps one strip.
+
+    Reproduces bug 3: the extension tears its widgets down on ``session_shutdown``
+    and reinstalls on the next ``session_start``; the old strip's deferred
+    remove() must drain before the fresh strip (same id) mounts.
+    """
+    app, session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        assert len(app.query(AgentStripWidget)) == 1
+
+        runtime = session.extension_runtime
+        await runtime.emit_session_shutdown("new")
+        await runtime.emit_session_start("new")
+        await _settle(pilot)
+
+        strips = app.query(AgentStripWidget)
+        assert len(strips) == 1, "strip lost / duplicated across session rebind"
+        assert strips.first().has_agents() is False
+        assert app._extension_component_failures_reported == set()
+
+
+async def test_journey_switch_viewers_then_back_to_main(tmp_path) -> None:  # noqa: ANN001
+    """The user's exact journey, end to end, with zero component failures.
+
+    Spawn two real background runs -> open run 1's viewer via keys -> ``left``
+    re-activates nav while viewing -> ``down``/``enter`` switches to run 2 ->
+    ``left``, select ``main``, ``enter`` closes the viewer and restores the
+    transcript with the prompt refocused.
+    """
+    app, session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+
+        release = asyncio.Event()
+        _patch_provider_factory(_extension_module(), _GatedProvider(release))
+        agent_tool = _agent_tool(session.extension_runtime)
+        for description, agent_type in (("survey the repo", "explore"), ("plan work", "general")):
+            result = await agent_tool.execute(
+                {
+                    "prompt": "look around",
+                    "description": description,
+                    "subagent_type": agent_type,
+                    "run_in_background": True,
+                }
+            )
+            assert result.ok, result.content
+
+        slot = app.query_one("#below-prompt-slot", Container)
+        strip = slot.query(AgentStripWidget).first()
+        await _wait_until(pilot, lambda: len(strip._agent_runs()) == 2)
+        main_slot = app.query_one("#main-slot", Container)
+
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.focus()
+        await pilot.pause()
+
+        # Open run 1's viewer via the fleet-list keys.
+        await pilot.press("left")   # activate nav on the main row
+        await pilot.press("down")   # -> first agent row
+        await pilot.press("enter")  # open its viewer
+        await _settle(pilot)
+        viewers = main_slot.query(ConversationViewer)
+        assert len(viewers) == 1
+        first_run_id = viewers.first()._run.agent_id
+        assert app.query_one("#transcript", TranscriptView).display is False
+
+        # `left` re-activates the strip nav while the viewer is open (bug fix 2).
+        await pilot.press("left")
+        await pilot.pause()
+        assert strip.nav_active is True
+
+        # `down`/`enter` switches the viewer to run 2 (race-safe swap).
+        await pilot.press("down")   # main -> agent 1
+        await pilot.press("down")   # agent 1 -> agent 2
+        await pilot.press("enter")  # switch the viewer
+        await _settle(pilot)
+        viewers = main_slot.query(ConversationViewer)
+        assert len(viewers) == 1, "switching viewers left more than one mounted"
+        second_run_id = viewers.first()._run.agent_id
+        assert second_run_id != first_run_id
+        assert strip.viewing_id == second_run_id
+        assert strip.nav_active is False  # opening reset nav
+
+        # `left`, select `main`, `enter` closes the viewer and restores main.
+        await pilot.press("left")
+        await pilot.pause()
+        assert strip.nav_active is True
+        assert strip.selected_index == 0
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert not main_slot.query(ConversationViewer), "main row did not close the viewer"
+        assert app.query_one("#transcript", TranscriptView).display is True
+        assert main_slot.display is False
+        assert app.query_one("#prompt", PromptInput).has_focus
+        assert strip.viewing_id is None
+        assert app._extension_component_failures_reported == set()
+
+        release.set()
+        await pilot.pause()

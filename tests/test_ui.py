@@ -544,7 +544,12 @@ async def test_controller_interceptor_other_key_flows_to_prompt() -> None:
         assert strip.nav_active is False
 
 
-async def test_controller_interceptor_yields_while_viewer_open() -> None:
+async def test_controller_interceptor_nav_stays_live_while_viewer_open() -> None:
+    """A viewer being open must NOT strand strip nav (bug fix 2).
+
+    ``left`` re-activates the strip while a viewer is up; ``down`` is left to the
+    focused viewer for scrolling; ``enter`` on the ``main`` row closes the viewer.
+    """
     run = _run("agent-1", status="running", session=SimpleNamespace(messages=()))
     bridge = FakeComponentBridge()
     controller = SubagentUiController(_manager(run), bridge)
@@ -556,9 +561,102 @@ async def test_controller_interceptor_yields_while_viewer_open() -> None:
         await pilot.pause()
         controller.open_conversation(run)
         assert controller._viewer is not None
-        # While a viewer/composer owns focus, the interceptor yields every key.
-        assert interceptor(Key("left", None), "") is False
+        handle = bridge.main_views[0][0]
+
+        # Nav inactive + viewer open: `down` belongs to the focused viewer (scroll).
         assert interceptor(Key("down", None), "") is False
+        assert strip.nav_active is False
+        # `left` re-activates strip nav even while the viewer is up.
+        assert interceptor(Key("left", None), "") is True
+        assert strip.nav_active is True
+        assert strip.selected_index == 0
+        # `enter` on the main row closes the viewer and returns to the prompt.
+        assert interceptor(Key("enter", None), "") is True
+        assert handle.closed is True
+        assert strip.nav_active is False
+
+
+async def test_controller_interceptor_enter_agent_switches_viewer() -> None:
+    """`enter` on another agent row while a viewer is open switches the viewer."""
+    run_a = _run("agent-1", status="running", session=SimpleNamespace(messages=()))
+    run_b = _run("agent-2", status="running", session=SimpleNamespace(messages=()))
+    bridge = FakeComponentBridge()
+    controller = SubagentUiController(_manager(run_a, run_b), bridge)
+    controller.install()
+    strip = bridge.slots[STRIP_KEY](TAU_DARK_THEME)
+    interceptor = bridge.interceptors[0]
+    app = _Harness(strip)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        controller.open_conversation(run_a)
+        assert len(bridge.main_views) == 1
+        # Re-enter nav, move onto run_b's row, enter switches the viewer.
+        assert interceptor(Key("left", None), "") is True
+        assert interceptor(Key("down", None), "") is True  # main -> agent 1
+        assert interceptor(Key("down", None), "") is True  # agent 1 -> agent 2
+        assert strip.selected_index == 2
+        assert interceptor(Key("enter", None), "") is True
+        assert len(bridge.main_views) == 2  # a new viewer opened for run_b
+        assert controller._viewing_id == "agent-2"
+        assert strip.viewing_id == "agent-2"
+        assert strip.nav_active is False  # opening resets nav
+
+
+async def test_controller_interceptor_yields_while_composer_active() -> None:
+    """While the steer composer owns the keyboard, the interceptor yields."""
+    run = _run("agent-1", status="running", session=SimpleNamespace(messages=()))
+    bridge = FakeComponentBridge()
+    controller = SubagentUiController(_manager(run), bridge)
+    controller.install()
+    strip = bridge.slots[STRIP_KEY](TAU_DARK_THEME)
+    interceptor = bridge.interceptors[0]
+    app = _Harness(strip)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        controller.open_conversation(run)
+        # Simulate the composer being up (it owns keys until it closes).
+        controller._viewer._composer = object()  # type: ignore[attr-defined]
+        assert controller._viewer.composer_active is True
+        assert interceptor(Key("left", None), "") is False
+        assert interceptor(Key("escape", None), "") is False
+
+
+async def test_strip_click_main_row_closes_open_viewer() -> None:
+    """Clicking the ``main`` row while a viewer is open closes it (bug fix 2)."""
+    run = _run("agent-1", status="running", session=SimpleNamespace(messages=()))
+    closed: list[int] = []
+
+    def _close() -> bool:
+        closed.append(1)
+        return True
+
+    strip = AgentStripWidget(
+        _manager(run),
+        TAU_DARK_THEME,
+        open_conversation=lambda r: True,
+        close_conversation=_close,
+    )
+    strip.viewing_id = "agent-1"
+    app = _Harness(strip)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        # render() populated _row_runs; index 0 is the main row (None).
+        assert strip._row_runs[0] is None
+        strip.on_click(SimpleNamespace(y=0))  # type: ignore[arg-type]
+        assert closed == [1]
+        # With no viewer open, the main-row click just deactivates nav.
+        closed_none = AgentStripWidget(
+            _manager(run),
+            TAU_DARK_THEME,
+            open_conversation=lambda r: True,
+            close_conversation=lambda: False,
+        )
+        app2 = _Harness(closed_none)
+        async with app2.run_test(size=(80, 24)) as pilot2:
+            await pilot2.pause()
+            closed_none.activate_nav()
+            closed_none.on_click(SimpleNamespace(y=0))  # type: ignore[arg-type]
+            assert closed_none.nav_active is False
 
 
 async def test_controller_interceptor_ignored_without_agents() -> None:

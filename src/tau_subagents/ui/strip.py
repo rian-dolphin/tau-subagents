@@ -101,11 +101,15 @@ class AgentStripWidget(Static):
         theme: TuiTheme,
         *,
         open_conversation: Callable[[AgentRun], bool],
+        close_conversation: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__("", id="subagents-fleet-strip")
         self._manager = manager
         self._theme = theme
         self._open_conversation = open_conversation
+        # Closes an open viewer if one is up; returns True if it did. Lets the
+        # `main` row double as "back to main" while a viewer is open.
+        self._close_conversation = close_conversation
         # 0 = main, 1..N = the agent at roster position N.
         self._selected_index = 0
         self._focused_nav = False
@@ -218,13 +222,15 @@ class AgentStripWidget(Static):
     def on_click(self, event: events.Click) -> None:
         """Click a row to open its viewer; needs no focus (pi/tau parity).
 
-        The ``main`` row just deactivates nav; an agent row selects and opens.
+        The ``main`` row closes an open viewer (back to main), else deactivates
+        nav; an agent row selects and opens.
         """
         line = int(event.y)
         if 0 <= line < len(self._row_runs):
             run = self._row_runs[line]
             if run is None:
-                self.deactivate_nav()
+                if self._close_conversation is None or not self._close_conversation():
+                    self.deactivate_nav()
                 return
             # Reflect the click in the selection, then open.
             agents = self._agent_runs()

@@ -159,6 +159,15 @@ class ConversationViewer(Vertical):
         self._refresh_transcript()
         self._update_header()
 
+    @property
+    def composer_active(self) -> bool:
+        """Whether the steer composer is up (and owns the keyboard)."""
+        return self._composer is not None
+
+    def request_close(self) -> None:
+        """Close this view via its host handle (the strip-nav close path)."""
+        self._handle.close()
+
     def on_unmount(self) -> None:
         """Unsubscribe and let the controller forget this viewer."""
         try:

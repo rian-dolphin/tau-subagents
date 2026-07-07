@@ -952,14 +952,22 @@ def setup(tau: ExtensionAPI) -> None:
     ui_controller: list[object] = []  # 0 or 1 element (a nonlocal-friendly cell)
 
     def _install_ui_components() -> None:
-        if ui_controller:
-            return
         # getattr-guard keeps the extension loadable on an older tau without the
         # component seam (constraint 8): it then runs dialog-only, no strip.
         components = getattr(getattr(tau, "context", None), "ui", None)
         components = getattr(components, "components", None)
         if components is None or not getattr(components, "supports_components", False):
             return
+        # Defensive reinstall (bug fix 2): a controller can survive into the next
+        # bind if a session_start arrives without a matching shutdown (or the host
+        # force-cleared its slots on rebind). Tear the stale one down and mount
+        # fresh widgets against the host's current slots. The host sequences the
+        # same-tick teardown+reinstall, so the strip's slot never collides on its
+        # id (which used to raise DuplicateIds and drop the strip).
+        existing = _current_controller()
+        if existing is not None:
+            existing.teardown()
+            ui_controller.clear()
         from .ui import SubagentUiController
 
         controller = SubagentUiController(manager, components)

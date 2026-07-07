@@ -63,7 +63,10 @@ class SubagentUiController:
 
     def _build_strip(self, theme: TuiTheme) -> AgentStripWidget:
         strip = AgentStripWidget(
-            self._manager, theme, open_conversation=self.open_conversation
+            self._manager,
+            theme,
+            open_conversation=self.open_conversation,
+            close_conversation=self.close_conversation,
         )
         strip.viewing_id = self._viewing_id
         self._strip = strip
@@ -108,6 +111,19 @@ class SubagentUiController:
         self._components.open_main_view(build)
         return True
 
+    def close_conversation(self) -> bool:
+        """Close the open viewer via its host handle. False if none is open.
+
+        The viewer's ``on_unmount`` calls back into ``_on_viewer_closed``, which
+        clears the ● marker and restores the strip; the host handle restores the
+        main transcript and prompt focus.
+        """
+        viewer = self._viewer
+        if viewer is None:
+            return False
+        viewer.request_close()
+        return True
+
     def _on_viewer_closed(self, viewer: ConversationViewer) -> None:
         if self._viewer is not viewer:
             return
@@ -124,27 +140,39 @@ class SubagentUiController:
 
         The host consults this pre-dispatch, before its app-level priority
         bindings and the focused widget, so the strip never needs focus. Gated
-        on: a mounted strip with agents, no viewer open (a viewer/composer owns
-        real focus and its own keys), and an empty prompt (typing flows through).
+        on a mounted strip with agents; it stays active even while a viewer is
+        open (so the user can navigate back to ``main`` or another run) EXCEPT
+        while the steer composer owns the keyboard.
 
-        Keys: while inactive, ``down``/``left`` activate nav (highlight ``main``).
-        While active, ``down``/``up`` move the selection (up past the top
-        deactivates), ``enter`` activates the row (``main`` → deactivate; an agent
-        → open its viewer), ``escape`` deactivates. Any other key deactivates and
-        is NOT consumed, so it flows to the prompt naturally (pi parity).
+        Keys — no viewer open: while inactive, ``down``/``left`` at an empty
+        prompt activate nav; typing flows through. Viewer open: ``left`` (only,
+        not ``down`` — the focused viewer scrolls with ``up``/``down``) activates
+        nav. While active: ``down``/``up`` move the selection (up past the top
+        deactivates), ``escape`` deactivates, ``enter`` on ``main`` closes any
+        open viewer and deactivates, ``enter`` on an agent opens/switches its
+        viewer; any other key deactivates and is NOT consumed (pi parity).
         """
         strip = self._strip
-        # Yield entirely while a viewer/composer is open — it owns focus + keys.
-        if strip is None or self._viewer is not None or not strip.has_agents():
+        if strip is None or not strip.has_agents():
             return False
-        if prompt_text != "":
-            # The user is typing; make sure a stale nav highlight is cleared.
+        viewer = self._viewer
+        # While the steer composer is focused, yield entirely — it owns keys.
+        if viewer is not None and viewer.composer_active:
+            return False
+        if viewer is None and prompt_text != "":
+            # The user is typing at the prompt; clear any stale nav highlight.
             if strip.nav_active:
                 strip.deactivate_nav()
             return False
 
         key = event.key
         if not strip.nav_active:
+            if viewer is not None:
+                # Viewer open: only `left` enters the strip; `down` scrolls it.
+                if key == "left":
+                    strip.activate_nav()
+                    return True
+                return False
             if key in ("down", "left"):
                 strip.activate_nav()
                 return True
@@ -166,11 +194,14 @@ class SubagentUiController:
         if key == "enter":
             run = strip.selected_run()
             if run is None:
-                strip.deactivate_nav()  # main row: just return to the prompt
+                # main row: close any open viewer, then return to the prompt.
+                self.close_conversation()
+                strip.deactivate_nav()
             else:
+                # Open or switch (race-safe: the host sequences the swap).
                 self.open_conversation(run)
             return True
 
-        # Any other key: cancel nav and let it flow to the prompt (pi parity).
+        # Any other key: cancel nav and let it flow (pi parity).
         strip.deactivate_nav()
         return False
