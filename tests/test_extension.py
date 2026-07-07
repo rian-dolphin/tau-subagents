@@ -1701,6 +1701,37 @@ def test_agent_result_renderer_formats_card(tmp_path: Path) -> None:
     assert render(SimpleNamespace(details=None), expanded=False) is None
 
 
+async def test_hard_cancelled_tool_call_stops_the_ticker(tmp_path: Path) -> None:
+    # Tau can hard-cancel the tool coroutine mid-wait (consumer teardown). The
+    # run task keeps going; the ticker callback must be cleared so the still-
+    # running child does not keep ticking into an orphaned callback.
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    release = asyncio.Event()
+    _patch_provider_factory(_extension_module(), BlockingProvider(release, "done"))
+
+    agent_tool = _agent_tool(runtime)
+    updates: list[str] = []
+    task = asyncio.create_task(
+        agent_tool.execute(
+            {"prompt": "go", "description": "d"},
+            on_update=lambda message, data=None: updates.append(message),
+        )
+    )
+    await asyncio.sleep(0.1)  # let the executor enter its wait loop
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    updates.clear()
+    release.set()
+    # Pump the loop so the (still-running) child finishes its events; a leaked
+    # callback would append ticker lines here.
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert updates == []
+
+
 async def test_foreground_cancel_returns_cancelled_card_details(tmp_path: Path) -> None:
     # Esc-cancel stays in the card family: the result carries details so the
     # row renders "✗ cancelled" instead of falling back to the generic block.

@@ -1124,35 +1124,44 @@ def setup(tau: ExtensionAPI) -> None:
             )
 
         # Live stats ticker: only valid while this tool call is executing, so
-        # foreground-only, cleared before returning.
+        # foreground-only. The try/finally clears it even when tau hard-cancels
+        # this coroutine mid-wait (the run task keeps going and must not keep
+        # ticking into an orphaned callback).
         run.on_update = on_update
         assert run.task is not None
-        while not run.task.done():
-            if signal is not None and signal.is_cancelled():
-                if run.session is not None:
-                    run.session.cancel()
-                run.task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await run.task
-                await manager.close_run(run)
-                run.on_update = None
-                # A cancel that lands before the task first runs never reaches
-                # _run_agent's CancelledError handler; settle the record here
-                # so the roster and the result agree the run is over.
-                if run.status not in TERMINAL_STATUSES:
-                    run.status = "cancelled"
-                if run.completed_at is None:
-                    run.completed_at = time.monotonic()
-                return _tool_result(
-                    "agent",
-                    ok=False,
-                    content="Subagent cancelled",
-                    # Cancelled runs stay in the card family (✗ cancelled).
-                    details=build_notification_details(run, FOREGROUND_RESULT_CHARS),
-                )
-            await asyncio.sleep(0.05)
+        try:
+            while not run.task.done():
+                if signal is not None and signal.is_cancelled():
+                    if run.session is not None:
+                        run.session.cancel()
+                    run.task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await run.task
+                    await manager.close_run(run)
+                    # A cancel that lands before the task first runs never
+                    # reaches _run_agent's CancelledError handler; settle the
+                    # record here so the roster and the result agree.
+                    if run.status not in TERMINAL_STATUSES:
+                        run.status = "cancelled"
+                    if run.completed_at is None:
+                        run.completed_at = time.monotonic()
+                    if run.status in ("completed", "steered"):
+                        # The run beat the cancel to the finish line — report
+                        # the real result, not a phantom cancellation.
+                        return _foreground_result(run)
+                    return _tool_result(
+                        "agent",
+                        ok=False,
+                        content="Subagent cancelled",
+                        # Cancelled runs stay in the card family (✗ cancelled).
+                        details=build_notification_details(
+                            run, FOREGROUND_RESULT_CHARS
+                        ),
+                    )
+                await asyncio.sleep(0.05)
+        finally:
+            run.on_update = None
 
-        run.on_update = None
         return _foreground_result(run)
 
     async def run_resume(agent_id: str, arguments, on_update=None) -> AgentToolResult:  # noqa: ANN001

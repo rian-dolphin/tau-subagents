@@ -150,7 +150,8 @@ def _format_duration(ms: int) -> str:
     seconds = ms / 1000
     if seconds < 59.95:  # the .1f rounding threshold, so "60.0s" never prints
         return f"{seconds:.1f}s"
-    minutes, secs = divmod(int(seconds), 60)
+    # round() (not int()) so 59.96s becomes "1m 0s", never "0m 59s".
+    minutes, secs = divmod(round(seconds), 60)
     if minutes < 60:
         return f"{minutes}m {secs}s"
     hours, minutes = divmod(minutes, 60)
