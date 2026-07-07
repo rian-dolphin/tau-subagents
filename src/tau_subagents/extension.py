@@ -1134,16 +1134,18 @@ def setup(tau: ExtensionAPI) -> None:
                 run.session.cancel()
             assert run.task is not None
             run.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await run.task
-            await manager.close_run(run)
-            # A cancel that lands before the task first runs never reaches
-            # _run_agent's CancelledError handler; settle the record here so
-            # the roster and the result agree the run is over.
+            # asyncio.wait (not `await run.task`) so the child's CancelledError
+            # is never raised here — a plain suppress would also swallow a
+            # cancellation aimed at THIS coroutine landing at that await.
+            await asyncio.wait({run.task})
+            # Settle before the async close: a cancel that lands before the
+            # task first runs never reaches _run_agent's CancelledError
+            # handler, and a re-cancel during close_run must not skip this.
             if run.status not in TERMINAL_STATUSES:
                 run.status = "cancelled"
             if run.completed_at is None:
                 run.completed_at = time.monotonic()
+            await manager.close_run(run)
 
         # Live stats ticker: only valid while this tool call is executing, so
         # foreground-only. The try/finally clears it even when tau hard-cancels
