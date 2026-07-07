@@ -1572,7 +1572,7 @@ def test_notification_renderer_formats_details(tmp_path: Path) -> None:
     collapsed = render(view, SimpleNamespace(expanded=False))
     assert "[green]✓[/green]" in collapsed
     assert "[bold]deploy watch[/bold]" in collapsed
-    assert "3/10 turns" in collapsed
+    assert "3 turns (max 10)" in collapsed
     assert "1.5k tokens" in collapsed
     assert "2.3s" in collapsed
     # A multi-line preview collapses to its first line plus an ellipsis, and
@@ -1631,7 +1631,7 @@ def test_agent_result_renderer_formats_card(tmp_path: Path) -> None:
     collapsed = render(SimpleNamespace(details=details), expanded=False)
     # Compact card: the description already sits on the invocation line above,
     # so the card starts with the status and stats.
-    assert collapsed.startswith("[green]✓[/green] [dim]completed · 3/10 turns")
+    assert collapsed.startswith("[green]✓[/green] [dim]completed · 3 turns (max 10)")
     assert "deploy watch" not in collapsed
     assert "1.5k tokens" in collapsed
     assert "⎿  line one…" in collapsed

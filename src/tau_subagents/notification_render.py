@@ -128,7 +128,11 @@ def stat_parts(details: dict) -> list[str]:  # noqa: ANN001
     turns = int(details.get("turn_count") or 0)
     max_turns = details.get("max_turns")
     if turns > 0:
-        parts.append(f"{turns}/{max_turns} turns" if max_turns else _plural(turns, "turn"))
+        parts.append(_plural(turns, "turn"))
+        if max_turns:
+            # "(max N)", not "x/N": the limit is a budget, and "3/8" reads
+            # like progress toward a known total.
+            parts[-1] += f" (max {max_turns})"
     tools = int(details.get("tool_uses") or 0)
     if tools > 0:
         parts.append(_plural(tools, "tool use"))
