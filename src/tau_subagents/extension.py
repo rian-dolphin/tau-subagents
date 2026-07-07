@@ -51,7 +51,7 @@ from .agents_menu import (
 )
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
-from .notification_render import render_notification
+from .notification_render import render_agent_result, render_notification, stat_parts
 from .output_file import OutputFileWriter, output_file_path
 from .prompts import (
     build_child_system_prompt,
@@ -76,6 +76,11 @@ if TYPE_CHECKING:
 
 INDIVIDUAL_RESULT_CHARS = 500
 GROUP_RESULT_CHARS = 300
+# Display-only budget for the foreground card's expanded view (Ctrl+O). More
+# generous than the notification previews above, which also enter the model's
+# context: the old generic result block showed the full text, so a tight cap
+# here would be a regression.
+FOREGROUND_RESULT_CHARS = 6_000
 RECORD_RESULT_CHARS = 4_000
 TRUNCATION_SUFFIX = "\n...(truncated, use get_subagent_result for full output)"
 BATCH_DEBOUNCE_SECONDS = 0.1
@@ -151,6 +156,11 @@ class AgentRun:
     soft_limit_reached: bool = False
     aborted: bool = False
     pending_steers: list[str] = field(default_factory=list)
+    # Live stats ticker (foreground runs only): tau's tool-progress seam, set
+    # for the duration of the blocking tool call. `last_progress` dedups so
+    # the line only repaints when a stat actually changed.
+    on_update: Callable[[str, dict[str, object] | None], None] | None = None
+    last_progress: str = ""
     join_mode: str | None = None
     requested_isolation: str | None = None
     worktree: Worktree | None = None
@@ -650,8 +660,35 @@ class SubagentManager:
         elif event.type == "error" and not event.recoverable:
             run.status = "error"
             run.error = event.message
+        self._emit_progress(run, event)
         if event.type in RUN_PUSH_EVENTS:
             self._notify_run(run)
+
+    def _emit_progress(self, run: AgentRun, event: AgentEvent) -> None:
+        """Update the live stats ticker under the tool row (foreground runs).
+
+        One stable, cumulative line in the completion card's stats vocabulary
+        (turns · tool uses · tokens), so the running row morphs into the
+        finished card — unlike the per-event activity echo this replaces
+        (dropped as noise in d0d5ac8), the line only changes when a stat does.
+        """
+        if run.on_update is None:
+            return
+        if event.type not in ("turn_end", "tool_execution_start", "message_end"):
+            return
+        message = format_live_stats(run)
+        if not message or message == run.last_progress:
+            return
+        run.last_progress = message
+        data: dict[str, object] = {
+            "agent_id": run.agent_id,
+            "turns": run.turns,
+            "tool_uses": run.tool_calls,
+        }
+        if run.has_usage:
+            data["total_tokens"] = lifetime_tokens(run)
+        with contextlib.suppress(Exception):
+            run.on_update(message, data)
 
     def _deliver_background_result(self, run: AgentRun) -> None:
         if run.result_consumed:
@@ -873,6 +910,20 @@ def lifetime_tokens(run: AgentRun) -> int:
     return run.tokens_input + run.tokens_output + run.tokens_cache_write
 
 
+def format_live_stats(run: AgentRun) -> str:
+    """Cumulative running-stats line in the completion card's vocabulary."""
+    return " · ".join(
+        stat_parts(
+            {
+                "turn_count": run.turns,
+                "max_turns": run.max_turns,
+                "tool_uses": run.tool_calls,
+                "total_tokens": lifetime_tokens(run) if run.has_usage else 0,
+            }
+        )
+    )
+
+
 def format_usage_parts(run: AgentRun) -> str:
     """Format pi-style usage parts joined by middle dots."""
     parts = []
@@ -987,13 +1038,13 @@ def setup(tau: ExtensionAPI) -> None:
             start_scheduler()
         _install_ui_components()
 
-    async def run_agent_tool(arguments, signal=None):  # noqa: ANN001, ANN202
+    async def run_agent_tool(arguments, signal=None, *, on_update=None):  # noqa: ANN001, ANN202
         await manager.evict_stale()
         if arguments.get("schedule"):
             return await run_schedule(arguments)
         resume_id = arguments.get("resume")
         if resume_id:
-            return await run_resume(str(resume_id), arguments)
+            return await run_resume(str(resume_id), arguments, on_update)
 
         definitions = manager.definitions()
         agent_type = str(arguments.get("subagent_type", "general"))
@@ -1062,8 +1113,19 @@ def setup(tau: ExtensionAPI) -> None:
                 "agent",
                 ok=True,
                 content=format_background_spawn(run, manager.max_concurrent),
+                # A "background" card: the row confirms the spawn in one dim
+                # line; completion arrives later as a notification card.
+                details={
+                    "status": "background",
+                    "agent_id": run.agent_id,
+                    "queued": run.status == "queued",
+                    "output_file": run.output_file,
+                },
             )
 
+        # Live stats ticker: only valid while this tool call is executing, so
+        # foreground-only, cleared before returning.
+        run.on_update = on_update
         assert run.task is not None
         while not run.task.done():
             if signal is not None and signal.is_cancelled():
@@ -1073,12 +1135,27 @@ def setup(tau: ExtensionAPI) -> None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await run.task
                 await manager.close_run(run)
-                return _tool_result("agent", ok=False, content="Subagent cancelled")
+                run.on_update = None
+                # A cancel that lands before the task first runs never reaches
+                # _run_agent's CancelledError handler; settle the record here
+                # so the roster and the result agree the run is over.
+                if run.status not in TERMINAL_STATUSES:
+                    run.status = "cancelled"
+                if run.completed_at is None:
+                    run.completed_at = time.monotonic()
+                return _tool_result(
+                    "agent",
+                    ok=False,
+                    content="Subagent cancelled",
+                    # Cancelled runs stay in the card family (✗ cancelled).
+                    details=build_notification_details(run, FOREGROUND_RESULT_CHARS),
+                )
             await asyncio.sleep(0.05)
 
+        run.on_update = None
         return _foreground_result(run)
 
-    async def run_resume(agent_id: str, arguments) -> AgentToolResult:  # noqa: ANN001
+    async def run_resume(agent_id: str, arguments, on_update=None) -> AgentToolResult:  # noqa: ANN001
         run = manager.runs.get(agent_id)
         if run is None:
             return _tool_result(
@@ -1109,7 +1186,12 @@ def setup(tau: ExtensionAPI) -> None:
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
             return _tool_result("agent", ok=False, content="prompt is required")
-        await manager.resume(run, prompt)
+        run.on_update = on_update
+        run.last_progress = ""
+        try:
+            await manager.resume(run, prompt)
+        finally:
+            run.on_update = None
         return _foreground_result(run)
 
     async def run_schedule(arguments) -> AgentToolResult:  # noqa: ANN001
@@ -1416,6 +1498,7 @@ def setup(tau: ExtensionAPI) -> None:
             executor=run_agent_tool,
             prompt_snippet="Spawn an autonomous subagent for delegated tasks.",
             render_call=render_agent_call,
+            render_result=render_agent_result,
         )
     )
     tau.register_tool(
@@ -1477,6 +1560,7 @@ def setup(tau: ExtensionAPI) -> None:
 
 
 def _foreground_result(run: AgentRun) -> AgentToolResult:
+    details = build_notification_details(run, FOREGROUND_RESULT_CHARS)
     if run.status in ("completed", "steered"):
         content = run.result_text or "(subagent produced no output)"
         duration = _duration_ms(run)
@@ -1495,11 +1579,13 @@ def _foreground_result(run: AgentRun) -> AgentToolResult:
             "agent",
             ok=True,
             content=f"{format_run_summary(run)}\n{completed_line}\n\n{content}",
+            details=details,
         )
     return _tool_result(
         "agent",
         ok=False,
         content=f"{format_run_summary(run)}\n\n{run.error or 'subagent failed'}",
+        details=details,
     )
 
 
@@ -1509,11 +1595,18 @@ def _coerce_max_turns(value) -> int | None:  # noqa: ANN001
     return int(value)
 
 
-def _tool_result(name: str, *, ok: bool, content: str) -> AgentToolResult:
+def _tool_result(
+    name: str,
+    *,
+    ok: bool,
+    content: str,
+    details: dict | None = None,
+) -> AgentToolResult:
     return AgentToolResult(
         tool_call_id="",
         name=name,
         ok=ok,
         content=content,
+        details=details,
         error=None if ok else content,
     )

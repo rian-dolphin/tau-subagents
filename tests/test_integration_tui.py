@@ -22,15 +22,20 @@ from types import SimpleNamespace
 import pytest
 from textual.containers import Container
 
-from tau_agent import QueueUpdateEvent
+from tau_agent import (
+    QueueUpdateEvent,
+    ToolCall,
+    ToolExecutionEndEvent,
+    ToolExecutionStartEvent,
+)
 from tau_agent.messages import AssistantMessage
-from tau_ai import ProviderResponseEndEvent, ProviderResponseStartEvent
+from tau_ai import FakeProvider, ProviderResponseEndEvent, ProviderResponseStartEvent
 from tau_coding.session import ModelChoice, TerminalCommandResult
 from tau_coding.skills import Skill
 from tau_coding.system_prompt import ProjectContextFile
 from tau_coding.tools import create_coding_tools
 from tau_coding.tui.app import PromptInput, TauTuiApp
-from tau_coding.tui.widgets import TranscriptView
+from tau_coding.tui.widgets import TranscriptMessageWidget, TranscriptView
 
 from tau_subagents.ui.strip import AgentStripWidget
 from tau_subagents.ui.viewer import ConversationViewer
@@ -41,6 +46,7 @@ from test_extension import (  # noqa: E402
     _extension_module,
     _load_runtime,
     _patch_provider_factory,
+    _text_stream,
 )
 from test_ui import _run, _strip_text  # noqa: E402
 
@@ -523,3 +529,54 @@ async def test_journey_switch_viewers_then_back_to_main(tmp_path) -> None:  # no
 
         release.set()
         await pilot.pause()
+
+
+async def test_foreground_result_renders_completion_card(tmp_path) -> None:  # noqa: ANN001
+    """End-to-end proof of the render_result seam: a REAL foreground agent run's
+    result, streamed through the REAL app, renders the completion card on the
+    tool row (invocation line + ✓ stats + ⎿ preview) instead of the bare
+    invocation the row used to collapse back to.
+    """
+    app, session = _make_app(tmp_path)
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+
+        _patch_provider_factory(
+            _extension_module(),
+            FakeProvider([_text_stream("Subagent report: all good.")]),
+        )
+        agent_tool = _agent_tool(session.extension_runtime)
+        result = await agent_tool.execute(
+            {"prompt": "go", "description": "survey the repo"}
+        )
+        # In production the loop stamps the id; the tool returns it blank.
+        result = result.model_copy(update={"tool_call_id": "call-1"})
+
+        async def stream(event) -> None:  # noqa: ANN001
+            app.adapter.apply(event)
+            await app._apply_streaming_transcript_event(event)
+
+        await stream(
+            ToolExecutionStartEvent(
+                tool_call=ToolCall(
+                    id="call-1",
+                    name="agent",
+                    arguments={"prompt": "go", "description": "survey the repo"},
+                )
+            )
+        )
+        await stream(ToolExecutionEndEvent(result=result))
+        await pilot.pause()
+
+        widget = next(
+            w for w in app.query(TranscriptMessageWidget) if w.item.role == "tool"
+        )
+        text = widget.selection_text
+        # The render_call invocation line stays…
+        assert "▸ general agent · survey the repo" in text
+        # …with the compact completion card beneath it.
+        assert "✓ completed" in text
+        assert "⎿  Subagent report: all good." in text
+        # The raw tool-result body stays out of the collapsed row.
+        assert "agent-1 [completed]" not in text

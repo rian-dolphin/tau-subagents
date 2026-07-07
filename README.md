@@ -96,7 +96,14 @@ updates are push-based — the viewer subscribes to the run's change listeners
 rather than polling. Finished agents leave the strip after a short linger;
 `/agents` still reaches their transcripts. The agent tool-call row in the main
 transcript shows a braille spinner and a live elapsed timer while the run
-executes (Tau core behavior, driven by this extension's `render_call` lines).
+executes (Tau core behavior, driven by this extension's `render_call` lines),
+plus a cumulative stats ticker (`2 turns · 5 tool uses · 41.2k tokens`)
+streamed through Tau's tool-progress seam. When a foreground run finishes, the
+row renders a completion card via the tool's `render_result` hook — status
+glyph, stats line, and a `⎿` result preview (full result and transcript path
+under Ctrl+O) — the same card family as background completion notifications,
+so foreground and background finishes read alike. Background spawns confirm in
+one line (`⎿ Running in background (agent-1)`).
 
 The UI installs defensively on every `session_start` (any stale controller is
 torn down and fresh widgets mounted), so `/new`, `/resume`, and session

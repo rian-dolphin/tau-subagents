@@ -1490,10 +1490,11 @@ async def test_real_usage_accumulates_and_surfaces(tmp_path: Path) -> None:
     assert "<usage><total_tokens>60</total_tokens><tool_uses>0</tool_uses>" in note
 
 
-async def test_foreground_run_emits_no_progress_updates(tmp_path: Path) -> None:
-    # The spinner on the pending tool row (tau core) is the live activity
-    # signal now; per-event "agent-n: turn n" updates were deliberately
-    # removed as transcript noise.
+async def test_foreground_run_emits_live_stats_ticker(tmp_path: Path) -> None:
+    # The ticker is one stable, cumulative line in the completion card's stats
+    # vocabulary — NOT the per-event "agent-n: turn n" activity echo that was
+    # dropped as transcript noise (d0d5ac8). It only fires when a stat changes,
+    # so the running row morphs into the finished card.
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     module = _extension_module()
@@ -1511,7 +1512,12 @@ async def test_foreground_run_emits_no_progress_updates(tmp_path: Path) -> None:
     )
 
     assert result.ok is True
-    assert updates == []
+    assert updates, "foreground run should stream the live stats ticker"
+    assert "1 tool use" in updates
+    assert updates[-1] == "2 turns · 1 tool use"
+    # Cumulative and deduplicated: every emission differs from the previous.
+    assert len(updates) == len(set(updates))
+    assert all("agent-" not in message for message in updates)
 
 
 async def test_inherit_context_prepends_parent_conversation(tmp_path: Path) -> None:
@@ -1604,6 +1610,113 @@ def test_notification_renderer_formats_details(tmp_path: Path) -> None:
     assert "second run" in both
 
     assert render(SimpleNamespace(details=None), SimpleNamespace(expanded=False)) is None
+
+
+def test_agent_result_renderer_formats_card(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    render = _submodule("notification_render").render_agent_result
+    details = {
+        "description": "deploy watch",
+        "status": "completed",
+        "turn_count": 3,
+        "max_turns": 10,
+        "tool_uses": 2,
+        "total_tokens": 1500,
+        "duration_ms": 2300,
+        "output_file": "/tmp/t.jsonl",
+        "error": None,
+        "result_preview": "line one\nline two",
+    }
+
+    collapsed = render(SimpleNamespace(details=details), expanded=False)
+    # Compact card: the description already sits on the invocation line above,
+    # so the card starts with the status and stats.
+    assert collapsed.startswith("[green]✓[/green] [dim]completed · 3/10 turns")
+    assert "deploy watch" not in collapsed
+    assert "1.5k tokens" in collapsed
+    assert "⎿  line one…" in collapsed
+    assert "transcript:" not in collapsed
+
+    expanded = render(SimpleNamespace(details=details), expanded=True)
+    assert "line two" in expanded
+    assert "transcript: /tmp/t.jsonl" in expanded
+
+    # Failure previews render red (the run's error text, not routine output).
+    error = render(
+        SimpleNamespace(details={**details, "status": "error", "result_preview": "boom"}),
+        expanded=False,
+    )
+    assert error.startswith("[red]✗[/red] [dim]error")
+    assert "[red]⎿  boom[/red]" in error
+
+    # A steered finish gets the cautionary yellow ✓.
+    steered = render(
+        SimpleNamespace(details={**details, "status": "steered"}), expanded=False
+    )
+    assert steered.startswith("[yellow]✓[/yellow] [dim]completed (steered)")
+
+    # Expanded views past the line cap say what was hidden.
+    tall = SimpleNamespace(
+        details={**details, "result_preview": "\n".join(f"l{i}" for i in range(35))}
+    )
+    tall_expanded = render(tall, expanded=True)
+    assert "… 5 more lines — get_subagent_result for full output" in tall_expanded
+
+    # Result text with Rich markup renders literally (escaping round-trip).
+    from rich.text import Text
+
+    marked = render(
+        SimpleNamespace(
+            details={**details, "result_preview": "found [red]3[/red] in [module]"}
+        ),
+        expanded=False,
+    )
+    assert "found [red]3[/red] in [module]" in Text.from_markup(marked).plain
+
+    spawned = render(
+        SimpleNamespace(details={"status": "background", "agent_id": "agent-1"}),
+        expanded=False,
+    )
+    assert spawned == "  [dim]⎿  Running in background (agent-1)[/dim]"
+    queued = render(
+        SimpleNamespace(
+            details={"status": "background", "agent_id": "agent-2", "queued": True}
+        ),
+        expanded=False,
+    )
+    assert "Queued in background (agent-2)" in queued
+    spawned_expanded = render(
+        SimpleNamespace(
+            details={
+                "status": "background",
+                "agent_id": "agent-1",
+                "output_file": "/tmp/t.jsonl",
+            }
+        ),
+        expanded=True,
+    )
+    assert "transcript: /tmp/t.jsonl" in spawned_expanded
+
+    # No details (e.g. argument-validation failures) → generic fallback.
+    assert render(SimpleNamespace(details=None), expanded=False) is None
+
+
+async def test_foreground_cancel_returns_cancelled_card_details(tmp_path: Path) -> None:
+    # Esc-cancel stays in the card family: the result carries details so the
+    # row renders "✗ cancelled" instead of falling back to the generic block.
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    release = asyncio.Event()
+    _patch_provider_factory(_extension_module(), BlockingProvider(release, "never"))
+
+    agent_tool = _agent_tool(runtime)
+    signal = SimpleNamespace(is_cancelled=lambda: True)
+    result = await agent_tool.execute({"prompt": "go", "description": "d"}, signal=signal)
+
+    assert result.ok is False
+    assert "Subagent cancelled" in result.content
+    assert result.details is not None
+    assert result.details["status"] == "cancelled"
 
 
 async def test_notification_delivered_as_custom_message(tmp_path: Path) -> None:
@@ -1962,6 +2075,12 @@ async def test_foreground_run_returns_result(tmp_path: Path) -> None:
     assert result.ok is True
     assert "Subagent report: all good." in result.content
     assert "agent-1 [completed]" in result.content
+    # The result carries the completion-card details for the tool's
+    # render_result hook (the foreground twin of the background notification).
+    assert agent_tool.render_result is not None
+    assert result.details is not None
+    assert result.details["status"] == "completed"
+    assert result.details["result_preview"] == "Subagent report: all good."
 
 
 async def test_background_run_delivers_notification(tmp_path: Path) -> None:
@@ -1980,6 +2099,11 @@ async def test_background_run_delivers_notification(tmp_path: Path) -> None:
     )
     assert spawn_result.ok is True
     assert "agent-1" in spawn_result.content
+    assert spawn_result.details is not None
+    assert spawn_result.details["status"] == "background"
+    assert spawn_result.details["agent_id"] == "agent-1"
+    assert spawn_result.details["queued"] is False
+    assert str(spawn_result.details["output_file"]).endswith("agent-1.jsonl")
 
     for _ in range(200):
         if session.followed_up:
