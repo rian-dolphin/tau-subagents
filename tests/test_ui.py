@@ -32,7 +32,7 @@ from tau_coding.tui.widgets import TranscriptMessageWidget
 
 from tau_subagents.extension import AgentRun, SubagentManager
 from tau_subagents.ui.controller import STRIP_KEY, SubagentUiController
-from tau_subagents.ui.strip import _SPINNER_FRAMES, AgentStripWidget
+from tau_subagents.ui.strip import AgentStripWidget
 from tau_subagents.ui.viewer import ConversationViewer
 
 # Sibling test module (pytest prepend import mode puts tests/ on sys.path).
@@ -118,10 +118,14 @@ def test_strip_renders_runs_and_statuses() -> None:
     assert "main" in text
     for label in ("explore", "review", "build"):
         assert label in text
-    # Running shows a braille spinner; finished statuses render their own glyph.
-    assert any(frame in text for frame in _SPINNER_FRAMES)
+    # Running shows a hollow circle (the animated spinner lives on the agent
+    # tool row in the main chat, not the strip); finished statuses render their
+    # own glyph. No timer/token stats in strip rows.
+    assert "○ explore" in text
     assert "✓" in text  # completed
     assert "✗" in text  # error
+    assert "tokens" not in text
+    assert "0s" not in text
 
 
 def test_strip_renders_steered_and_aborted_glyphs() -> None:

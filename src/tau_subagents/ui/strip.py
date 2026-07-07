@@ -2,8 +2,10 @@
 
 Ports pi-subagents' ``fleet-list.ts`` onto tau's component seam, blended with
 the rendering feel of tau core's old ``_render_agent_strip``. One row for
-``main`` plus one per active/lingering run; a braille spinner marks running
-runs and richer statuses (``steered``/``aborted``) render their own glyph
+``main`` plus one per active/lingering run. Rows stay deliberately quiet: a
+status glyph (hollow circle while running — the spinner/timer/token stats
+live on the agent tool row in the main chat, not here) plus type and
+description; richer statuses (``steered``/``aborted``) render their own glyph
 directly (no down-mapping onto the old five-status vocabulary).
 
 Navigation follows pi's fleet-list model. The strip NEVER takes Textual focus:
@@ -37,47 +39,24 @@ STRIP_MAX_ROWS = 4
 # How long a finished run lingers in the strip before it drops off (pi's
 # FINISHED_LINGER_MS). It stays reachable via /agents afterwards.
 FINISHED_LINGER_SECONDS = 4.0
-# Re-render cadence so the running spinner animates and lingering rows expire.
-SPINNER_INTERVAL = 0.2
-_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Re-render cadence so lingering rows expire on time.
+TICK_INTERVAL = 0.5
 
 ACTIVE_STATUSES = ("running", "queued")
 
-# AgentRun status → strip glyph. "running" is special-cased (spinner); the rest
-# render directly, so steered/aborted keep their own identity (the seam review's
-# "no more down-mapping").
+# AgentRun status → strip glyph. Every status renders directly, so
+# steered/aborted keep their own identity (the seam review's "no more
+# down-mapping"). Running is a hollow circle — the animated spinner belongs
+# to the agent tool row in the main chat, not the strip.
 STATUS_GLYPHS = {
     "queued": "◌",
+    "running": "○",
     "completed": "✓",
     "steered": "↻",
     "aborted": "⊘",
     "error": "✗",
     "cancelled": "∅",
 }
-
-
-def _lifetime_tokens(run: AgentRun) -> int:
-    """Lifetime billed tokens (mirrors extension.lifetime_tokens without importing it)."""
-    return run.tokens_input + run.tokens_output + run.tokens_cache_write
-
-
-def format_elapsed(run: AgentRun) -> str:
-    """`11s` — integer seconds, freezing once the run finishes (pi parity)."""
-    if run.started_at is None:
-        return "queued"
-    end = run.completed_at if run.completed_at is not None else time.monotonic()
-    return f"{max(0, round(end - run.started_at))}s"
-
-
-def format_tokens(count: int) -> str:
-    """`↓ 13.1k tokens` — compact magnitude with a down-arrow prefix (pi parity)."""
-    if count >= 1_000_000:
-        compact = f"{count / 1_000_000:.1f}M"
-    elif count >= 1_000:
-        compact = f"{count / 1_000:.1f}k"
-    else:
-        compact = str(count)
-    return f"↓ {compact} tokens"
 
 
 class AgentStripWidget(Static):
@@ -113,7 +92,6 @@ class AgentStripWidget(Static):
         # 0 = main, 1..N = the agent at roster position N.
         self._selected_index = 0
         self._focused_nav = False
-        self._spinner_frame = 0
         # id of the run whose viewer is currently open (● accent marker).
         self.viewing_id: str | None = None
         # Populated each render() so on_click can map a line offset back to a run
@@ -123,18 +101,16 @@ class AgentStripWidget(Static):
     # ---- Lifecycle --------------------------------------------------------
 
     def on_mount(self) -> None:
-        """Start the spinner/linger tick; refresh reflects live manager state."""
-        self.set_interval(SPINNER_INTERVAL, self._tick)
+        """Start the linger tick; refresh reflects live manager state."""
+        self.set_interval(TICK_INTERVAL, self._tick)
 
     def _tick(self) -> None:
-        """Advance the spinner and re-render (cheap; render reads live state).
+        """Re-render so lingering rows expire on time (render reads live state).
 
         Uses ``layout=True`` because a lingering run can expire between ticks,
         shrinking the row count — a plain ``refresh()`` would leave a stale
         height (the same class of bug as the mount-empty case).
         """
-        if self._agent_runs():
-            self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
         self.refresh(layout=True)
 
     def refresh_roster(self) -> None:
@@ -297,8 +273,6 @@ class AgentStripWidget(Static):
         return Group(*rows)
 
     def _glyph_for(self, run: AgentRun) -> str:
-        if run.status == "running":
-            return _SPINNER_FRAMES[self._spinner_frame]
         return STATUS_GLYPHS.get(run.status, "○")
 
     def _render_row(
@@ -334,10 +308,4 @@ class AgentStripWidget(Static):
         row.append(label, style=f"bold {label_style}" if selected else label_style)
         if detail:
             row.append(f"  {detail}", style=theme.muted_text)
-        if run is not None:
-            tokens = _lifetime_tokens(run)
-            stat = format_elapsed(run)
-            if run.has_usage and tokens:
-                stat += f" · {format_tokens(tokens)}"
-            row.append(f"  {stat}", style=theme.muted_text)
         return row
