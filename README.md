@@ -105,6 +105,12 @@ under Ctrl+O) — the same card family as background completion notifications,
 so foreground and background finishes read alike. Background spawns confirm in
 one line (`⎿ Running in background (agent-1)`).
 
+Esc follows pi's parent-abort semantics: interrupting the main loop while a
+foreground subagent runs cancels the child too (the run settles as
+`∅ cancelled` — neutral, not failure-red — and stays reachable via `/agents`
+and `get_subagent_result`). Background runs are untouched by Esc; they stop
+only via the viewer's `x x`, the `/agents` menu, or session shutdown.
+
 The UI installs defensively on every `session_start` (any stale controller is
 torn down and fresh widgets mounted), so `/new`, `/resume`, and session
 rebinds always land exactly one strip.

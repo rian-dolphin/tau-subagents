@@ -1602,6 +1602,11 @@ def test_notification_renderer_formats_details(tmp_path: Path) -> None:
     error_view = SimpleNamespace(details={**details, "status": "error"})
     assert "[red]✗[/red]" in render(error_view, SimpleNamespace(expanded=False))
 
+    cancelled_view = SimpleNamespace(details={**details, "status": "cancelled"})
+    cancelled_card = render(cancelled_view, SimpleNamespace(expanded=False))
+    assert "[dim]∅[/dim]" in cancelled_card
+    assert "[red]" not in cancelled_card
+
     grouped = SimpleNamespace(
         details={**details, "others": [{**details, "description": "second run"}]}
     )
@@ -1655,6 +1660,13 @@ def test_agent_result_renderer_formats_card(tmp_path: Path) -> None:
     )
     assert steered.startswith("[yellow]✓[/yellow] [dim]completed (steered)")
 
+    # User-initiated stops render neutral-dim (pi's ■ Stopped), not red.
+    cancelled = render(
+        SimpleNamespace(details={**details, "status": "cancelled"}), expanded=False
+    )
+    assert cancelled.startswith("[dim]∅[/dim] [dim]cancelled")
+    assert "[red]" not in cancelled
+
     # Expanded views past the line cap say what was hidden.
     tall = SimpleNamespace(
         details={**details, "result_preview": "\n".join(f"l{i}" for i in range(35))}
@@ -1701,10 +1713,11 @@ def test_agent_result_renderer_formats_card(tmp_path: Path) -> None:
     assert render(SimpleNamespace(details=None), expanded=False) is None
 
 
-async def test_hard_cancelled_tool_call_stops_the_ticker(tmp_path: Path) -> None:
-    # Tau can hard-cancel the tool coroutine mid-wait (consumer teardown). The
-    # run task keeps going; the ticker callback must be cleared so the still-
-    # running child does not keep ticking into an orphaned callback.
+async def test_hard_cancel_cascades_to_the_child(tmp_path: Path) -> None:
+    # Esc in the TUI hard-cancels the tool coroutine (consumer teardown). The
+    # cascade must take the child down too — no zombie run burning tokens with
+    # its result silently dropped — settle the record as cancelled, and clear
+    # the ticker callback.
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     release = asyncio.Event()
@@ -1723,13 +1736,22 @@ async def test_hard_cancelled_tool_call_stops_the_ticker(tmp_path: Path) -> None
     with pytest.raises(asyncio.CancelledError):
         await task
 
+    # The child is gone and the record settled: /agents and get_subagent_result
+    # agree the run is over.
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    probed = await get_result.execute({"agent_id": "agent-1"})
+    assert "[cancelled]" in probed.content
+
     updates.clear()
     release.set()
-    # Pump the loop so the (still-running) child finishes its events; a leaked
-    # callback would append ticker lines here.
+    # Pump the loop; a surviving child (or leaked callback) would tick here.
     for _ in range(20):
         await asyncio.sleep(0.01)
     assert updates == []
+    probed_again = await get_result.execute({"agent_id": "agent-1"})
+    assert "[cancelled]" in probed_again.content
 
 
 async def test_foreground_cancel_returns_cancelled_card_details(tmp_path: Path) -> None:

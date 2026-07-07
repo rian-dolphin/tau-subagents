@@ -353,6 +353,11 @@ class SubagentManager:
             run.context_tokens = session.context_token_estimate
             if run.status == "running":
                 run.status = "completed"
+        except asyncio.CancelledError:
+            # The resume runs inline in the tool coroutine, so a parent Esc
+            # (hard-cancel) lands here; settle the record before re-raising.
+            run.status = "cancelled"
+            raise
         except Exception as exc:  # noqa: BLE001 - report subagent failures as results
             run.status = "error"
             run.error = str(exc)
@@ -1123,28 +1128,32 @@ def setup(tau: ExtensionAPI) -> None:
                 },
             )
 
+        async def cancel_child() -> None:
+            """Stop the child and settle its record (pi's parent-abort cascade)."""
+            if run.session is not None:
+                run.session.cancel()
+            assert run.task is not None
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+            await manager.close_run(run)
+            # A cancel that lands before the task first runs never reaches
+            # _run_agent's CancelledError handler; settle the record here so
+            # the roster and the result agree the run is over.
+            if run.status not in TERMINAL_STATUSES:
+                run.status = "cancelled"
+            if run.completed_at is None:
+                run.completed_at = time.monotonic()
+
         # Live stats ticker: only valid while this tool call is executing, so
         # foreground-only. The try/finally clears it even when tau hard-cancels
-        # this coroutine mid-wait (the run task keeps going and must not keep
-        # ticking into an orphaned callback).
+        # this coroutine mid-wait.
         run.on_update = on_update
         assert run.task is not None
         try:
             while not run.task.done():
                 if signal is not None and signal.is_cancelled():
-                    if run.session is not None:
-                        run.session.cancel()
-                    run.task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await run.task
-                    await manager.close_run(run)
-                    # A cancel that lands before the task first runs never
-                    # reaches _run_agent's CancelledError handler; settle the
-                    # record here so the roster and the result agree.
-                    if run.status not in TERMINAL_STATUSES:
-                        run.status = "cancelled"
-                    if run.completed_at is None:
-                        run.completed_at = time.monotonic()
+                    await cancel_child()
                     if run.status in ("completed", "steered"):
                         # The run beat the cancel to the finish line — report
                         # the real result, not a phantom cancellation.
@@ -1153,12 +1162,22 @@ def setup(tau: ExtensionAPI) -> None:
                         "agent",
                         ok=False,
                         content="Subagent cancelled",
-                        # Cancelled runs stay in the card family (✗ cancelled).
+                        # Cancelled runs stay in the card family (∅ cancelled).
                         details=build_notification_details(
                             run, FOREGROUND_RESULT_CHARS
                         ),
                     )
                 await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            # Esc in the TUI: tau hard-cancels this tool coroutine (the event
+            # stream is torn down before the 50ms poll can see the signal), so
+            # the cooperative branch above never runs. Take the child down
+            # with us — otherwise it keeps running as a zombie and its result
+            # is silently dropped. Background runs are untouched by design:
+            # they never pass through this wait loop (pi wires the parent
+            # abort signal on the foreground path only).
+            await cancel_child()
+            raise
         finally:
             run.on_update = None
 

@@ -21,6 +21,9 @@ from __future__ import annotations
 from rich.markup import escape as _escape
 
 FAILURE_STATUSES = ("error", "stopped", "aborted", "cancelled")
+# User-initiated stops render neutral-dim (pi's "■ Stopped"), not failure-red:
+# the user asked for it, nothing went wrong.
+USER_STOP_STATUSES = ("cancelled", "stopped")
 EXPANDED_RESULT_LINES = 30
 COLLAPSED_PREVIEW_CHARS = 80
 
@@ -82,6 +85,9 @@ def _render_one(details: dict, expanded: bool) -> str:  # noqa: ANN001
 
 def _status_glyph(status: str) -> tuple[str, str]:
     """Return (icon markup, status text) for a run status."""
+    if status in USER_STOP_STATUSES:
+        # ∅ matches the fleet strip's cancelled glyph.
+        return "[dim]∅[/dim]", status
     if status in FAILURE_STATUSES:
         return "[red]✗[/red]", status
     if status == "steered":
@@ -97,7 +103,9 @@ def _result_body(details: dict, expanded: bool) -> str:  # noqa: ANN001
     failed run doesn't read like routine output.
     """
     preview = str(details.get("result_preview") or "No output.")
-    style = "red" if str(details.get("status", "")) in FAILURE_STATUSES else "dim"
+    status = str(details.get("status", ""))
+    is_failure = status in FAILURE_STATUSES and status not in USER_STOP_STATUSES
+    style = "red" if is_failure else "dim"
     lines = preview.split("\n")
     body = ""
     if expanded:
