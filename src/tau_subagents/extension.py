@@ -182,8 +182,11 @@ class SubagentManager:
         self._group_join: GroupJoinManager | None = None
         self._worktree_repos: set[str] = set()
         self._nudge_timers: dict[str, asyncio.TimerHandle] = {}
-        # Host signal (tau's transcript-sources seam): fired when the run
-        # list or a run's status changes so the agents strip refreshes.
+        # Roster change signal: fired when the run list or a run's status
+        # changes. On the component seam it is wired (in setup()) to the UI
+        # controller's on_change, which refreshes the extension's own strip
+        # and any open viewer. (The name predates the seam migration: it once
+        # pointed at tau core's removed transcript-sources callback.)
         self.sources_changed: Callable[[], None] | None = None
 
     def _notify_sources(self) -> None:

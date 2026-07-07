@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 from textual.containers import Container
 
-from tau_agent import QueueUpdateEvent, UserMessage
+from tau_agent import QueueUpdateEvent
 from tau_agent.messages import AssistantMessage
 from tau_ai import ProviderResponseEndEvent, ProviderResponseStartEvent
 from tau_coding.session import ModelChoice, TerminalCommandResult

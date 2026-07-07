@@ -152,8 +152,9 @@ class ConversationViewer(Vertical):
     def on_mount(self) -> None:
         """Focus the viewer, subscribe to run push events, and paint once."""
         # open_main_view leaves focus on the prompt; the viewer takes it so its
-        # own key handling (esc close, enter steer, x stop, scroll) works and it
-        # does not lean on the prompt-scoped interceptor.
+        # own key handling (esc close, enter steer, x stop, scroll) works
+        # without routing every command through the pre-dispatch interceptor
+        # (which stays live for strip nav while the viewer is open).
         self.focus()
         self._run.listeners.append(self._on_run_event)
         self._refresh_transcript()

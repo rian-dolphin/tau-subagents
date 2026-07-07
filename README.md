@@ -70,24 +70,37 @@ headless — it prints the plain-text list instead.
 
 On component-capable Tau builds, spawning a subagent shows a strip under the
 prompt (`AgentStripWidget`) listing `main` plus every queued/running agent (the
-Claude Code pattern), a braille spinner for running runs and each finished
-run's own status glyph. `←`/`↓` in an empty prompt enters the strip; once
-focused it owns `↑`/`↓` navigation, `Enter` opens the selected agent's
-conversation viewer, and `Esc` (or `↑` past the top) hands focus back to the
-prompt. Clicking a row opens it directly.
+Claude Code pattern). Rows are deliberately quiet: a status glyph (a hollow
+circle while running — the spinner/timer/token stats live on the agent
+tool-call row in the main chat, not here) plus the agent type and description.
+
+Navigation is focus-free (pi's fleet-list model): the strip never takes
+keyboard focus — the prompt keeps it throughout, and a pre-dispatch key
+interceptor drives the strip. `←` or `↓` at an empty prompt activates nav;
+`↑`/`↓` then move the selection, `Enter` opens the selected agent's
+conversation viewer, and `Esc` (or `↑` past the top, or typing any other key)
+deactivates nav and returns the keys to the prompt. Clicking a row opens it
+directly.
 
 `Enter` opens the conversation viewer (`ConversationViewer`) in the main area
 as a display-toggled view — the strip stays visible for peripheral fleet
-awareness. It renders the run's live conversation (reusing Tau's own transcript
-rendering), carries a header with label/status/detail, and embeds a steer
-composer: `Enter` opens it, type + `Enter` sends a steering message, `Esc`
-cancels the composer. `x` twice stops the run (a two-press guard), and `Esc`/`q`
-closes the viewer. Live updates are push-based — the viewer subscribes to the
-run's change listeners rather than polling. Finished agents leave the strip
-after a short linger; `/agents` still reaches their transcripts. The agent
-tool-call row in the main transcript shows a braille spinner and a live elapsed
-timer while the run executes (Tau core behavior, driven by this extension's
-`render_call` lines).
+awareness, and nav stays reachable while viewing: `←` re-enters the strip
+(`↓` scrolls the viewer), so you can switch straight to another agent with
+`↑`/`↓` + `Enter`, or select the `main` row and press `Enter` (or click it) to
+close the viewer and return to the main transcript. The viewer renders the
+run's live conversation (reusing Tau's own transcript rendering), carries a
+header with label/status/detail, and embeds a steer composer: `Enter` opens
+it, type + `Enter` sends a steering message, `Esc` cancels the composer. `x`
+twice stops the run (a two-press guard), and `Esc`/`q` closes the viewer. Live
+updates are push-based — the viewer subscribes to the run's change listeners
+rather than polling. Finished agents leave the strip after a short linger;
+`/agents` still reaches their transcripts. The agent tool-call row in the main
+transcript shows a braille spinner and a live elapsed timer while the run
+executes (Tau core behavior, driven by this extension's `render_call` lines).
+
+The UI installs defensively on every `session_start` (any stale controller is
+torn down and fresh widgets mounted), so `/new`, `/resume`, and session
+rebinds always land exactly one strip.
 
 ## Agent types
 

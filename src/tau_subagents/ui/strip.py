@@ -13,9 +13,11 @@ the prompt keeps focus throughout, and the controller's pre-dispatch key
 interceptor (:meth:`~tau_subagents.ui.controller.SubagentUiController._intercept_key`)
 owns the whole nav state machine. This widget only holds the visual nav state
 (``_focused_nav`` + ``_selected_index``) and exposes small mutators the
-controller drives — ``left``/``down`` at an empty prompt activate nav, arrows
-move the selection, ``enter`` opens an agent's viewer, ``esc`` / up-past-top
-deactivates. A mouse click still works with no focus (:meth:`on_click`).
+controller drives — ``left``/``down`` at an empty prompt activate nav (while a
+viewer is open, only ``left``: ``down`` scrolls the focused viewer), arrows
+move the selection, ``enter`` opens an agent's viewer (on the ``main`` row it
+closes any open viewer instead), ``esc`` / up-past-top deactivates. A mouse
+click still works with no focus (:meth:`on_click`).
 """
 
 from __future__ import annotations
