@@ -15,6 +15,7 @@ It is the experiment's proof of life: it exercises the session_start ordering
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,8 @@ import pytest
 from textual.containers import Container
 
 from tau_agent import QueueUpdateEvent, UserMessage
+from tau_agent.messages import AssistantMessage
+from tau_ai import ProviderResponseEndEvent, ProviderResponseStartEvent
 from tau_coding.session import ModelChoice, TerminalCommandResult
 from tau_coding.skills import Skill
 from tau_coding.system_prompt import ProjectContextFile
@@ -33,7 +36,12 @@ from tau_subagents.ui.strip import AgentStripWidget
 from tau_subagents.ui.viewer import ConversationViewer
 
 # Sibling test modules (pytest prepend import mode puts tests/ on sys.path).
-from test_extension import _load_runtime  # noqa: E402
+from test_extension import (  # noqa: E402
+    _agent_tool,
+    _extension_module,
+    _load_runtime,
+    _patch_provider_factory,
+)
 from test_ui import _run, _strip_text  # noqa: E402
 
 pytestmark = pytest.mark.anyio
@@ -210,3 +218,113 @@ async def test_real_app_mounts_extension_strip_and_viewer(tmp_path) -> None:  # 
         assert app.query_one("#main-slot", Container).display is False
         # Focus returned to the host prompt.
         assert app.query_one("#prompt", PromptInput).has_focus
+
+
+class _GatedProvider:
+    """A provider whose single response stalls on an event, keeping the run alive.
+
+    Modeled on ``test_extension.BlockingProvider``: the spawned run stays
+    ``running`` (so the strip stays populated with a live row) until ``release``
+    is set, which lets the E2E observe the strip and drive keyboard nav without
+    racing the run to completion.
+    """
+
+    def __init__(self, release: asyncio.Event) -> None:
+        self._release = release
+
+    def stream_response(self, *, model, system, messages, tools, signal=None):  # noqa: ANN001, ANN202
+        async def iterator():  # noqa: ANN202
+            await self._release.wait()
+            yield ProviderResponseStartEvent(model="fake")
+            yield ProviderResponseEndEvent(message=AssistantMessage(content="done"))
+
+        return iterator()
+
+
+async def _wait_until(pilot, condition, *, tries: int = 200) -> None:  # noqa: ANN001
+    """Pump the event loop until ``condition()`` holds (or we give up)."""
+    for _ in range(tries):
+        if condition():
+            return
+        await pilot.pause()
+
+
+async def test_real_spawn_lights_strip_and_keyboard_opens_viewer(tmp_path) -> None:  # noqa: ANN001
+    """End-to-end proof: a real background spawn lights the strip (with non-zero
+    height), and REAL key presses drive the fleet-list nav — ``left`` activates,
+    ``down``+``enter`` open the viewer, ``escape`` closes it — all through the
+    pre-dispatch key interceptor, with the prompt keeping focus throughout.
+    """
+    app, session = _make_app(tmp_path)
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+
+        release = asyncio.Event()
+        _patch_provider_factory(_extension_module(), _GatedProvider(release))
+        agent_tool = _agent_tool(session.extension_runtime)
+
+        # Spawn through the REAL agent tool, in the background so it returns at once
+        # while the run keeps executing on the TUI event loop.
+        result = await agent_tool.execute(
+            {
+                "prompt": "look around",
+                "description": "survey the repo",
+                "subagent_type": "explore",
+                "run_in_background": True,
+            }
+        )
+        assert result.ok, result.content
+
+        slot = app.query_one("#below-prompt-slot", Container)
+        strip = slot.query(AgentStripWidget).first()
+
+        # A. The real spawn path lit up the strip with no manual signal.
+        await _wait_until(pilot, strip.has_agents)
+        assert strip.has_agents(), "spawn did not populate the strip"
+        assert "explore" in _strip_text(strip)
+
+        # A'. Geometry regression: the strip must actually occupy visible height
+        # (the invisible zero-height bug — refresh() without layout=True).
+        await _wait_until(pilot, lambda: strip.region.height > 0)
+        assert strip.region.height > 0, "strip mounted but stayed zero-height"
+        assert strip.display is True
+        # And it is genuinely on screen (the compositor is painting it).
+        assert strip in app.screen._compositor.visible_widgets
+
+        # B. REAL keyboard: left at the empty prompt activates nav (no focus steal).
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.focus()
+        await pilot.pause()
+        assert prompt.has_focus
+        await pilot.press("left")
+        await pilot.pause()
+        assert strip.nav_active, "left at empty prompt did not activate strip nav"
+        assert prompt.has_focus, "strip stole focus from the prompt"
+        assert strip.selected_index == 0  # highlights the main row first
+
+        # C. down moves onto the agent row; enter opens the real viewer in #main-slot.
+        await pilot.press("down")
+        await pilot.pause()
+        assert strip.selected_index == 1
+        await pilot.press("enter")
+        await pilot.pause()
+        main_slot = app.query_one("#main-slot", Container)
+        viewers = main_slot.query(ConversationViewer)
+        assert viewers, "enter on the agent row did not open the viewer"
+        assert app.query_one("#transcript", TranscriptView).display is False
+        assert main_slot.display is True
+        # Opening the viewer reset the strip's nav state.
+        assert strip.nav_active is False
+
+        # D. escape (with the viewer focused) closes it and restores the transcript.
+        assert viewers.first().has_focus
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not main_slot.query(ConversationViewer)
+        assert app.query_one("#transcript", TranscriptView).display is True
+        assert main_slot.display is False
+
+        # Let the stalled run finish so teardown is clean.
+        release.set()
+        await pilot.pause()

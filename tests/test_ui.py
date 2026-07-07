@@ -168,46 +168,43 @@ def test_strip_marks_only_the_viewed_row() -> None:
     assert _strip_text(strip).count("●") == 1
 
 
-# --- strip navigation ------------------------------------------------------
+# --- strip navigation (controller-driven; the strip never takes focus) -----
 
 
-async def test_strip_enter_and_leave_returns_focus_to_prompt() -> None:
-    run = _run("agent-1", status="running")
-    opened: list[str] = []
-    strip = AgentStripWidget(
-        _manager(run), TAU_DARK_THEME, open_conversation=lambda r: opened.append(r.agent_id)
-    )
+async def test_strip_nav_mutators_track_selection() -> None:
+    a = _run("agent-1", agent_type="explore", status="running")
+    b = _run("agent-2", agent_type="review", status="running")
+    strip = AgentStripWidget(_manager(a, b), TAU_DARK_THEME, open_conversation=lambda r: True)
     app = _Harness(strip)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        strip.enter_strip()
-        await pilot.pause()
-        assert strip.has_focus
 
-        # Down selects the first agent row (index 1); Enter opens it.
-        await pilot.press("down")
-        await pilot.press("enter")
-        await pilot.pause()
-        assert opened == ["agent-1"]
+        assert strip.nav_active is False
+        assert strip.selected_index == 0
 
-        # Re-enter, then Esc hands focus back to the prompt.
-        strip.enter_strip()
-        await pilot.pause()
-        await pilot.press("escape")
-        await pilot.pause()
-        assert app.query_one("#prompt", Input).has_focus
+        strip.activate_nav()
+        assert strip.nav_active is True
+        assert strip.selected_index == 0  # highlights the main row
+        assert strip.selected_run() is None  # main row → no run
 
+        strip.move_selection(1)
+        assert strip.selected_index == 1
+        assert strip.selected_run() is a  # first agent row
 
-async def test_strip_up_past_top_leaves_to_prompt() -> None:
-    run = _run("agent-1", status="running")
-    strip = AgentStripWidget(_manager(run), TAU_DARK_THEME, open_conversation=lambda r: True)
-    app = _Harness(strip)
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.pause()
-        strip.enter_strip()  # selection at main (index 0)
-        await pilot.pause()
-        await pilot.press("up")  # up-past-top exits
-        await pilot.pause()
+        strip.move_selection(1)
+        assert strip.selected_index == 2
+        assert strip.selected_run() is b
+
+        # Clamped at the last row (no wrap).
+        strip.move_selection(1)
+        assert strip.selected_index == 2
+
+        strip.deactivate_nav()
+        assert strip.nav_active is False
+        assert strip.selected_index == 0
+
+        # The strip is never focusable — the prompt keeps focus throughout.
+        assert strip.can_focus is False
         assert app.query_one("#prompt", Input).has_focus
 
 
@@ -482,26 +479,86 @@ def test_controller_open_conversation_degrades_without_components() -> None:
     assert controller.open_conversation(run) is False
 
 
-async def test_controller_interceptor_enters_strip() -> None:
+async def test_controller_interceptor_drives_nav_and_opens_viewer() -> None:
     run = _run("agent-1", status="running")
     manager = _manager(run)
     bridge = FakeComponentBridge()
     controller = SubagentUiController(manager, bridge)
     controller.install()
-    strip_factory = bridge.slots[STRIP_KEY]
+    strip = bridge.slots[STRIP_KEY](TAU_DARK_THEME)
     interceptor = bridge.interceptors[0]
-
-    # Build + mount the strip via the captured factory (this sets controller._strip).
-    strip = strip_factory(TAU_DARK_THEME)
     app = _Harness(strip)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         # Non-empty prompt → not consumed (pi's empty-editor gate).
         assert interceptor(Key("left", None), "hello") is False
-        # Empty prompt + left/down with agents present → enters the strip.
+        assert strip.nav_active is False
+        # Empty prompt + left activates nav — the strip NEVER takes focus.
         assert interceptor(Key("left", None), "") is True
+        assert strip.nav_active is True
+        assert strip.selected_index == 0
+        assert app.query_one("#prompt", Input).has_focus
+        # Down moves onto the agent row; Enter opens its viewer via the bridge.
+        assert interceptor(Key("down", None), "") is True
+        assert strip.selected_index == 1
+        assert interceptor(Key("enter", None), "") is True
+        assert bridge.main_views, "Enter on the agent row did not open a viewer"
+        # Opening a viewer resets the strip's nav state.
+        assert strip.nav_active is False
+
+
+async def test_controller_interceptor_escape_and_up_deactivate() -> None:
+    run = _run("agent-1", status="running")
+    bridge = FakeComponentBridge()
+    controller = SubagentUiController(_manager(run), bridge)
+    controller.install()
+    strip = bridge.slots[STRIP_KEY](TAU_DARK_THEME)
+    interceptor = bridge.interceptors[0]
+    app = _Harness(strip)
+    async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        assert strip.has_focus
+        interceptor(Key("down", None), "")  # activate (highlight main)
+        assert strip.nav_active is True
+        # Escape deactivates.
+        assert interceptor(Key("escape", None), "") is True
+        assert strip.nav_active is False
+        # Re-activate; up-past-top deactivates.
+        interceptor(Key("down", None), "")
+        assert interceptor(Key("up", None), "") is True
+        assert strip.nav_active is False
+
+
+async def test_controller_interceptor_other_key_flows_to_prompt() -> None:
+    run = _run("agent-1", status="running")
+    bridge = FakeComponentBridge()
+    controller = SubagentUiController(_manager(run), bridge)
+    controller.install()
+    strip = bridge.slots[STRIP_KEY](TAU_DARK_THEME)
+    interceptor = bridge.interceptors[0]
+    app = _Harness(strip)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        interceptor(Key("down", None), "")  # activate
+        # A typed character cancels nav and is NOT consumed (flows to the prompt).
+        assert interceptor(Key("a", None), "") is False
+        assert strip.nav_active is False
+
+
+async def test_controller_interceptor_yields_while_viewer_open() -> None:
+    run = _run("agent-1", status="running", session=SimpleNamespace(messages=()))
+    bridge = FakeComponentBridge()
+    controller = SubagentUiController(_manager(run), bridge)
+    controller.install()
+    strip = bridge.slots[STRIP_KEY](TAU_DARK_THEME)
+    interceptor = bridge.interceptors[0]
+    app = _Harness(strip)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        controller.open_conversation(run)
+        assert controller._viewer is not None
+        # While a viewer/composer owns focus, the interceptor yields every key.
+        assert interceptor(Key("left", None), "") is False
+        assert interceptor(Key("down", None), "") is False
 
 
 async def test_controller_interceptor_ignored_without_agents() -> None:

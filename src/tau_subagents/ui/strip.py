@@ -6,12 +6,14 @@ the rendering feel of tau core's old ``_render_agent_strip``. One row for
 runs and richer statuses (``steered``/``aborted``) render their own glyph
 directly (no down-mapping onto the old five-status vocabulary).
 
-Navigation follows the seam review's ruling: the extension's key interceptor
-(registered by :class:`~tau_subagents.ui.controller.SubagentUiController`) only
-ENTERS the strip — ``left``/``down`` at an empty prompt. Once the strip has
-Textual focus it owns its own nav via :meth:`on_key`; ``esc`` / up-past-top
-returns focus to the prompt. ``Enter`` (or a click) on an agent row opens the
-conversation viewer; the ``main`` row just returns to the prompt.
+Navigation follows pi's fleet-list model. The strip NEVER takes Textual focus:
+the prompt keeps focus throughout, and the controller's pre-dispatch key
+interceptor (:meth:`~tau_subagents.ui.controller.SubagentUiController._intercept_key`)
+owns the whole nav state machine. This widget only holds the visual nav state
+(``_focused_nav`` + ``_selected_index``) and exposes small mutators the
+controller drives — ``left``/``down`` at an empty prompt activate nav, arrows
+move the selection, ``enter`` opens an agent's viewer, ``esc`` / up-past-top
+deactivates. A mouse click still works with no focus (:meth:`on_click`).
 """
 
 from __future__ import annotations
@@ -79,10 +81,12 @@ def format_tokens(count: int) -> str:
 
 
 class AgentStripWidget(Static):
-    """Focusable below-prompt widget showing ``main`` + active subagent runs."""
+    """Below-prompt widget showing ``main`` + active subagent runs.
 
-    # A slot widget must be focusable so it can own keyboard nav once entered.
-    can_focus = True
+    Never takes focus: the controller's pre-dispatch key interceptor drives the
+    nav state held here (``_focused_nav`` / ``_selected_index``) via the mutators
+    below, so the prompt keeps focus throughout (pi's fleet-list model).
+    """
 
     DEFAULT_CSS = """
     AgentStripWidget {
@@ -119,14 +123,25 @@ class AgentStripWidget(Static):
         self.set_interval(SPINNER_INTERVAL, self._tick)
 
     def _tick(self) -> None:
-        """Advance the spinner and re-render (cheap; render reads live state)."""
+        """Advance the spinner and re-render (cheap; render reads live state).
+
+        Uses ``layout=True`` because a lingering run can expire between ticks,
+        shrinking the row count — a plain ``refresh()`` would leave a stale
+        height (the same class of bug as the mount-empty case).
+        """
         if self._agent_runs():
             self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
-        self.refresh()
+        self.refresh(layout=True)
 
     def refresh_roster(self) -> None:
-        """Re-render after the run list or a status changed (controller push)."""
-        self.refresh()
+        """Re-render after the run list or a status changed (controller push).
+
+        ``layout=True`` is mandatory: the strip mounts empty (height 0) and a
+        plain ``refresh()`` never re-measures, so a widget that gains its first
+        row would stay invisible. Any refresh that can change the row count
+        must relayout.
+        """
+        self.refresh(layout=True)
 
     # ---- Roster -----------------------------------------------------------
 
@@ -159,77 +174,57 @@ class AgentStripWidget(Static):
         """Total selectable rows: main + agents."""
         return 1 + len(self._agent_runs())
 
-    # ---- Entry / focus ----------------------------------------------------
+    # ---- Nav state (driven by the controller's key interceptor) -----------
 
-    def enter_strip(self) -> None:
-        """Take keyboard focus and start navigating from the top (main)."""
+    @property
+    def nav_active(self) -> bool:
+        """Whether arrow keys currently navigate the strip (vs. flow to prompt)."""
+        return self._focused_nav
+
+    @property
+    def selected_index(self) -> int:
+        """Current selection: 0 = ``main`` row, 1..N = agent rows."""
+        return self._selected_index
+
+    def activate_nav(self) -> None:
+        """Turn nav on and select the top (``main``) row."""
         self._focused_nav = True
         self._selected_index = 0
-        self.focus()
         self.refresh()
 
-    def _exit_to_prompt(self) -> None:
-        """Return focus to the prompt (host-owned ``#prompt``; noted coupling)."""
+    def deactivate_nav(self) -> None:
+        """Turn nav off and drop the highlight (prompt keeps focus regardless)."""
         self._focused_nav = False
         self._selected_index = 0
-        # The strip is a real Textual widget, so it reaches the host prompt by id.
-        # This is the extension→host coupling the component-seam experiment records.
-        try:
-            self.app.query_one("#prompt").focus()
-        except Exception:  # noqa: BLE001 - never let a focus miss crash nav
-            pass
         self.refresh()
 
-    def on_blur(self) -> None:
-        """Drop the nav highlight when focus leaves the strip by any route."""
-        self._focused_nav = False
+    def move_selection(self, delta: int) -> None:
+        """Move the selection by ``delta``, clamped to the roster (no wrap)."""
+        self._selected_index = max(
+            0, min(self._roster_len() - 1, self._selected_index + delta)
+        )
         self.refresh()
 
-    # ---- Keyboard nav (only while the strip holds focus) ------------------
-
-    def on_key(self, event: events.Key) -> None:
-        """Own navigation while focused; esc / up-past-top hands back to prompt."""
-        key = event.key
-        if key == "down":
-            event.stop()
-            event.prevent_default()
-            self._selected_index = min(self._roster_len() - 1, self._selected_index + 1)
-            self.refresh()
-        elif key == "up":
-            event.stop()
-            event.prevent_default()
-            if self._selected_index == 0:
-                self._exit_to_prompt()
-            else:
-                self._selected_index -= 1
-                self.refresh()
-        elif key == "escape":
-            event.stop()
-            event.prevent_default()
-            self._exit_to_prompt()
-        elif key == "enter":
-            event.stop()
-            event.prevent_default()
-            self._activate_selected()
-
-    def _activate_selected(self) -> None:
-        """Open the selected agent's viewer; the main row just returns to prompt."""
+    def selected_run(self) -> AgentRun | None:
+        """The run at the current selection, or ``None`` for the ``main`` row."""
         agents = self._agent_runs()
         index = self._selected_index
         if index <= 0 or index - 1 >= len(agents):
-            self._exit_to_prompt()
-            return
-        self._open_conversation(agents[index - 1])
+            return None
+        return agents[index - 1]
 
     # ---- Mouse ------------------------------------------------------------
 
     def on_click(self, event: events.Click) -> None:
-        """Click a row to select it; agent rows open the viewer (pi/tau parity)."""
+        """Click a row to open its viewer; needs no focus (pi/tau parity).
+
+        The ``main`` row just deactivates nav; an agent row selects and opens.
+        """
         line = int(event.y)
         if 0 <= line < len(self._row_runs):
             run = self._row_runs[line]
             if run is None:
-                self._exit_to_prompt()
+                self.deactivate_nav()
                 return
             # Reflect the click in the selection, then open.
             agents = self._agent_runs()

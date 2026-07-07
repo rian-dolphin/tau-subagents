@@ -1,9 +1,10 @@
 """Wires the extension's Textual widgets onto tau's component seam.
 
 Holds the fleet strip and the (at most one) open conversation viewer, registers
-the strip slot widget + the key interceptor that ENTERS the strip, and repoints
-the manager's change signal at a push that refreshes the strip and any open
-viewer. All host access goes through the :class:`ComponentBridge`
+the strip slot widget + the pre-dispatch key interceptor that owns the strip's
+whole navigation state machine (pi's fleet-list model; the strip never takes
+focus), and repoints the manager's change signal at a push that refreshes the
+strip and any open viewer. All host access goes through the :class:`ComponentBridge`
 (``context.ui.components``); nothing here touches tau internals directly beyond
 the widgets it mounts.
 """
@@ -40,7 +41,7 @@ class SubagentUiController:
     # ---- Install / teardown ----------------------------------------------
 
     def install(self) -> None:
-        """Mount the strip slot and register the strip-entry key interceptor."""
+        """Mount the strip slot and register the nav key interceptor."""
         self._components.set_slot_widget(
             STRIP_KEY, self._build_strip, placement="below_prompt"
         )
@@ -86,6 +87,9 @@ class SubagentUiController:
         self._viewing_id = run.agent_id
         if self._strip is not None:
             self._strip.viewing_id = run.agent_id
+            # Nav state resets when a viewer opens: the interceptor yields while a
+            # viewer is up, so leaving nav active would strand a highlight.
+            self._strip.deactivate_nav()
             self._strip.refresh_roster()
 
         def build(handle, theme: TuiTheme) -> ConversationViewer:
@@ -113,19 +117,60 @@ class SubagentUiController:
             self._strip.viewing_id = None
             self._strip.refresh_roster()
 
-    # ---- Key interceptor (enter the strip only) ---------------------------
+    # ---- Key interceptor (owns the whole nav state machine) ---------------
 
     def _intercept_key(self, event: events.Key, prompt_text: str) -> bool:
-        """Enter the strip on left/down at an empty prompt (pi's activation gate).
+        """Drive strip navigation, pi's fleet-list model, from the prompt.
 
-        The interceptor fires only while the prompt is focused, so it is used
-        solely to hand focus INTO the strip; once focused the strip owns its own
-        navigation via its ``on_key``.
+        The host consults this pre-dispatch, before its app-level priority
+        bindings and the focused widget, so the strip never needs focus. Gated
+        on: a mounted strip with agents, no viewer open (a viewer/composer owns
+        real focus and its own keys), and an empty prompt (typing flows through).
+
+        Keys: while inactive, ``down``/``left`` activate nav (highlight ``main``).
+        While active, ``down``/``up`` move the selection (up past the top
+        deactivates), ``enter`` activates the row (``main`` → deactivate; an agent
+        → open its viewer), ``escape`` deactivates. Any other key deactivates and
+        is NOT consumed, so it flows to the prompt naturally (pi parity).
         """
         strip = self._strip
-        if strip is None or prompt_text != "":
+        # Yield entirely while a viewer/composer is open — it owns focus + keys.
+        if strip is None or self._viewer is not None or not strip.has_agents():
             return False
-        if event.key in ("down", "left") and strip.has_agents():
-            strip.enter_strip()
+        if prompt_text != "":
+            # The user is typing; make sure a stale nav highlight is cleared.
+            if strip.nav_active:
+                strip.deactivate_nav()
+            return False
+
+        key = event.key
+        if not strip.nav_active:
+            if key in ("down", "left"):
+                strip.activate_nav()
+                return True
+            return False
+
+        # Nav is active.
+        if key == "down":
+            strip.move_selection(1)
             return True
+        if key == "up":
+            if strip.selected_index == 0:
+                strip.deactivate_nav()
+            else:
+                strip.move_selection(-1)
+            return True
+        if key == "escape":
+            strip.deactivate_nav()
+            return True
+        if key == "enter":
+            run = strip.selected_run()
+            if run is None:
+                strip.deactivate_nav()  # main row: just return to the prompt
+            else:
+                self.open_conversation(run)
+            return True
+
+        # Any other key: cancel nav and let it flow to the prompt (pi parity).
+        strip.deactivate_nav()
         return False
