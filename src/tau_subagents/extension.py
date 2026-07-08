@@ -28,7 +28,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tau_agent.messages import UserMessage
 from tau_agent.session import SessionEntry
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding import (
@@ -42,24 +41,17 @@ from tau_coding.extensions import (
     SessionShutdownEvent,
     SessionStartEvent,
 )
-
-try:  # tau's transcript-sources seam (agents strip); older tau lacks it
-    from tau_coding.extensions import TranscriptSource
-except ImportError:  # pragma: no cover - exercised only on older tau branches
-    TranscriptSource = None  # type: ignore[assignment, misc]
 from tau_coding.provider_runtime import create_model_provider
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL, THINKING_LEVELS
 
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
 from .agents_menu import (
-    run_snapshot_messages,
     show_agents_menu,
-    steer_run,
     supports_menu,
 )
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
-from .notification_render import render_notification
+from .notification_render import render_agent_result, render_notification, stat_parts
 from .output_file import OutputFileWriter, output_file_path
 from .prompts import (
     build_child_system_prompt,
@@ -84,6 +76,11 @@ if TYPE_CHECKING:
 
 INDIVIDUAL_RESULT_CHARS = 500
 GROUP_RESULT_CHARS = 300
+# Display-only budget for the foreground card's expanded view (Ctrl+O). More
+# generous than the notification previews above, which also enter the model's
+# context: the old generic result block showed the full text, so a tight cap
+# here would be a regression.
+FOREGROUND_RESULT_CHARS = 6_000
 RECORD_RESULT_CHARS = 4_000
 TRUNCATION_SUFFIX = "\n...(truncated, use get_subagent_result for full output)"
 BATCH_DEBOUNCE_SECONDS = 0.1
@@ -92,6 +89,12 @@ GROUP_TIMEOUT_SECONDS = DEFAULT_TIMEOUT
 STRAGGLER_TIMEOUT_SECONDS = STRAGGLER_TIMEOUT
 STALE_AFTER_SECONDS = 600.0
 TERMINAL_STATUSES = ("completed", "steered", "aborted", "error", "cancelled")
+# Event types that change what a viewer would show (session.messages / status).
+# Streaming deltas are skipped: they never touch session.messages, so pushing on
+# them would redraw identical content on every token.
+RUN_PUSH_EVENTS = frozenset(
+    {"message_end", "tool_execution_start", "tool_execution_end", "turn_end", "error"}
+)
 SOFT_LIMIT_MESSAGE = (
     "You have reached your turn limit. Wrap up immediately — provide your"
     " final answer now."
@@ -153,12 +156,23 @@ class AgentRun:
     soft_limit_reached: bool = False
     aborted: bool = False
     pending_steers: list[str] = field(default_factory=list)
+    # Live stats ticker (foreground runs only): tau's tool-progress seam, set
+    # for the duration of the blocking tool call. `last_progress` dedups so
+    # the line only repaints when a stat actually changed.
+    on_update: Callable[[str, dict[str, object] | None], None] | None = None
+    last_progress: str = ""
     join_mode: str | None = None
     requested_isolation: str | None = None
     worktree: Worktree | None = None
     used_worktree: bool = False
     output_writer: OutputFileWriter | None = None
     output_file: str | None = None
+    # Per-run push listeners (component seam): fired when this run's content or
+    # status changes so an open conversation viewer can re-render. The direct
+    # analog of pi's ``session.subscribe(() => tui.requestRender())``. Safe to
+    # call widget methods from here because runs are asyncio tasks on the TUI
+    # event loop (see the design's push-refresh invariant).
+    listeners: list[Callable[[], None]] = field(default_factory=list)
 
 
 class SubagentManager:
@@ -178,8 +192,11 @@ class SubagentManager:
         self._group_join: GroupJoinManager | None = None
         self._worktree_repos: set[str] = set()
         self._nudge_timers: dict[str, asyncio.TimerHandle] = {}
-        # Host signal (tau's transcript-sources seam): fired when the run
-        # list or a run's status changes so the agents strip refreshes.
+        # Roster change signal: fired when the run list or a run's status
+        # changes. On the component seam it is wired (in setup()) to the UI
+        # controller's on_change, which refreshes the extension's own strip
+        # and any open viewer. (The name predates the seam migration: it once
+        # pointed at tau core's removed transcript-sources callback.)
         self.sources_changed: Callable[[], None] | None = None
 
     def _notify_sources(self) -> None:
@@ -187,6 +204,12 @@ class SubagentManager:
         if callback is not None:
             with contextlib.suppress(Exception):
                 callback()
+
+    def _notify_run(self, run: AgentRun) -> None:
+        """Fire a run's per-run listeners (viewer push); guarded per listener."""
+        for listener in tuple(run.listeners):
+            with contextlib.suppress(Exception):
+                listener()
 
     @property
     def runs(self) -> dict[str, AgentRun]:
@@ -321,6 +344,7 @@ class SubagentManager:
         run.started_at = time.monotonic()
         run.completed_at = None
         self._notify_sources()
+        self._notify_run(run)
         final_text: list[str] = []
         try:
             async for event in session.prompt(prompt):
@@ -329,6 +353,11 @@ class SubagentManager:
             run.context_tokens = session.context_token_estimate
             if run.status == "running":
                 run.status = "completed"
+        except asyncio.CancelledError:
+            # The resume runs inline in the tool coroutine, so a parent Esc
+            # (hard-cancel) lands here; settle the record before re-raising.
+            run.status = "cancelled"
+            raise
         except Exception as exc:  # noqa: BLE001 - report subagent failures as results
             run.status = "error"
             run.error = str(exc)
@@ -336,6 +365,7 @@ class SubagentManager:
             await self._persist_record(run)
             run.completed_at = time.monotonic()
             self._notify_sources()
+            self._notify_run(run)
 
     async def shutdown(self) -> None:
         self._shutting_down = True
@@ -414,6 +444,7 @@ class SubagentManager:
             await self._finalize_run(run)
             run.completed_at = time.monotonic()
             self._notify_sources()
+            self._notify_run(run)
             if run.background:
                 self._running_background -= 1
                 self._drain_queue()
@@ -634,6 +665,35 @@ class SubagentManager:
         elif event.type == "error" and not event.recoverable:
             run.status = "error"
             run.error = event.message
+        self._emit_progress(run, event)
+        if event.type in RUN_PUSH_EVENTS:
+            self._notify_run(run)
+
+    def _emit_progress(self, run: AgentRun, event: AgentEvent) -> None:
+        """Update the live stats ticker under the tool row (foreground runs).
+
+        One stable, cumulative line in the completion card's stats vocabulary
+        (turns · tool uses · tokens), so the running row morphs into the
+        finished card — unlike the per-event activity echo this replaces
+        (dropped as noise in d0d5ac8), the line only changes when a stat does.
+        """
+        if run.on_update is None:
+            return
+        if event.type not in ("turn_end", "tool_execution_start", "message_end"):
+            return
+        message = format_live_stats(run)
+        if not message or message == run.last_progress:
+            return
+        run.last_progress = message
+        data: dict[str, object] = {
+            "agent_id": run.agent_id,
+            "turns": run.turns,
+            "tool_uses": run.tool_calls,
+        }
+        if run.has_usage:
+            data["total_tokens"] = lifetime_tokens(run)
+        with contextlib.suppress(Exception):
+            run.on_update(message, data)
 
     def _deliver_background_result(self, run: AgentRun) -> None:
         if run.result_consumed:
@@ -855,6 +915,20 @@ def lifetime_tokens(run: AgentRun) -> int:
     return run.tokens_input + run.tokens_output + run.tokens_cache_write
 
 
+def format_live_stats(run: AgentRun) -> str:
+    """Cumulative running-stats line in the completion card's vocabulary."""
+    return " · ".join(
+        stat_parts(
+            {
+                "turn_count": run.turns,
+                "max_turns": run.max_turns,
+                "tool_uses": run.tool_calls,
+                "total_tokens": lifetime_tokens(run) if run.has_usage else 0,
+            }
+        )
+    )
+
+
 def format_usage_parts(run: AgentRun) -> str:
     """Format pi-style usage parts joined by middle dots."""
     parts = []
@@ -876,51 +950,6 @@ def _duration_ms(run: AgentRun) -> int | None:
 
 
 STEER_CALL_PREVIEW_CHARS = 60
-
-# AgentRun statuses → tau's TranscriptSource status vocabulary.
-SOURCE_STATUS = {
-    "running": "running",
-    "queued": "queued",
-    "completed": "done",
-    "steered": "done",
-    "error": "error",
-    "cancelled": "cancelled",
-    "aborted": "cancelled",
-}
-
-
-def run_transcript_source(run: AgentRun):  # noqa: ANN201 - TranscriptSource when available
-    """Map one run onto tau's TranscriptSource (the agents-strip seam)."""
-
-    def messages():  # noqa: ANN202 - tuple[AgentMessage, ...] | None
-        session = run.session
-        if session is not None:
-            try:
-                return tuple(session.messages)
-            except Exception:  # noqa: BLE001 - a closing session must not break the strip
-                return None
-        if run.status == "queued":
-            return (UserMessage(content=run.prompt),)
-        if run.status in TERMINAL_STATUSES:
-            # Session closed or evicted: the run record still tells the story.
-            return run_snapshot_messages(run)
-        return None
-
-    steer = None
-    if run.status in ("running", "queued"):
-
-        def steer(text: str, _run: AgentRun = run) -> None:
-            steer_run(_run, text)
-
-    return TranscriptSource(
-        id=run.agent_id,
-        label=run.agent_type,
-        detail=run.description,
-        status=SOURCE_STATUS.get(run.status, "running"),
-        messages=messages,
-        revision=run.revision,
-        steer=steer,
-    )
 
 
 def render_agent_call(arguments: Mapping[str, object]) -> str:
@@ -974,18 +1003,53 @@ def setup(tau: ExtensionAPI) -> None:
         except Exception:  # noqa: BLE001 - scheduling must never break the session
             pass
 
+    # Component seam (experimental): the extension owns the agents strip and the
+    # conversation viewer as Textual widgets mounted through the component
+    # bridge. Installed lazily on session_start — NOT in setup() — because the
+    # host attaches its UI bridge (making supports_components True) only after
+    # CodingSession.load has already run setup() with the print-mode NullUiBridge.
+    ui_controller: list[object] = []  # 0 or 1 element (a nonlocal-friendly cell)
+
+    def _install_ui_components() -> None:
+        # getattr-guard keeps the extension loadable on an older tau without the
+        # component seam (constraint 8): it then runs dialog-only, no strip.
+        components = getattr(getattr(tau, "context", None), "ui", None)
+        components = getattr(components, "components", None)
+        if components is None or not getattr(components, "supports_components", False):
+            return
+        # Defensive reinstall (bug fix 2): a controller can survive into the next
+        # bind if a session_start arrives without a matching shutdown (or the host
+        # force-cleared its slots on rebind). Tear the stale one down and mount
+        # fresh widgets against the host's current slots. The host sequences the
+        # same-tick teardown+reinstall, so the strip's slot never collides on its
+        # id (which used to raise DuplicateIds and drop the strip).
+        existing = _current_controller()
+        if existing is not None:
+            existing.teardown()
+            ui_controller.clear()
+        from .ui import SubagentUiController
+
+        controller = SubagentUiController(manager, components)
+        controller.install()
+        manager.sources_changed = controller.on_change
+        ui_controller.append(controller)
+
+    def _current_controller():  # noqa: ANN202 - SubagentUiController | None
+        return ui_controller[0] if ui_controller else None
+
     async def on_session_start(event: SessionStartEvent) -> None:
         del event
         if not scheduler.is_active():
             start_scheduler()
+        _install_ui_components()
 
-    async def run_agent_tool(arguments, signal=None):  # noqa: ANN001, ANN202
+    async def run_agent_tool(arguments, signal=None, *, on_update=None):  # noqa: ANN001, ANN202
         await manager.evict_stale()
         if arguments.get("schedule"):
             return await run_schedule(arguments)
         resume_id = arguments.get("resume")
         if resume_id:
-            return await run_resume(str(resume_id), arguments)
+            return await run_resume(str(resume_id), arguments, on_update)
 
         definitions = manager.definitions()
         agent_type = str(arguments.get("subagent_type", "general"))
@@ -1054,23 +1118,74 @@ def setup(tau: ExtensionAPI) -> None:
                 "agent",
                 ok=True,
                 content=format_background_spawn(run, manager.max_concurrent),
+                # A "background" card: the row confirms the spawn in one dim
+                # line; completion arrives later as a notification card.
+                details={
+                    "status": "background",
+                    "agent_id": run.agent_id,
+                    "queued": run.status == "queued",
+                    "output_file": run.output_file,
+                },
             )
 
+        async def cancel_child() -> None:
+            """Stop the child and settle its record (pi's parent-abort cascade)."""
+            if run.session is not None:
+                run.session.cancel()
+            assert run.task is not None
+            run.task.cancel()
+            # asyncio.wait (not `await run.task`) so the child's CancelledError
+            # is never raised here — a plain suppress would also swallow a
+            # cancellation aimed at THIS coroutine landing at that await.
+            await asyncio.wait({run.task})
+            # Settle before the async close: a cancel that lands before the
+            # task first runs never reaches _run_agent's CancelledError
+            # handler, and a re-cancel during close_run must not skip this.
+            if run.status not in TERMINAL_STATUSES:
+                run.status = "cancelled"
+            if run.completed_at is None:
+                run.completed_at = time.monotonic()
+            await manager.close_run(run)
+
+        # Live stats ticker: only valid while this tool call is executing, so
+        # foreground-only. The try/finally clears it even when tau hard-cancels
+        # this coroutine mid-wait.
+        run.on_update = on_update
         assert run.task is not None
-        while not run.task.done():
-            if signal is not None and signal.is_cancelled():
-                if run.session is not None:
-                    run.session.cancel()
-                run.task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await run.task
-                await manager.close_run(run)
-                return _tool_result("agent", ok=False, content="Subagent cancelled")
-            await asyncio.sleep(0.05)
+        try:
+            while not run.task.done():
+                if signal is not None and signal.is_cancelled():
+                    await cancel_child()
+                    if run.status in ("completed", "steered"):
+                        # The run beat the cancel to the finish line — report
+                        # the real result, not a phantom cancellation.
+                        return _foreground_result(run)
+                    return _tool_result(
+                        "agent",
+                        ok=False,
+                        content="Subagent cancelled",
+                        # Cancelled runs stay in the card family (∅ cancelled).
+                        details=build_notification_details(
+                            run, FOREGROUND_RESULT_CHARS
+                        ),
+                    )
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            # Esc in the TUI: tau hard-cancels this tool coroutine (the event
+            # stream is torn down before the 50ms poll can see the signal), so
+            # the cooperative branch above never runs. Take the child down
+            # with us — otherwise it keeps running as a zombie and its result
+            # is silently dropped. Background runs are untouched by design:
+            # they never pass through this wait loop (pi wires the parent
+            # abort signal on the foreground path only).
+            await cancel_child()
+            raise
+        finally:
+            run.on_update = None
 
         return _foreground_result(run)
 
-    async def run_resume(agent_id: str, arguments) -> AgentToolResult:  # noqa: ANN001
+    async def run_resume(agent_id: str, arguments, on_update=None) -> AgentToolResult:  # noqa: ANN001
         run = manager.runs.get(agent_id)
         if run is None:
             return _tool_result(
@@ -1101,7 +1216,12 @@ def setup(tau: ExtensionAPI) -> None:
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
             return _tool_result("agent", ok=False, content="prompt is required")
-        await manager.resume(run, prompt)
+        run.on_update = on_update
+        run.last_progress = ""
+        try:
+            await manager.resume(run, prompt)
+        finally:
+            run.on_update = None
         return _foreground_result(run)
 
     async def run_schedule(arguments) -> AgentToolResult:  # noqa: ANN001
@@ -1291,7 +1411,11 @@ def setup(tau: ExtensionAPI) -> None:
                 # loop task (the documented ui-dialogs pattern). Return no
                 # message: any text would open a modal the user must dismiss
                 # before the menu appears.
-                task = loop.create_task(show_agents_menu(manager, ui, scheduler))
+                task = loop.create_task(
+                    show_agents_menu(
+                        manager, ui, scheduler, controller=_current_controller()
+                    )
+                )
                 menu_tasks.add(task)
                 task.add_done_callback(menu_tasks.discard)
                 return None
@@ -1311,6 +1435,12 @@ def setup(tau: ExtensionAPI) -> None:
         # belong to the outgoing transcript and would otherwise leak sessions.
         del event
         scheduler.stop()
+        controller = _current_controller()
+        if controller is not None:
+            # pi parity: the extension clears its own widgets on shutdown (the
+            # host also force-clears as a safety net on the next bridge install).
+            controller.teardown()
+            ui_controller.clear()
         await manager.shutdown()
         manager.runs.clear()
         manager._notify_sources()  # noqa: SLF001 - same-module teardown signal
@@ -1398,6 +1528,7 @@ def setup(tau: ExtensionAPI) -> None:
             executor=run_agent_tool,
             prompt_snippet="Spawn an autonomous subagent for delegated tasks.",
             render_call=render_agent_call,
+            render_result=render_agent_result,
         )
     )
     tau.register_tool(
@@ -1449,16 +1580,6 @@ def setup(tau: ExtensionAPI) -> None:
             render_call=render_steer_call,
         )
     )
-    set_source_provider = getattr(tau, "set_transcript_source_provider", None)
-    if TranscriptSource is not None and callable(set_source_provider):
-
-        def transcript_sources():  # noqa: ANN202 - tuple of TranscriptSource
-            return tuple(
-                run_transcript_source(run) for run in manager.runs.values()
-            )
-
-        set_source_provider(transcript_sources)
-        manager.sources_changed = tau.notify_transcript_sources_changed
     tau.register_command(
         "agents",
         agents_command,
@@ -1469,6 +1590,7 @@ def setup(tau: ExtensionAPI) -> None:
 
 
 def _foreground_result(run: AgentRun) -> AgentToolResult:
+    details = build_notification_details(run, FOREGROUND_RESULT_CHARS)
     if run.status in ("completed", "steered"):
         content = run.result_text or "(subagent produced no output)"
         duration = _duration_ms(run)
@@ -1487,11 +1609,13 @@ def _foreground_result(run: AgentRun) -> AgentToolResult:
             "agent",
             ok=True,
             content=f"{format_run_summary(run)}\n{completed_line}\n\n{content}",
+            details=details,
         )
     return _tool_result(
         "agent",
         ok=False,
         content=f"{format_run_summary(run)}\n\n{run.error or 'subagent failed'}",
+        details=details,
     )
 
 
@@ -1501,11 +1625,18 @@ def _coerce_max_turns(value) -> int | None:  # noqa: ANN001
     return int(value)
 
 
-def _tool_result(name: str, *, ok: bool, content: str) -> AgentToolResult:
+def _tool_result(
+    name: str,
+    *,
+    ok: bool,
+    content: str,
+    details: dict | None = None,
+) -> AgentToolResult:
     return AgentToolResult(
         tool_call_id="",
         name=name,
         ok=ok,
         content=content,
+        details=details,
         error=None if ok else content,
     )

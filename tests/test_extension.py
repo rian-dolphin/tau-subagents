@@ -1490,10 +1490,11 @@ async def test_real_usage_accumulates_and_surfaces(tmp_path: Path) -> None:
     assert "<usage><total_tokens>60</total_tokens><tool_uses>0</tool_uses>" in note
 
 
-async def test_foreground_run_emits_no_progress_updates(tmp_path: Path) -> None:
-    # The spinner on the pending tool row (tau core) is the live activity
-    # signal now; per-event "agent-n: turn n" updates were deliberately
-    # removed as transcript noise.
+async def test_foreground_run_emits_live_stats_ticker(tmp_path: Path) -> None:
+    # The ticker is one stable, cumulative line in the completion card's stats
+    # vocabulary — NOT the per-event "agent-n: turn n" activity echo that was
+    # dropped as transcript noise (d0d5ac8). It only fires when a stat changes,
+    # so the running row morphs into the finished card.
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     module = _extension_module()
@@ -1511,7 +1512,12 @@ async def test_foreground_run_emits_no_progress_updates(tmp_path: Path) -> None:
     )
 
     assert result.ok is True
-    assert updates == []
+    assert updates, "foreground run should stream the live stats ticker"
+    assert "1 tool use" in updates
+    assert updates[-1] == "2 turns · 1 tool use"
+    # Cumulative and deduplicated: every emission differs from the previous.
+    assert len(updates) == len(set(updates))
+    assert all("agent-" not in message for message in updates)
 
 
 async def test_inherit_context_prepends_parent_conversation(tmp_path: Path) -> None:
@@ -1566,17 +1572,40 @@ def test_notification_renderer_formats_details(tmp_path: Path) -> None:
     collapsed = render(view, SimpleNamespace(expanded=False))
     assert "[green]✓[/green]" in collapsed
     assert "[bold]deploy watch[/bold]" in collapsed
-    assert "3/10 turns" in collapsed
+    assert "3 turns (max 10)" in collapsed
     assert "1.5k tokens" in collapsed
-    assert "⎿  line one" in collapsed
+    assert "2.3s" in collapsed
+    # A multi-line preview collapses to its first line plus an ellipsis, and
+    # the transcript path stays out of the collapsed card.
+    assert "⎿  line one…" in collapsed
     assert "line two" not in collapsed
-    assert "transcript: /tmp/t.jsonl" in collapsed
+    assert "transcript:" not in collapsed
 
     expanded = render(view, SimpleNamespace(expanded=True))
     assert "line two" in expanded
+    assert "transcript: /tmp/t.jsonl" in expanded
+
+    # Long first lines cut at a word boundary, never mid-word.
+    long_view = SimpleNamespace(
+        details={**details, "result_preview": ("word " * 40).strip()}
+    )
+    long_collapsed = render(long_view, SimpleNamespace(expanded=False))
+    preview_line = next(
+        line for line in long_collapsed.split("\n") if "⎿" in line
+    )
+    assert preview_line.rstrip("[/dim]").endswith("word…")
+
+    # Durations of a minute or more switch to the elapsed style.
+    slow_view = SimpleNamespace(details={**details, "duration_ms": 83_200})
+    assert "1m 23s" in render(slow_view, SimpleNamespace(expanded=False))
 
     error_view = SimpleNamespace(details={**details, "status": "error"})
     assert "[red]✗[/red]" in render(error_view, SimpleNamespace(expanded=False))
+
+    cancelled_view = SimpleNamespace(details={**details, "status": "cancelled"})
+    cancelled_card = render(cancelled_view, SimpleNamespace(expanded=False))
+    assert "[dim]∅[/dim]" in cancelled_card
+    assert "[red]" not in cancelled_card
 
     grouped = SimpleNamespace(
         details={**details, "others": [{**details, "description": "second run"}]}
@@ -1586,6 +1615,161 @@ def test_notification_renderer_formats_details(tmp_path: Path) -> None:
     assert "second run" in both
 
     assert render(SimpleNamespace(details=None), SimpleNamespace(expanded=False)) is None
+
+
+def test_agent_result_renderer_formats_card(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    render = _submodule("notification_render").render_agent_result
+    details = {
+        "description": "deploy watch",
+        "status": "completed",
+        "turn_count": 3,
+        "max_turns": 10,
+        "tool_uses": 2,
+        "total_tokens": 1500,
+        "duration_ms": 2300,
+        "output_file": "/tmp/t.jsonl",
+        "error": None,
+        "result_preview": "line one\nline two",
+    }
+
+    collapsed = render(SimpleNamespace(details=details), expanded=False)
+    # Compact card: the description already sits on the invocation line above,
+    # so the card starts with the status and stats.
+    assert collapsed.startswith("[green]✓[/green] [dim]completed · 3 turns (max 10)")
+    assert "deploy watch" not in collapsed
+    assert "1.5k tokens" in collapsed
+    assert "⎿  line one…" in collapsed
+    assert "transcript:" not in collapsed
+
+    expanded = render(SimpleNamespace(details=details), expanded=True)
+    assert "line two" in expanded
+    assert "transcript: /tmp/t.jsonl" in expanded
+
+    # Failure previews render red (the run's error text, not routine output).
+    error = render(
+        SimpleNamespace(details={**details, "status": "error", "result_preview": "boom"}),
+        expanded=False,
+    )
+    assert error.startswith("[red]✗[/red] [dim]error")
+    assert "[red]⎿  boom[/red]" in error
+
+    # A steered finish gets the cautionary yellow ✓.
+    steered = render(
+        SimpleNamespace(details={**details, "status": "steered"}), expanded=False
+    )
+    assert steered.startswith("[yellow]✓[/yellow] [dim]completed (steered)")
+
+    # User-initiated stops render neutral-dim (pi's ■ Stopped), not red.
+    cancelled = render(
+        SimpleNamespace(details={**details, "status": "cancelled"}), expanded=False
+    )
+    assert cancelled.startswith("[dim]∅[/dim] [dim]cancelled")
+    assert "[red]" not in cancelled
+
+    # Expanded views past the line cap say what was hidden.
+    tall = SimpleNamespace(
+        details={**details, "result_preview": "\n".join(f"l{i}" for i in range(35))}
+    )
+    tall_expanded = render(tall, expanded=True)
+    assert "… 5 more lines — get_subagent_result for full output" in tall_expanded
+
+    # Result text with Rich markup renders literally (escaping round-trip).
+    from rich.text import Text
+
+    marked = render(
+        SimpleNamespace(
+            details={**details, "result_preview": "found [red]3[/red] in [module]"}
+        ),
+        expanded=False,
+    )
+    assert "found [red]3[/red] in [module]" in Text.from_markup(marked).plain
+
+    spawned = render(
+        SimpleNamespace(details={"status": "background", "agent_id": "agent-1"}),
+        expanded=False,
+    )
+    assert spawned == "  [dim]⎿  Running in background (agent-1)[/dim]"
+    queued = render(
+        SimpleNamespace(
+            details={"status": "background", "agent_id": "agent-2", "queued": True}
+        ),
+        expanded=False,
+    )
+    assert "Queued in background (agent-2)" in queued
+    spawned_expanded = render(
+        SimpleNamespace(
+            details={
+                "status": "background",
+                "agent_id": "agent-1",
+                "output_file": "/tmp/t.jsonl",
+            }
+        ),
+        expanded=True,
+    )
+    assert "transcript: /tmp/t.jsonl" in spawned_expanded
+
+    # No details (e.g. argument-validation failures) → generic fallback.
+    assert render(SimpleNamespace(details=None), expanded=False) is None
+
+
+async def test_hard_cancel_cascades_to_the_child(tmp_path: Path) -> None:
+    # Esc in the TUI hard-cancels the tool coroutine (consumer teardown). The
+    # cascade must take the child down too — no zombie run burning tokens with
+    # its result silently dropped — settle the record as cancelled, and clear
+    # the ticker callback.
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    release = asyncio.Event()
+    _patch_provider_factory(_extension_module(), BlockingProvider(release, "done"))
+
+    agent_tool = _agent_tool(runtime)
+    updates: list[str] = []
+    task = asyncio.create_task(
+        agent_tool.execute(
+            {"prompt": "go", "description": "d"},
+            on_update=lambda message, data=None: updates.append(message),
+        )
+    )
+    await asyncio.sleep(0.1)  # let the executor enter its wait loop
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The child is gone and the record settled: /agents and get_subagent_result
+    # agree the run is over.
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+    probed = await get_result.execute({"agent_id": "agent-1"})
+    assert "[cancelled]" in probed.content
+
+    updates.clear()
+    release.set()
+    # Pump the loop; a surviving child (or leaked callback) would tick here.
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert updates == []
+    probed_again = await get_result.execute({"agent_id": "agent-1"})
+    assert "[cancelled]" in probed_again.content
+
+
+async def test_foreground_cancel_returns_cancelled_card_details(tmp_path: Path) -> None:
+    # Esc-cancel stays in the card family: the result carries details so the
+    # row renders "✗ cancelled" instead of falling back to the generic block.
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    release = asyncio.Event()
+    _patch_provider_factory(_extension_module(), BlockingProvider(release, "never"))
+
+    agent_tool = _agent_tool(runtime)
+    signal = SimpleNamespace(is_cancelled=lambda: True)
+    result = await agent_tool.execute({"prompt": "go", "description": "d"}, signal=signal)
+
+    assert result.ok is False
+    assert "Subagent cancelled" in result.content
+    assert result.details is not None
+    assert result.details["status"] == "cancelled"
 
 
 async def test_notification_delivered_as_custom_message(tmp_path: Path) -> None:
@@ -1722,93 +1906,58 @@ async def test_agents_menu_shows_finished_result(tmp_path: Path) -> None:
     assert menu.supports_menu(None) is False
 
 
-def test_run_transcript_source_maps_live_and_terminal_runs() -> None:
-    extension = _extension_module()
-
-    live = _menu_run(extension, status="running")
-    steered: list[str] = []
-    live.session = SimpleNamespace(
-        messages=[UserMessage(content="child prompt")],
-        queue_steering_message=steered.append,
-    )
-    live.revision = 7
-    source = extension.run_transcript_source(live)
-    assert (source.id, source.label, source.detail) == ("agent-1", "general", "task")
-    assert source.status == "running"
-    assert source.revision == 7
-    assert source.messages() == (UserMessage(content="child prompt"),)
-    source.steer("focus on tests")
-    assert steered == ["focus on tests"]
-
-    done = _menu_run(extension, status="completed", result_text="Final report")
-    source = extension.run_transcript_source(done)
-    assert source.status == "done"
-    assert source.steer is None
-    snapshot = source.messages()
-    assert snapshot is not None
-    assert snapshot[0].content == "p"
-    assert snapshot[1].content == "Final report"
-
-    queued = _menu_run(extension, status="queued")
-    source = extension.run_transcript_source(queued)
-    assert source.status == "queued"
-    assert source.messages() == (UserMessage(content="p"),)
-    source.steer("get ahead of it")
-    assert queued.pending_steers == ["get ahead of it"]
-
-    aborted = _menu_run(extension, status="aborted")
-    assert extension.run_transcript_source(aborted).status == "cancelled"
-
-
-async def test_transcript_sources_published_and_signalled(tmp_path: Path) -> None:
-    runtime = _load_runtime(tmp_path)
-    session = RecordingSession(tmp_path)
-    runtime.bind(session)
-    fired: list[int] = []
-    runtime.set_transcript_sources_changed_callback(lambda: fired.append(1))
-    _patch_provider_factory(_extension_module(), FakeProvider([_text_stream("done")]))
-
-    agent_tool = _agent_tool(runtime)
-    await agent_tool.execute({"prompt": "task", "description": "map the code"})
-
-    assert fired  # spawn + completion pushed the sources-changed signal
-    sources = runtime.transcript_sources()
-    assert len(sources) == 1
-    assert sources[0].id == "agent-1"
-    assert sources[0].status == "done"
-    assert sources[0].detail == "map the code"
-    messages = sources[0].messages()
-    assert messages is not None and len(messages) >= 2
-
-
-async def test_agents_menu_prefers_in_place_view(tmp_path: Path) -> None:
+async def test_agents_menu_opens_conversation_via_component_seam(tmp_path: Path) -> None:
+    # The transcript-source view_transcript seam is gone: the menu now opens the
+    # extension's own viewer through the component controller. On success the
+    # whole menu unwinds ("exit") so the user lands in the view.
     _load_runtime(tmp_path)
     menu = _submodule("agents_menu")
     run = _menu_run(_extension_module(), status="running")
     manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
 
-    class InPlaceUi(ScriptedUi):
-        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
-            super().__init__(*args, **kwargs)
-            self.viewed: list[str] = []
+    opened: list[str] = []
 
-        async def view_transcript(self, source_id: str) -> bool:
-            self.viewed.append(source_id)
+    class FakeController:
+        def open_conversation(self, run) -> bool:  # noqa: ANN001
+            opened.append(run.agent_id)
             return True
 
-    ui = InPlaceUi(
+    ui = ScriptedUi(
         selects=[
             lambda options: options[0],  # top: Running agents (…)
-            lambda options: options[0],  # the run → switches the main view
+            lambda options: options[0],  # the run → opens the viewer
         ],
     )
 
-    await menu.show_agents_menu(manager, ui)
+    await menu.show_agents_menu(manager, ui, controller=FakeController())
 
-    # The whole menu unwound so the user lands in the in-place view; the
-    # action submenu never opened.
-    assert ui.viewed == ["agent-1"]
+    assert opened == ["agent-1"]
+    # The action submenu never opened (only the two selects above).
     assert len(ui.select_calls) == 2
+
+
+async def test_agents_menu_degrades_to_actions_without_controller(tmp_path: Path) -> None:
+    # A component-less host (controller=None) falls straight to the action
+    # submenu, exactly as the old view_transcript-missing branch did.
+    _load_runtime(tmp_path)
+    menu = _submodule("agents_menu")
+    run = _menu_run(_extension_module(), status="running")
+    manager = SimpleNamespace(runs={"agent-1": run}, definitions=dict)
+
+    ui = ScriptedUi(
+        selects=[
+            lambda options: options[0],  # top: Running agents (…)
+            lambda options: options[0],  # the run → no controller → actions
+            "Back",  # action submenu
+            None,  # leave run list
+            None,  # leave top menu
+        ],
+    )
+
+    await menu.show_agents_menu(manager, ui, controller=None)
+
+    # The action submenu opened (its title names the run).
+    assert any(title.startswith("agent-1 [running]") for title, _ in ui.select_calls)
 
 
 def test_render_call_lines() -> None:
@@ -1979,6 +2128,12 @@ async def test_foreground_run_returns_result(tmp_path: Path) -> None:
     assert result.ok is True
     assert "Subagent report: all good." in result.content
     assert "agent-1 [completed]" in result.content
+    # The result carries the completion-card details for the tool's
+    # render_result hook (the foreground twin of the background notification).
+    assert agent_tool.render_result is not None
+    assert result.details is not None
+    assert result.details["status"] == "completed"
+    assert result.details["result_preview"] == "Subagent report: all good."
 
 
 async def test_background_run_delivers_notification(tmp_path: Path) -> None:
@@ -1997,6 +2152,11 @@ async def test_background_run_delivers_notification(tmp_path: Path) -> None:
     )
     assert spawn_result.ok is True
     assert "agent-1" in spawn_result.content
+    assert spawn_result.details is not None
+    assert spawn_result.details["status"] == "background"
+    assert spawn_result.details["agent_id"] == "agent-1"
+    assert spawn_result.details["queued"] is False
+    assert str(spawn_result.details["output_file"]).endswith("agent-1.jsonl")
 
     for _ in range(200):
         if session.followed_up:

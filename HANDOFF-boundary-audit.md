@@ -1,5 +1,14 @@
 # Handoff: audit the tau ↔ tau-subagents boundary
 
+> **Revisited on branch `component-seam-experiment` (2026-07-06).** This audit
+> concludes below that "the pi-style component seam (option 3) was rejected."
+> That decision was reopened as a deliberate experiment: on
+> `component-seam-experiment` the transcript-sources seam is removed from tau
+> core and the strip/viewer are extension-owned Textual widgets on a generic
+> component seam. See `README.md` and the tau repo's
+> `dev-notes/design/component-seam-experiment.md`. The rejection recorded below
+> stands only if the experiment is discarded.
+
 > **RESOLVED (2026-07-06).** The audit ran, a fresh-context reviewer
 > pressure-tested it, and the changes were applied. Verdict: no logic leaks
 > — no `tau_subagents` imports in core, no tool-name special-casing, status

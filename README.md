@@ -15,9 +15,9 @@ Also registers:
 - `get_subagent_result` — poll a background agent, or `wait=true` to block for it
 - `steer_subagent` — inject a message into a running (or queued) agent
 - `/agents` — interactive menu over agent types, runs, and scheduled jobs
-- an **agents strip** under the prompt (Tau builds with the
-  transcript-sources seam): live subagent list with in-place conversation
-  views and steer-by-typing (see "The agents strip")
+- an **agents strip** under the prompt (Tau builds with the component seam):
+  live subagent list with an embedded conversation viewer (see "The agents
+  strip")
 
 ## Install
 
@@ -39,8 +39,9 @@ ln -s ~/code/tau-subagents ~/.tau/extensions/tau-subagents
 
 Update with `git pull`, then restart `tau` (or `/reload`).
 
-No dependencies beyond Tau itself — the extension only imports `tau_agent` /
-`tau_coding` and the standard library.
+Beyond Tau, this branch takes a direct dependency on `textual`: on the
+`component-seam-experiment` branch the agents strip and conversation viewer are
+extension-owned Textual widgets (see "The agents strip").
 
 ## Use
 
@@ -52,27 +53,67 @@ Ask the model to delegate:
 > run it in the background.
 
 `/agents` manages agents. On Tau builds with the `ui-dialogs` seam it opens
-an interactive menu (ported from pi's showAgentsMenu): selecting a run jumps
-into its in-place conversation view (see "The agents strip"), falling back
-to a dialog submenu (view result / steer / stop) on older Tau builds. pi's
-create wizard and settings menu are not
-ported yet. Without the seam — or headless — it prints the plain-text list
-instead.
+an interactive menu (ported from pi's showAgentsMenu): selecting a run opens
+its conversation viewer (see "The agents strip"), falling back to a dialog
+submenu (view result / steer / stop) on hosts without the component seam. pi's
+create wizard and settings menu are not ported yet. Without the seam — or
+headless — it prints the plain-text list instead.
 
 ## The agents strip
 
-On Tau builds with the transcript-sources seam, spawning a subagent shows a
-strip under the prompt listing `main` plus every queued/running agent (the
-Claude Code pattern). `←` in an empty prompt enters the strip (↑/↓ + Enter),
-or click a row: the main transcript swaps to that agent's conversation in
-place — its prompt as the user message, then thinking, tool calls, and
-responses, live-updating while it runs. While a view is open the input talks
-to that agent: submissions become steering messages (the prompt prefix and
-placeholder make the target explicit); Esc returns to main without
-cancelling anything. Finished agents leave the strip — `/agents` still
-reaches their transcripts. The agent tool-call row in the main transcript
-shows a braille spinner and a live elapsed timer while the run executes
-(Tau core behavior, driven by this extension's `render_call` lines).
+> **Experimental (branch `component-seam-experiment`).** On this branch the
+> whole agent UI is owned by the extension as real Textual widgets
+> (`src/tau_subagents/ui/`), mounted through Tau's generic *component seam*
+> (`context.ui.components`: `set_slot_widget` / `open_main_view` /
+> `register_key_interceptor`) rather than Tau core's older transcript-sources
+> seam. Tau core stays agent-agnostic — it only hosts widgets.
+
+On component-capable Tau builds, spawning a subagent shows a strip under the
+prompt (`AgentStripWidget`) listing `main` plus every queued/running agent (the
+Claude Code pattern). Rows are deliberately quiet: a status glyph (a hollow
+circle while running — the spinner/timer/token stats live on the agent
+tool-call row in the main chat, not here) plus the agent type and description.
+
+Navigation is focus-free (pi's fleet-list model): the strip never takes
+keyboard focus — the prompt keeps it throughout, and a pre-dispatch key
+interceptor drives the strip. `←` or `↓` at an empty prompt activates nav;
+`↑`/`↓` then move the selection, `Enter` opens the selected agent's
+conversation viewer, and `Esc` (or `↑` past the top, or typing any other key)
+deactivates nav and returns the keys to the prompt. Clicking a row opens it
+directly.
+
+`Enter` opens the conversation viewer (`ConversationViewer`) in the main area
+as a display-toggled view — the strip stays visible for peripheral fleet
+awareness, and nav stays reachable while viewing: `←` re-enters the strip
+(`↓` scrolls the viewer), so you can switch straight to another agent with
+`↑`/`↓` + `Enter`, or select the `main` row and press `Enter` (or click it) to
+close the viewer and return to the main transcript. The viewer renders the
+run's live conversation (reusing Tau's own transcript rendering), carries a
+header with label/status/detail, and embeds a steer composer: `Enter` opens
+it, type + `Enter` sends a steering message, `Esc` cancels the composer. `x`
+twice stops the run (a two-press guard), and `Esc`/`q` closes the viewer. Live
+updates are push-based — the viewer subscribes to the run's change listeners
+rather than polling. Finished agents leave the strip after a short linger;
+`/agents` still reaches their transcripts. The agent tool-call row in the main
+transcript shows a braille spinner and a live elapsed timer while the run
+executes (Tau core behavior, driven by this extension's `render_call` lines),
+plus a cumulative stats ticker (`2 turns · 5 tool uses · 41.2k tokens`)
+streamed through Tau's tool-progress seam. When a foreground run finishes, the
+row renders a completion card via the tool's `render_result` hook — status
+glyph, stats line, and a `⎿` result preview (full result and transcript path
+under Ctrl+O) — the same card family as background completion notifications,
+so foreground and background finishes read alike. Background spawns confirm in
+one line (`⎿ Running in background (agent-1)`).
+
+Esc follows pi's parent-abort semantics: interrupting the main loop while a
+foreground subagent runs cancels the child too (the run settles as
+`∅ cancelled` — neutral, not failure-red — and stays reachable via `/agents`
+and `get_subagent_result`). Background runs are untouched by Esc; they stop
+only via the viewer's `x x`, the `/agents` menu, or session shutdown.
+
+The UI installs defensively on every `session_start` (any stale controller is
+torn down and fresh widgets mounted), so `/new`, `/resume`, and session
+rebinds always land exactly one strip.
 
 ## Agent types
 
