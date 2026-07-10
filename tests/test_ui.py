@@ -300,6 +300,126 @@ async def test_viewer_composer_escape_cancels_without_steering() -> None:
         assert run.pending_steers == []  # nothing sent
 
 
+async def test_viewer_empty_composer_autocloses_when_run_finishes() -> None:
+    # An empty composer on a finished run is pure clutter; closing it is
+    # lossless. (A non-empty one must survive — see the next test.)
+    run = _run("agent-1", status="running", session=None)
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("enter")  # open composer
+        await pilot.pause()
+        assert viewer._composer is not None
+
+        run.status = "completed"
+        run.completed_at = time.monotonic()
+        viewer._on_run_event()  # completion push arrives on the UI loop
+        await pilot.pause()
+
+        assert viewer._composer is None
+        assert viewer.has_focus
+
+
+async def test_viewer_composer_with_text_survives_run_finish() -> None:
+    # Completion arrives between keystrokes; yanking the input away would
+    # destroy whatever the user was typing. Keep it, with the header already
+    # showing the terminal status.
+    run = _run("agent-1", status="running", session=None)
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("a", "b")
+
+        run.status = "completed"
+        run.completed_at = time.monotonic()
+        viewer._on_run_event()
+        await pilot.pause()
+
+        assert viewer._composer is not None
+        assert viewer._composer.value == "ab"
+        # The header reconciles even though the composer is preserved: the
+        # terminal status shows, the steer hint is gone, and the notice goes
+        # up immediately — no silent window inviting a doomed steer.
+        header = viewer._header_text.plain
+        assert "[completed]" in header
+        assert "Enter steer" not in header
+        assert "not sent" in header
+
+
+async def test_viewer_empty_composer_autocloses_on_external_change() -> None:
+    # Controller pushes (roster/status changes) reconcile the composer too,
+    # not just the run's own listener events.
+    run = _run("agent-1", status="running", session=None)
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert viewer._composer is not None
+
+        run.status = "completed"
+        run.completed_at = time.monotonic()
+        viewer.on_external_change()
+        await pilot.pause()
+
+        assert viewer._composer is None
+
+
+async def test_viewer_rejects_steer_after_run_finished_without_losing_text() -> None:
+    # pending_steers are only drained at session creation, so a steer sent to
+    # a finished run silently vanishes. Refuse the send, keep the typed text
+    # (the user can copy it), and say why in the header. Esc still closes.
+    run = _run("agent-1", status="running", session=None)
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("a", "b")
+
+        run.status = "completed"
+        run.completed_at = time.monotonic()
+        viewer._on_run_event()
+        await pilot.pause()
+        await pilot.press("enter")  # submit into the finished run
+        await pilot.pause()
+
+        assert run.pending_steers == []  # nothing queued into the void
+        assert viewer._composer is not None  # text not swallowed
+        assert viewer._composer.value == "ab"
+        assert "not sent" in viewer._header_text.plain
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert viewer._composer is None
+        assert "not sent" not in viewer._header_text.plain
+
+
+async def test_viewer_and_composer_carry_identifying_chrome() -> None:
+    # The viewer reuses tau's TranscriptView, so a subagent transcript is
+    # pixel-identical to the main chat; the frame and composer title are what
+    # tell the user they are inside a subagent view, not tau's prompt.
+    run = _run("agent-1", agent_type="explore", status="running", session=None)
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert "explore" in str(viewer.border_title)
+
+        await pilot.press("enter")  # open composer
+        await pilot.pause()
+        composer = viewer._composer
+        assert composer is not None
+        assert composer.id == "viewer-composer"
+        assert "steer" in str(composer.border_title).lower()
+
+
 async def test_viewer_two_press_stop_guard() -> None:
     run = _run("agent-1", status="running", session=None)
     viewer = _viewer_for(run)

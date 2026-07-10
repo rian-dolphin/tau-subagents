@@ -46,6 +46,9 @@ if TYPE_CHECKING:
 
 ACTIVE_STATUSES = ("running", "queued")
 
+# Shown while the composer holds text the finished run can no longer accept.
+_STEER_REFUSED_NOTICE = "run finished — steer not sent · Esc close"
+
 _STATUS_GLYPHS = {
     "queued": "◌",
     "running": "●",
@@ -78,7 +81,12 @@ class _SteerComposer(Input):
     """Single-line steer composer; Esc cancels back to the viewer (pi parity)."""
 
     def __init__(self, on_cancel: Callable[[], None]) -> None:
-        super().__init__(placeholder="Steer the agent…  Enter send · Esc cancel")
+        # The id is what binds the DEFAULT_CSS #viewer-composer rules (it was
+        # previously constructed without one, leaving that CSS dead).
+        super().__init__(
+            placeholder="Steer the agent…  Enter send · Esc cancel",
+            id="viewer-composer",
+        )
         self._on_cancel = on_cancel
 
     def on_key(self, event: events.Key) -> None:
@@ -96,6 +104,8 @@ class ConversationViewer(Vertical):
     DEFAULT_CSS = """
     ConversationViewer {
         height: 1fr;
+        border: round $tau-border;
+        padding: 0 1;
     }
     ConversationViewer > #viewer-header {
         height: auto;
@@ -107,6 +117,7 @@ class ConversationViewer(Vertical):
     ConversationViewer > #viewer-composer {
         height: auto;
         margin: 1 0 0 0;
+        border: round $tau-accent;
     }
     """
 
@@ -133,6 +144,9 @@ class ConversationViewer(Vertical):
         self._header: Static | None = None
         # Last rendered header line, kept for observability/tests.
         self._header_text: Text = Text()
+        # Transient header notice (e.g. a steer refused on a finished run);
+        # lives exactly as long as the composer that provoked it.
+        self._notice: str | None = None
 
     # ---- Lifecycle --------------------------------------------------------
 
@@ -156,6 +170,10 @@ class ConversationViewer(Vertical):
         # without routing every command through the pre-dispatch interceptor
         # (which stays live for strip nav while the viewer is open).
         self.focus()
+        # The transcript inside is rendered by tau's own TranscriptView, so it
+        # is pixel-identical to the main chat; the frame title is what tells
+        # the user they are looking at a subagent, not tau.
+        self.border_title = f"subagent · {self._run.agent_type}"
         self._run.listeners.append(self._on_run_event)
         self._refresh_transcript()
         self._update_header()
@@ -180,13 +198,32 @@ class ConversationViewer(Vertical):
 
     def _on_run_event(self) -> None:
         """Run listener (on the UI loop): repaint transcript + header live."""
+        self._reconcile_composer()
         self._refresh_transcript()
         self._update_header()
 
     def on_external_change(self) -> None:
         """Controller push (roster/status change) — repaint header + transcript."""
+        self._reconcile_composer()
         self._refresh_transcript()
         self._update_header()
+
+    def _reconcile_composer(self) -> None:
+        """Fold an *empty* composer away when the run stops being steerable.
+
+        Closing an empty composer is lossless clutter removal. A composer with
+        text is deliberately left alone — completion arrives between keystrokes
+        and yanking the input would destroy what the user typed — but the
+        notice goes up immediately, so the composer never sits silently
+        inviting a steer that the guarded submit path would refuse.
+        """
+        composer = self._composer
+        if composer is None or self._can_steer():
+            return
+        if not composer.value.strip():
+            self._close_composer()
+        elif self._notice is None:
+            self._notice = _STEER_REFUSED_NOTICE
 
     # ---- Steer / stop capability -----------------------------------------
 
@@ -256,26 +293,42 @@ class ConversationViewer(Vertical):
 
     def _open_composer(self) -> None:
         composer = _SteerComposer(on_cancel=self._close_composer)
+        composer.border_title = f"steer {self._run.agent_type}"
         self._composer = composer
+        self._notice = None
         self.mount(composer)
         composer.focus()
 
     def _close_composer(self) -> None:
         composer = self._composer
         self._composer = None
+        self._notice = None
         if composer is not None:
             composer.remove()
         self.focus()
+        self._update_header()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Enter in the composer sends the steering message and closes the composer."""
+        """Enter in the composer sends the steering message and closes the composer.
+
+        Steerability is re-checked at submit time, not just at composer-open:
+        pending_steers are only drained at session creation, so a steer sent to
+        a finished run would silently vanish. Refuse the send, keep the typed
+        text on screen, and say why in the header (Esc still closes).
+        """
         if self._composer is None or event.input is not self._composer:
             return
         event.stop()
         message = event.value.strip()
+        if not message:
+            self._close_composer()
+            return
+        if not self._can_steer():
+            self._notice = _STEER_REFUSED_NOTICE
+            self._update_header()
+            return
         self._close_composer()
-        if message:
-            steer_run(self._run, message)
+        steer_run(self._run, message)
 
     # ---- Rendering --------------------------------------------------------
 
@@ -305,6 +358,11 @@ class ConversationViewer(Vertical):
         line.append(f"{glyph} ", style=glyph_style)
         line.append(run.agent_type, style=f"bold {theme.prompt_text}")
         line.append(f" [{run.status}]", style=theme.muted_text)
+        if self._notice is not None:
+            # Ahead of the description/hints: the line ellipsizes from the
+            # right, and on a narrow terminal the notice is the one part that
+            # must survive (it explains why Enter is doing nothing).
+            line.append(f"  {self._notice}", style=theme.role_styles["error"].border)
         if run.description:
             line.append(f"  {run.description}", style=theme.muted_text)
         # Right-hand action hints, mirroring pi's footer affordances.
