@@ -25,7 +25,8 @@ from textual.app import App, ComposeResult
 from textual.events import Key
 from textual.widgets import Input
 
-from tau_agent.messages import AssistantMessage, UserMessage
+from tau_agent.messages import AssistantMessage, ToolResultMessage, UserMessage
+from tau_agent.tools import ToolCall
 from tau_coding.tui.app import _theme_css_variables
 from tau_coding.tui.config import TAU_DARK_THEME
 from tau_coding.tui.widgets import TranscriptMessageWidget
@@ -82,9 +83,18 @@ def _manager(*runs: AgentRun) -> SimpleNamespace:
 class _Harness(App):
     """Minimal app that mounts an ``#prompt`` plus the widgets under test."""
 
+    # Mirrors the real host's (non-priority) app-level toggle binding: it fires
+    # only when a ctrl+o leaks past the widgets under test, which in the real
+    # app means the hidden main transcript toggles instead of the viewer.
+    BINDINGS = [("ctrl+o", "host_toggle_tool_results", "Tool results")]
+
     def __init__(self, *widgets) -> None:  # noqa: ANN002
         super().__init__()
         self._widgets = widgets
+        self.leaked_tool_toggles = 0
+
+    def action_host_toggle_tool_results(self) -> None:
+        self.leaked_tool_toggles += 1
 
     def get_css_variables(self) -> dict[str, str]:
         # The reused TranscriptView (and its markdown widgets) reference tau's
@@ -472,6 +482,91 @@ async def test_viewer_cannot_steer_finished_run() -> None:
         await pilot.press("enter")
         await pilot.pause()
         assert viewer._composer is None
+
+
+def _tool_result_session() -> SimpleNamespace:
+    """A session whose transcript holds one tool call with a collapsed result."""
+    return SimpleNamespace(
+        messages=[
+            UserMessage(content="list files"),
+            AssistantMessage(
+                content="",
+                tool_calls=[ToolCall(id="call-1", name="bash", arguments={"command": "ls"})],
+            ),
+            ToolResultMessage(tool_call_id="call-1", name="bash", content="secret-output-line"),
+        ],
+        queue_steering_message=lambda m: None,
+    )
+
+
+def _transcript_text(viewer: ConversationViewer) -> str:
+    return " ".join(str(w.selection_text) for w in viewer.query(TranscriptMessageWidget))
+
+
+async def test_viewer_toggles_tool_result_expansion() -> None:
+    # Ctrl+O (the host's toggle_tool_results key) must expand/collapse tool
+    # results inside the viewer's own transcript — not fall through to the
+    # host app, which would toggle the hidden main transcript instead.
+    session = _tool_result_session()
+    run = _run("agent-1", status="running", session=session)
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert "secret-output-line" not in _transcript_text(viewer)  # collapsed by default
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert "secret-output-line" in _transcript_text(viewer)
+        # Expansion survives a live repaint (each push rebuilds the TuiState).
+        session.messages.append(AssistantMessage(content="progress update"))
+        for listener in list(run.listeners):
+            listener()
+        await pilot.pause()
+        assert "secret-output-line" in _transcript_text(viewer)
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert "secret-output-line" not in _transcript_text(viewer)
+        assert app.leaked_tool_toggles == 0  # never reached the host binding
+
+
+async def test_viewer_toggles_tool_results_while_composer_open() -> None:
+    # Parity with the main chat, where ctrl+o works while typing at the
+    # prompt: mid-steer, the toggle still applies to the viewer (and is still
+    # consumed) without disturbing the composer's text.
+    run = _run("agent-1", status="running", session=_tool_result_session())
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("enter")  # open the steer composer
+        await pilot.pause()
+        await pilot.press("h", "i")
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert "secret-output-line" in _transcript_text(viewer)
+        assert viewer._composer is not None
+        assert viewer._composer.value == "hi"
+        assert app.leaked_tool_toggles == 0
+
+
+async def test_viewer_honors_remapped_toggle_key() -> None:
+    # The viewer reads the toggle key from the host's live settings, so a
+    # remap applies here too — and ctrl+o goes back to flowing through.
+    run = _run("agent-1", status="running", session=_tool_result_session())
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    app.tui_settings = SimpleNamespace(
+        keybindings=SimpleNamespace(toggle_tool_results="ctrl+b")
+    )
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+b")
+        await pilot.pause()
+        assert "secret-output-line" in _transcript_text(viewer)
+        await pilot.press("ctrl+o")  # no longer the toggle: bubbles to the app
+        await pilot.pause()
+        assert "secret-output-line" in _transcript_text(viewer)  # viewer unchanged
+        assert app.leaked_tool_toggles == 1
 
 
 async def test_viewer_push_listener_rerenders_on_new_message() -> None:

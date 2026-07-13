@@ -531,6 +531,125 @@ async def test_journey_switch_viewers_then_back_to_main(tmp_path) -> None:  # no
         await pilot.pause()
 
 
+# --- Regression: focus integrity while a viewer is open ----------------------
+# The user-reported cluster (ctrl+o toggling the MAIN transcript, typed text
+# submitting to the main chat, esc doing nothing) is one state: viewer open but
+# focus back on the prompt. The host's app-level click handler used to refocus
+# the prompt on ANY left click, silently rerouting every key to the main chat.
+
+
+def _focus_inside(app, widget) -> bool:  # noqa: ANN001
+    focused = app.focused
+    return focused is not None and (focused is widget or widget in focused.ancestors)
+
+
+def _open_viewer(app, strip, run):  # noqa: ANN001, ANN202
+    controller = strip._open_conversation.__self__
+    assert controller.open_conversation(run) is True
+    return controller
+
+
+async def test_click_inside_viewer_keeps_viewer_focused(tmp_path) -> None:  # noqa: ANN001
+    app, _session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        strip = app.query_one("#below-prompt-slot", Container).query(AgentStripWidget).first()
+        run = _seed_run(strip, "agent-1", agent_type="explore", description="A")
+        strip._manager.sources_changed()
+        _open_viewer(app, strip, run)
+        await _settle(pilot)
+        viewer = app.query_one(ConversationViewer)
+        assert _focus_inside(app, viewer)
+
+        await pilot.click(ConversationViewer)
+        await pilot.pause()
+        assert _focus_inside(app, viewer), (
+            "clicking inside the viewer moved focus away "
+            f"(focused: {app.focused!r}) — every key now goes to the main chat"
+        )
+
+
+async def test_click_outside_viewer_keeps_viewer_focused(tmp_path) -> None:  # noqa: ANN001
+    # A click on the strip (or any main-screen chrome) must not hand the
+    # keyboard back to the prompt while an extension main view is open.
+    app, _session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        strip = app.query_one("#below-prompt-slot", Container).query(AgentStripWidget).first()
+        run = _seed_run(strip, "agent-1", agent_type="explore", description="A")
+        strip._manager.sources_changed()
+        _open_viewer(app, strip, run)
+        await _settle(pilot)
+        viewer = app.query_one(ConversationViewer)
+
+        # Click the strip's hint line (row 2 with one agent): a dead row —
+        # clicking the main row would legitimately close the viewer, and the
+        # agent row would re-open it.
+        await pilot.click(AgentStripWidget, offset=(1, 2))
+        await pilot.pause()
+        assert app.query(ConversationViewer), "the dead-row click closed the viewer"
+        assert _focus_inside(app, viewer), (
+            f"a click outside the viewer stole focus (focused: {app.focused!r})"
+        )
+
+
+async def test_viewer_keys_still_work_after_a_click(tmp_path) -> None:  # noqa: ANN001
+    # The reported symptoms, end to end: after a click, ctrl+o must toggle the
+    # VIEWER's tool results (not the hidden main transcript) and esc must
+    # close the viewer (not fall through to the prompt's cancel).
+    app, _session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        strip = app.query_one("#below-prompt-slot", Container).query(AgentStripWidget).first()
+        run = _seed_run(strip, "agent-1", agent_type="explore", description="A")
+        strip._manager.sources_changed()
+        _open_viewer(app, strip, run)
+        await _settle(pilot)
+        viewer = app.query_one(ConversationViewer)
+
+        await pilot.click(ConversationViewer)
+        await pilot.pause()
+
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert viewer._show_tool_results is True, "ctrl+o did not reach the viewer"
+        assert app.state.show_tool_results is False, (
+            "ctrl+o leaked to the host and toggled the main transcript"
+        )
+
+        await pilot.press("escape")
+        await _settle(pilot)
+        assert not app.query(ConversationViewer), "esc after a click did not close the viewer"
+        assert app.query_one("#transcript", TranscriptView).display is True
+
+
+async def test_agents_menu_open_path_focuses_viewer(tmp_path) -> None:  # noqa: ANN001
+    # The /agents flow opens the viewer right after a modal select dismisses;
+    # the modal's focus-restore must not outlive the viewer's mount focus.
+    app, session = _make_app(tmp_path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        strip = app.query_one("#below-prompt-slot", Container).query(AgentStripWidget).first()
+        run = _seed_run(strip, "agent-1", agent_type="explore", description="A")
+        strip._manager.sources_changed()
+        await pilot.pause()
+
+        bridge = session.extension_runtime.ui  # the real _TuiExtensionUiBridge
+        select_task = asyncio.ensure_future(bridge.select("Agents", ["explore (A)"]))
+        await _settle(pilot)
+        await pilot.press("enter")  # choose the (only) run, dismissing the modal
+        choice = await select_task
+        assert choice == "explore (A)"
+
+        # agents_menu.view_run_conversation runs after the await returns.
+        _open_viewer(app, strip, run)
+        await _settle(pilot)
+        viewer = app.query_one(ConversationViewer)
+        assert _focus_inside(app, viewer), (
+            f"viewer opened from the /agents modal is not focused (focused: {app.focused!r})"
+        )
+
+
 async def test_foreground_result_renders_completion_card(tmp_path) -> None:  # noqa: ANN001
     """End-to-end proof of the render_result seam: a REAL foreground agent run's
     result, streamed through the REAL app, renders the completion card on the

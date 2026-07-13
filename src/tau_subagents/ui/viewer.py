@@ -30,6 +30,7 @@ from textual.widgets import Input, Static
 # Host-internal rendering reuse (the measured coupling): the viewer renders an
 # agent's conversation through the very same state + transcript widget the host
 # uses for the main chat, so message/tool/thinking formatting stays identical.
+from tau_coding.tui.config import TuiKeybindings
 from tau_coding.tui.state import TuiState
 from tau_coding.tui.widgets import TranscriptView
 
@@ -141,6 +142,11 @@ class ConversationViewer(Vertical):
         self._stop_armed = False
         self._composer: _SteerComposer | None = None
         self._transcript: TranscriptView | None = None
+        # Viewer-local expand/collapse for tool results. Each repaint feeds a
+        # fresh TuiState into the transcript, so the flag must live here — and
+        # it is deliberately independent of the main chat's toggle: expanding
+        # a subagent's tool output should not re-render the hidden main view.
+        self._show_tool_results = False
         self._header: Static | None = None
         # Last rendered header line, kept for observability/tests.
         self._header_text: Text = Text()
@@ -166,7 +172,8 @@ class ConversationViewer(Vertical):
     def on_mount(self) -> None:
         """Focus the viewer, subscribe to run push events, and paint once."""
         # open_main_view leaves focus on the prompt; the viewer takes it so its
-        # own key handling (esc close, enter steer, x stop, scroll) works
+        # own key handling (esc close, enter steer, x stop, scroll, and the
+        # ctrl+o tool-results toggle) works
         # without routing every command through the pre-dispatch interceptor
         # (which stays live for strip nav while the viewer is open).
         self.focus()
@@ -233,11 +240,31 @@ class ConversationViewer(Vertical):
     def _is_stoppable(self) -> bool:
         return self._run.status in ACTIVE_STATUSES
 
+    # ---- Mouse ------------------------------------------------------------
+
+    def on_click(self, event: events.Click) -> None:
+        """Keep the keyboard on this viewer when it is clicked.
+
+        Bubbling would reach the host app's click handler, which (on hosts
+        without the main-view guard) refocuses the main prompt — silently
+        rerouting esc/ctrl+o/typed text to the main chat while this view is
+        open. Clicks on the steer composer keep their native Input focus.
+        """
+        event.stop()
+        if self._composer is None and not self.has_focus:
+            self.focus()
+
     # ---- Keyboard ---------------------------------------------------------
 
     def on_key(self, event: events.Key) -> None:
-        """Viewer commands while focused (the composer owns keys while it is up)."""
+        """Viewer commands while focused.
+
+        The composer owns the keyboard while it is up — except the
+        tool-results toggle: in the main chat ctrl+o works while typing at
+        the prompt, so it keeps working (and stays consumed) mid-steer too.
+        """
         if self._composer is not None:
+            self._maybe_toggle_tool_results(event)
             return
         key = event.key
         if key in ("escape", "q"):
@@ -267,6 +294,8 @@ class ConversationViewer(Vertical):
         if self._stop_armed:
             self._stop_armed = False
             self._update_header()
+        if self._maybe_toggle_tool_results(event):
+            return
         transcript = self._transcript
         if transcript is None:
             return
@@ -288,6 +317,32 @@ class ConversationViewer(Vertical):
         elif key == "end":
             transcript.scroll_end()
             event.stop()
+
+    def _maybe_toggle_tool_results(self, event: events.Key) -> bool:
+        """Apply and consume the tool-results toggle key; False for other keys.
+
+        Consuming matters: letting the key bubble would hit the host app's
+        own binding, toggling the hidden main transcript and notifying
+        "Tool results expanded." while this view visibly does nothing.
+        """
+        if event.key != self._toggle_tool_results_key():
+            return False
+        event.stop()
+        event.prevent_default()
+        self._show_tool_results = not self._show_tool_results
+        self._refresh_transcript()
+        return True
+
+    def _toggle_tool_results_key(self) -> str:
+        """The host's configured tool-results toggle key (default ctrl+o).
+
+        Read live from the running app's settings so a remapped binding keeps
+        working here; hosts without ``tui_settings`` (tests) get the default.
+        """
+        settings = getattr(self.app, "tui_settings", None)
+        keybindings = getattr(settings, "keybindings", None)
+        key = getattr(keybindings, "toggle_tool_results", None)
+        return key if isinstance(key, str) else TuiKeybindings().toggle_tool_results
 
     # ---- Steer composer ---------------------------------------------------
 
@@ -337,6 +392,7 @@ class ConversationViewer(Vertical):
         if transcript is None:
             return
         state = TuiState()
+        state.show_tool_results = self._show_tool_results
         state.load_messages(run_messages(self._run))
         transcript.update_from_state(state, theme=self._theme)
 
