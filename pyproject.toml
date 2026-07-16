@@ -11,7 +11,10 @@ requires-python = ">=3.14"
 # extension's agents strip and conversation viewer are real Textual widgets
 # mounted through tau's component seam (previously it reached textual only
 # transitively via tau).
-dependencies = ["tau-ai", "textual>=1.0"]
+dependencies = [
+ "tau-ai>=0.2.0",
+ "textual>=1.0",
+]
 
 [dependency-groups]
 dev = ["pytest>=8.0", "anyio>=4.0"]
@@ -21,12 +24,6 @@ dev = ["pytest>=8.0", "anyio>=4.0"]
 # entry inside the src layout, no root shim needed.
 [tool.tau]
 extensions = ["src/tau_subagents/extension.py"]
-
-# Tau is unpublished; resolve it from the local integration worktree (the
-# subagents-integration branch — the full seam stack). If the worktree is
-# gone, check out subagents-integration anywhere and point this at it.
-[tool.uv.sources]
-tau-ai = { path = "/Users/rian/.herdr/worktrees/tau/worktree-extensions", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
