@@ -14,18 +14,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from tau_agent.messages import AssistantMessage, UserMessage
-
-try:  # provider-usage seam (tau branch `provider-usage`)
-    from tau_agent.messages import Usage
-except ImportError:  # pragma: no cover - tau branch without the usage seam
-    Usage = None  # type: ignore[assignment, misc]
-from tau_agent.tools import ToolCall
+from tau_agent.messages import AssistantMessage, TextContent, ToolCall, Usage, UserMessage
 from tau_ai import (
+    AssistantDoneEvent,
+    AssistantErrorEvent,
+    AssistantStartEvent,
     FakeProvider,
-    ProviderErrorEvent,
-    ProviderResponseEndEvent,
-    ProviderResponseStartEvent,
 )
 from tau_coding import TauResourcePaths
 from tau_coding.extensions import ExtensionRuntime
@@ -123,8 +117,8 @@ def _patch_fake_provider(module: object, *, response: str) -> None:
         lambda provider, model, thinking_level: FakeProvider(
             [
                 [
-                    ProviderResponseStartEvent(model="fake"),
-                    ProviderResponseEndEvent(message=AssistantMessage(content=response)),
+                    AssistantStartEvent(partial=AssistantMessage(model="fake")),
+                    AssistantDoneEvent(reason="stop", message=AssistantMessage(content=response)),
                 ]
             ]
         )
@@ -169,19 +163,20 @@ def _steer_tool(runtime: ExtensionRuntime):  # noqa: ANN202
 
 def _text_stream(text: str) -> list[object]:
     return [
-        ProviderResponseStartEvent(model="fake"),
-        ProviderResponseEndEvent(message=AssistantMessage(content=text)),
+        AssistantStartEvent(partial=AssistantMessage(model="fake")),
+        AssistantDoneEvent(reason="stop", message=AssistantMessage(content=text)),
     ]
 
 
 def _tool_call_stream(text: str, call_id: str) -> list[object]:
     return [
-        ProviderResponseStartEvent(model="fake"),
-        ProviderResponseEndEvent(
+        AssistantStartEvent(partial=AssistantMessage(model="fake")),
+        AssistantDoneEvent(
+            reason="toolUse",
             message=AssistantMessage(
-                content=text,
-                tool_calls=[ToolCall(id=call_id, name="noop")],
-            )
+                content=[TextContent(text=text), ToolCall(id=call_id, name="noop")],
+                stop_reason="toolUse",
+            ),
         ),
     ]
 
@@ -199,8 +194,8 @@ class BlockingProvider:
 
         async def iterator():  # noqa: ANN202
             await self._release.wait()
-            yield ProviderResponseStartEvent(model="fake")
-            yield ProviderResponseEndEvent(message=AssistantMessage(content=self._text))
+            yield AssistantStartEvent(partial=AssistantMessage(model="fake"))
+            yield AssistantDoneEvent(reason="stop", message=AssistantMessage(content=self._text))
 
         return iterator()
 
@@ -330,14 +325,16 @@ async def test_background_queue_limits_concurrency(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     first = await agent_tool.execute(
+        "call-1",
         {"prompt": "one", "description": "one", "run_in_background": True}
     )
     second = await agent_tool.execute(
+        "call-1",
         {"prompt": "two", "description": "two", "run_in_background": True}
     )
-    assert "Agent started in background." in first.content
-    assert "Agent queued in background." in second.content
-    assert "Position: queued (max 1 concurrent)" in second.content
+    assert "Agent started in background." in first.text
+    assert "Agent queued in background." in second.text
+    assert "Position: queued (max 1 concurrent)" in second.text
 
     release.set()
     await _wait_for(lambda: len(session.followed_up) >= 2)
@@ -352,15 +349,13 @@ async def test_steer_unknown_and_completed(tmp_path: Path) -> None:
     _patch_provider_factory(module, FakeProvider([_text_stream("done")]))
 
     steer_tool = _steer_tool(runtime)
-    unknown = await steer_tool.execute({"agent_id": "nope", "message": "hi"})
-    assert unknown.ok is False
-    assert 'Agent not found: "nope". It may have been cleaned up.' in unknown.content
+    unknown = await steer_tool.execute("call-1", {"agent_id": "nope", "message": "hi"})
+    assert 'Agent not found: "nope". It may have been cleaned up.' in unknown.text
 
     agent_tool = _agent_tool(runtime)
-    await agent_tool.execute({"prompt": "x", "description": "x"})
-    completed = await steer_tool.execute({"agent_id": "agent-1", "message": "hi"})
-    assert completed.ok is False
-    assert 'is not running (status: completed)' in completed.content
+    await agent_tool.execute("call-1", {"prompt": "x", "description": "x"})
+    completed = await steer_tool.execute("call-1", {"agent_id": "agent-1", "message": "hi"})
+    assert 'is not running (status: completed)' in completed.text
 
 
 async def test_steer_queued_run_is_delivered_after_drain(tmp_path: Path) -> None:
@@ -381,21 +376,28 @@ async def test_steer_queued_run_is_delivered_after_drain(tmp_path: Path) -> None
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "one", "description": "one", "run_in_background": True}
     )
     await agent_tool.execute(
+        "call-1",
         {"prompt": "two", "description": "two", "run_in_background": True}
     )
 
     steer_tool = _steer_tool(runtime)
-    steered = await steer_tool.execute({"agent_id": "agent-2", "message": "go faster"})
-    assert steered.ok is True
-    assert "Steering message queued for agent agent-2" in steered.content
+    steered = await steer_tool.execute("call-1", {"agent_id": "agent-2", "message": "go faster"})
+    assert "Steering message queued for agent agent-2" in steered.text
 
     release.set()
     await _wait_for(lambda: len(session.followed_up) >= 2)
-    assert len(queued_provider.calls) >= 2
-    assert UserMessage(content="go faster") in queued_provider.calls[1][2]
+    # The steer was queued before the drained run started, so the loop drains
+    # it into the FIRST turn's context (pi loop semantics) rather than
+    # triggering an extra provider call.
+    assert queued_provider.calls
+    assert any(
+        getattr(m, "role", None) == "user" and m.text == "go faster"
+        for m in queued_provider.calls[0][2]
+    )
 
 
 async def test_get_result_reports_queued_and_wait_follows_drain(tmp_path: Path) -> None:
@@ -422,27 +424,27 @@ async def test_get_result_reports_queued_and_wait_follows_drain(tmp_path: Path) 
         tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
     )
     await agent_tool.execute(
+        "call-1",
         {"prompt": "one", "description": "one", "run_in_background": True}
     )
     await agent_tool.execute(
+        "call-1",
         {"prompt": "two", "description": "two", "run_in_background": True}
     )
 
-    queued = await get_result.execute({"agent_id": "agent-2"})
-    assert queued.ok is True
-    assert "[queued]" in queued.content
-    assert "Still queued (max 1 concurrent)." in queued.content
+    queued = await get_result.execute("call-1", {"agent_id": "agent-2"})
+    assert "[queued]" in queued.text
+    assert "Still queued (max 1 concurrent)." in queued.text
 
     # wait=true follows the run through queued -> started -> finished.
     waiter = asyncio.create_task(
-        get_result.execute({"agent_id": "agent-2", "wait": True})
+        get_result.execute("call-1", {"agent_id": "agent-2", "wait": True})
     )
     await asyncio.sleep(0.02)
     release.set()
     waited = await waiter
-    assert waited.ok is True
-    assert "[completed]" in waited.content
-    assert "Second done" in waited.content
+    assert "[completed]" in waited.text
+    assert "Second done" in waited.text
 
     # The queued check did not consume agent-2's result (the wait did), so
     # only agent-1's completion notification is delivered.
@@ -460,14 +462,17 @@ async def test_max_turns_soft_limit_wraps_up(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "go", "description": "go", "max_turns": 1}
     )
-
-    assert result.ok is True
-    assert "[steered]" in result.content
-    assert "Final answer" in result.content
+    assert "[steered]" in result.text
+    assert "Final answer" in result.text
     soft_message = module.SOFT_LIMIT_MESSAGE  # type: ignore[attr-defined]
-    assert UserMessage(content=soft_message) in provider.calls[1][2]
+    # Messages carry timestamps now, so compare by role + text.
+    assert any(
+        getattr(m, "role", None) == "user" and m.text == soft_message
+        for m in provider.calls[1][2]
+    )
 
 
 async def test_max_turns_grace_abort(tmp_path: Path) -> None:
@@ -485,14 +490,18 @@ async def test_max_turns_grace_abort(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "loop", "description": "loop", "max_turns": 1}
     )
-
-    assert result.ok is False
-    assert "[aborted]" in result.content
-    # Soft limit at turn 1, grace of 1 => hard cancel right after turn 2.
-    assert "turns=2" in result.content
-    assert len(provider.calls) == 2
+    assert "[aborted]" in result.text
+    # Soft limit at turn 1, grace of 1 => hard cancel right after turn 2. The
+    # pi loop then surfaces the cancellation as one final synthetic error turn
+    # ("Provider produced no assistant message"), so the counter reads 3 —
+    # still far below the 6 turns the provider offered.
+    assert "turns=3" in result.text
+    # Two real provider calls, plus the post-cancel call the provider answers
+    # with an empty (cancelled) stream.
+    assert len(provider.calls) == 3
 
 
 async def test_resume_continues_session(tmp_path: Path) -> None:
@@ -503,18 +512,15 @@ async def test_resume_continues_session(tmp_path: Path) -> None:
     _patch_provider_factory(module, provider)
 
     agent_tool = _agent_tool(runtime)
-    first = await agent_tool.execute({"prompt": "start", "description": "start"})
-    assert first.ok is True
-    assert "First response" in first.content
+    first = await agent_tool.execute("call-1", {"prompt": "start", "description": "start"})
+    assert "First response" in first.text
 
-    resumed = await agent_tool.execute({"resume": "agent-1", "prompt": "keep going"})
-    assert resumed.ok is True
-    assert "Second response" in resumed.content
-    assert "turns=2" in resumed.content
+    resumed = await agent_tool.execute("call-1", {"resume": "agent-1", "prompt": "keep going"})
+    assert "Second response" in resumed.text
+    assert "turns=2" in resumed.text
 
-    unknown = await agent_tool.execute({"resume": "ghost", "prompt": "x"})
-    assert unknown.ok is False
-    assert 'Agent not found: "ghost". It may have been cleaned up.' in unknown.content
+    unknown = await agent_tool.execute("call-1", {"resume": "ghost", "prompt": "x"})
+    assert 'Agent not found: "ghost". It may have been cleaned up.' in unknown.text
 
 
 async def test_group_join_full_delivery(tmp_path: Path) -> None:
@@ -603,9 +609,11 @@ async def test_smart_mode_consolidates_two_background_agents(tmp_path: Path) -> 
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "one", "description": "one", "run_in_background": True}
     )
     await agent_tool.execute(
+        "call-1",
         {"prompt": "two", "description": "two", "run_in_background": True}
     )
 
@@ -638,9 +646,11 @@ async def test_async_mode_sends_individual_notifications(tmp_path: Path) -> None
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "one", "description": "one", "run_in_background": True}
     )
     await agent_tool.execute(
+        "call-1",
         {"prompt": "two", "description": "two", "run_in_background": True}
     )
 
@@ -671,9 +681,11 @@ async def test_smart_mode_partial_delivery_then_straggler(
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "slow", "description": "slow", "run_in_background": True}
     )
     await agent_tool.execute(
+        "call-1",
         {"prompt": "fast", "description": "fast", "run_in_background": True}
     )
 
@@ -771,8 +783,8 @@ async def test_resolve_skill_blocks(tmp_path: Path) -> None:
     _load_runtime(tmp_path)
     module = _extension_module()
     cwd = tmp_path / "proj"
-    (cwd / ".tau" / "skills").mkdir(parents=True)
-    (cwd / ".tau" / "skills" / "foo.md").write_text(
+    (cwd / ".tau" / "skills" / "foo").mkdir(parents=True)
+    (cwd / ".tau" / "skills" / "foo" / "SKILL.md").write_text(
         "---\ndescription: Foo skill\n---\nAlways foo."
     )
     home = tmp_path / "empty-home"
@@ -789,8 +801,8 @@ async def test_spawn_injects_skills_and_append_prompt(tmp_path: Path) -> None:
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     module = _extension_module()
-    (tmp_path / ".tau" / "skills").mkdir(parents=True)
-    (tmp_path / ".tau" / "skills" / "myskill.md").write_text("Skill body here.")
+    (tmp_path / ".tau" / "skills" / "myskill").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "myskill" / "SKILL.md").write_text("Skill body here.")
     (tmp_path / ".tau" / "agents").mkdir(parents=True)
     (tmp_path / ".tau" / "agents" / "skilled.md").write_text(
         "---\n"
@@ -805,10 +817,9 @@ async def test_spawn_injects_skills_and_append_prompt(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "go", "description": "go", "subagent_type": "skilled"}
     )
-
-    assert result.ok is True
     system = provider.calls[0][1]
     assert system.startswith("You are Tau.\n\n<sub_agent_context>")
     assert "<agent_instructions>\nUse the skill.\n</agent_instructions>" in system
@@ -867,12 +878,11 @@ async def test_worktree_spawn_fails_in_non_git_cwd(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "isolation": "worktree"}
     )
-
-    assert result.ok is False
-    assert 'Cannot run with isolation: "worktree"' in result.content
-    assert "Initialize git and commit at least once, or omit isolation." in result.content
+    assert 'Cannot run with isolation: "worktree"' in result.text
+    assert "Initialize git and commit at least once, or omit isolation." in result.text
 
 
 async def test_worktree_isolation_runs_child_in_worktree(tmp_path: Path) -> None:
@@ -884,14 +894,16 @@ async def test_worktree_isolation_runs_child_in_worktree(tmp_path: Path) -> None
     provider = FakeProvider(
         [
             [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
+                AssistantStartEvent(partial=AssistantMessage(model="fake")),
+                AssistantDoneEvent(
+                    reason="toolUse",
                     message=AssistantMessage(
-                        content="checking",
-                        tool_calls=[
-                            ToolCall(id="c1", name="bash", arguments={"command": "pwd"})
+                        content=[
+                            TextContent(text="checking"),
+                            ToolCall(id="c1", name="bash", arguments={"command": "pwd"}),
                         ],
-                    )
+                        stop_reason="toolUse",
+                    ),
                 ),
             ],
             _text_stream("done"),
@@ -901,10 +913,9 @@ async def test_worktree_isolation_runs_child_in_worktree(tmp_path: Path) -> None
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "where am I", "description": "where", "isolation": "worktree"}
     )
-
-    assert result.ok is True
     assert "tau-agent-agent-1" in str(provider.calls[1][2])  # pwd ran in the worktree
     assert "tau-agent" not in _git_stdout(["worktree", "list"], repo)
     assert _git_stdout(["branch", "--list", "tau-agent-agent-1"], repo).strip() == ""
@@ -921,6 +932,7 @@ async def test_background_worktree_failure_delivers_error_notification(
 
     agent_tool = _agent_tool(runtime)
     spawn_result = await agent_tool.execute(
+        "call-1",
         {
             "prompt": "x",
             "description": "x",
@@ -928,8 +940,7 @@ async def test_background_worktree_failure_delivers_error_notification(
             "run_in_background": True,
         }
     )
-    assert spawn_result.ok is True
-    assert "Agent started in background." in spawn_result.content
+    assert "Agent started in background." in spawn_result.text
 
     await _wait_for(lambda: session.followed_up)
     note = session.followed_up[0]
@@ -947,15 +958,14 @@ async def test_resume_blocked_for_worktree_agents(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     first = await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "isolation": "worktree"}
     )
-    assert first.ok is True
 
-    resumed = await agent_tool.execute({"resume": "agent-1", "prompt": "more"})
-    assert resumed.ok is False
+    resumed = await agent_tool.execute("call-1", {"resume": "agent-1", "prompt": "more"})
     assert (
         'Agent "agent-1" ran in an isolated worktree that has been cleaned up;'
-        " resume is not supported for worktree agents." in resumed.content
+        " resume is not supported for worktree agents." in resumed.text
     )
 
 
@@ -968,23 +978,30 @@ async def test_worktree_error_run_surfaces_branch_annotation(tmp_path: Path) -> 
     provider = FakeProvider(
         [
             [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
+                AssistantStartEvent(partial=AssistantMessage(model="fake")),
+                AssistantDoneEvent(
+                    reason="toolUse",
                     message=AssistantMessage(
-                        content="working",
-                        tool_calls=[
+                        content=[
+                            TextContent(text="working"),
                             ToolCall(
                                 id="c1",
                                 name="bash",
                                 arguments={"command": "echo dirty > newfile.txt"},
-                            )
+                            ),
                         ],
-                    )
+                        stop_reason="toolUse",
+                    ),
                 ),
             ],
             [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderErrorEvent(message="boom"),
+                AssistantStartEvent(partial=AssistantMessage(model="fake")),
+                AssistantErrorEvent(
+                    reason="error",
+                    error=AssistantMessage(
+                        model="fake", stop_reason="error", error_message="boom"
+                    ),
+                ),
             ],
         ]
     )
@@ -992,12 +1009,11 @@ async def test_worktree_error_run_surfaces_branch_annotation(tmp_path: Path) -> 
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "break", "description": "break", "isolation": "worktree"}
     )
-
-    assert result.ok is False
-    assert "boom" in result.content
-    assert "Changes saved to branch `tau-agent-agent-1`" in result.content
+    assert "boom" in result.text
+    assert "Changes saved to branch `tau-agent-agent-1`" in result.text
     assert "tau-agent-agent-1" in _git_stdout(
         ["branch", "--list", "tau-agent-agent-1"], repo
     )
@@ -1005,8 +1021,57 @@ async def test_worktree_error_run_surfaces_branch_annotation(tmp_path: Path) -> 
     get_result = next(
         tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
     )
-    fetched = await get_result.execute({"agent_id": "agent-1"})
-    assert "Changes saved to branch `tau-agent-agent-1`" in fetched.content
+    fetched = await get_result.execute("call-1", {"agent_id": "agent-1"})
+    assert "Changes saved to branch `tau-agent-agent-1`" in fetched.text
+
+
+async def test_recovered_error_does_not_mark_run_failed() -> None:
+    # There is no error event in the pi protocol: errors are assistant
+    # messages with stop_reason "error", and tau can recover from a mid-run
+    # overflow error via compaction + auto-retry INSIDE one prompt() stream.
+    # The verdict must therefore be taken only at stream end: a later
+    # successful assistant message clears the pending error.
+    from tau_agent.events import MessageEndEvent
+
+    from tau_subagents.extension import AgentRun, SubagentManager
+
+    manager = SubagentManager(api=SimpleNamespace())
+    run = AgentRun(
+        agent_id="agent-1",
+        agent_type="general",
+        description="d",
+        prompt="p",
+        background=False,
+    )
+    final_text: list[str] = []
+
+    error_message = AssistantMessage(
+        model="fake", stop_reason="error", error_message="context overflow"
+    )
+    manager._observe(run, MessageEndEvent(message=error_message), final_text)
+    assert run.pending_error == "context overflow"
+
+    recovered = AssistantMessage(content="recovered fine")
+    manager._observe(run, MessageEndEvent(message=recovered), final_text)
+    assert run.pending_error is None
+
+    manager._finalize_status(run)
+    assert run.status == "completed"
+    assert run.error is None
+    assert final_text == ["recovered fine"]
+
+    # Without the recovery, the pending error becomes the terminal status.
+    failed = AgentRun(
+        agent_id="agent-2",
+        agent_type="general",
+        description="d",
+        prompt="p",
+        background=False,
+    )
+    manager._observe(failed, MessageEndEvent(message=error_message), [])
+    manager._finalize_status(failed)
+    assert failed.status == "error"
+    assert failed.error == "context overflow"
 
 
 async def test_output_file_streams_transcript(tmp_path: Path) -> None:
@@ -1018,10 +1083,11 @@ async def test_output_file_streams_transcript(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     spawn_result = await agent_tool.execute(
+        "call-1",
         {"prompt": "Long task", "description": "long", "run_in_background": True}
     )
     output_line = next(
-        line for line in spawn_result.content.splitlines()
+        line for line in spawn_result.text.splitlines()
         if line.startswith("Output file: ")
     )
     output_path = Path(output_line.removeprefix("Output file: "))
@@ -1050,8 +1116,8 @@ async def test_output_file_streams_transcript(tmp_path: Path) -> None:
     get_result = next(
         tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
     )
-    fetched = await get_result.execute({"agent_id": "agent-1"})
-    assert f"Output file: {output_path}" in fetched.content
+    fetched = await get_result.execute("call-1", {"agent_id": "agent-1"})
+    assert f"Output file: {output_path}" in fetched.text
 
 
 async def test_memory_dir_layout_and_validation(tmp_path: Path) -> None:
@@ -1117,6 +1183,7 @@ async def test_memory_injection_rw_and_ro(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "go", "description": "go", "subagent_type": "memo"}
     )
     rw_system = rw_provider.calls[0][1]
@@ -1125,6 +1192,7 @@ async def test_memory_injection_rw_and_ro(tmp_path: Path) -> None:
     assert (tmp_path / ".tau" / "agent-memory" / "memo").is_dir()
 
     await agent_tool.execute(
+        "call-1",
         {"prompt": "go", "description": "go", "subagent_type": "memoro"}
     )
     ro_system = ro_provider.calls[0][1]
@@ -1183,7 +1251,7 @@ async def test_run_records_persisted(tmp_path: Path) -> None:
     )
 
     agent_tool = _agent_tool(runtime)
-    await agent_tool.execute({"prompt": "fg", "description": "fg task"})
+    await agent_tool.execute("call-1", {"prompt": "fg", "description": "fg task"})
     records = [
         data for namespace, data in session.custom_entries
         if namespace == "subagents:record"
@@ -1195,6 +1263,7 @@ async def test_run_records_persisted(tmp_path: Path) -> None:
     assert records[0]["turns"] == 1
 
     await agent_tool.execute(
+        "call-1",
         {"prompt": "bg", "description": "bg task", "run_in_background": True}
     )
     await _wait_for(
@@ -1219,16 +1288,18 @@ async def test_model_and_thinking_param_precedence(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "model": "haiku", "thinking": "high"}
     )
     assert models[-1] == "haiku"  # param used when frontmatter has none
     assert thinking_levels[-1] == "high"
 
-    await agent_tool.execute({"prompt": "x", "description": "x"})
+    await agent_tool.execute("call-1", {"prompt": "x", "description": "x"})
     assert models[-1] is None  # parent default
     assert thinking_levels[-1] == "medium"  # DEFAULT_THINKING_LEVEL
 
     await agent_tool.execute(
+        "call-1",
         {
             "prompt": "x",
             "description": "x",
@@ -1247,18 +1318,18 @@ async def test_invalid_thinking_rejected(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "thinking": "ultra"}
     )
-
-    assert result.ok is False
-    assert "Invalid thinking level: ultra." in result.content
-    assert "Valid options: off, minimal, low, medium, high, xhigh" in result.content
+    assert "Invalid thinking level: ultra." in result.text
+    assert "Valid options: off, minimal, low, medium, high, xhigh" in result.text
 
     get_result = next(
         tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
     )
-    unknown = await get_result.execute({"agent_id": "agent-1"})
-    assert unknown.ok is False  # nothing was spawned
+    unknown = await get_result.execute("call-1", {"agent_id": "agent-1"})
+    # The rejected spawn must not have created a run.
+    assert "Unknown agent_id: agent-1" in unknown.text
 
 
 async def test_skills_true_pins_discovery_to_parent_cwd_under_worktree(
@@ -1271,8 +1342,8 @@ async def test_skills_true_pins_discovery_to_parent_cwd_under_worktree(
     module = _extension_module()
     # Created AFTER the commit: the parent cwd has this skill, but a detached
     # worktree checkout of HEAD does not.
-    (repo / ".tau" / "skills").mkdir(parents=True)
-    (repo / ".tau" / "skills" / "parentskill.md").write_text(
+    (repo / ".tau" / "skills" / "parentskill").mkdir(parents=True)
+    (repo / ".tau" / "skills" / "parentskill" / "SKILL.md").write_text(
         "---\ndescription: Parent-only skill\n---\nDo parent things."
     )
     (repo / ".tau" / "agents").mkdir(exist_ok=True)
@@ -1288,14 +1359,13 @@ async def test_skills_true_pins_discovery_to_parent_cwd_under_worktree(
 
     agent_tool = _agent_tool(runtime)
     pinned = await agent_tool.execute(
+        "call-1",
         {"prompt": "go", "description": "go", "subagent_type": "pinned"}
     )
     unpinned = await agent_tool.execute(
+        "call-1",
         {"prompt": "go", "description": "go", "subagent_type": "unpinned"}
     )
-
-    assert pinned.ok is True
-    assert unpinned.ok is True
     pinned_system = pinned_provider.calls[0][1]
     unpinned_system = unpinned_provider.calls[0][1]
     # skills: true resolves resources against the parent cwd, so the child
@@ -1310,8 +1380,8 @@ async def test_skills_none_disables_native_discovery(tmp_path: Path) -> None:
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     module = _extension_module()
-    (tmp_path / ".tau" / "skills").mkdir(parents=True)
-    (tmp_path / ".tau" / "skills" / "idxskill.md").write_text(
+    (tmp_path / ".tau" / "skills" / "idxskill").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "idxskill" / "SKILL.md").write_text(
         "---\ndescription: Indexed skill\n---\nDo indexed things."
     )
     (tmp_path / ".tau" / "agents").mkdir(exist_ok=True)
@@ -1323,13 +1393,11 @@ async def test_skills_none_disables_native_discovery(tmp_path: Path) -> None:
     _patch_provider_sequence(module, [control_provider, noskills_provider])
 
     agent_tool = _agent_tool(runtime)
-    control = await agent_tool.execute({"prompt": "x", "description": "x"})
+    control = await agent_tool.execute("call-1", {"prompt": "x", "description": "x"})
     noskills = await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "subagent_type": "noskills"}
     )
-
-    assert control.ok is True
-    assert noskills.ok is True
     control_system = control_provider.calls[0][1]
     assert "<name>idxskill</name>" in control_system  # omitted => native discovery
     noskills_system = noskills_provider.calls[0][1]
@@ -1341,8 +1409,8 @@ async def test_named_skills_preload_disables_native_index(tmp_path: Path) -> Non
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     module = _extension_module()
-    (tmp_path / ".tau" / "skills").mkdir(parents=True)
-    (tmp_path / ".tau" / "skills" / "idxskill.md").write_text(
+    (tmp_path / ".tau" / "skills" / "idxskill").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "idxskill" / "SKILL.md").write_text(
         "---\ndescription: Indexed skill\n---\nDo indexed things."
     )
     (tmp_path / ".tau" / "agents").mkdir(exist_ok=True)
@@ -1354,10 +1422,9 @@ async def test_named_skills_preload_disables_native_index(tmp_path: Path) -> Non
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "subagent_type": "preloader"}
     )
-
-    assert result.ok is True
     system = provider.calls[0][1]
     assert "# Preloaded Skill: idxskill" in system
     assert "<available_skills>" not in system  # pi: named preload sets noSkills
@@ -1369,8 +1436,8 @@ async def test_skills_none_falls_back_without_seam(
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     module = _extension_module()
-    (tmp_path / ".tau" / "skills").mkdir(parents=True)
-    (tmp_path / ".tau" / "skills" / "idxskill.md").write_text(
+    (tmp_path / ".tau" / "skills" / "idxskill").mkdir(parents=True)
+    (tmp_path / ".tau" / "skills" / "idxskill" / "SKILL.md").write_text(
         "---\ndescription: Indexed skill\n---\nDo indexed things."
     )
     (tmp_path / ".tau" / "agents").mkdir(exist_ok=True)
@@ -1383,12 +1450,12 @@ async def test_skills_none_falls_back_without_seam(
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "subagent_type": "noskills"}
     )
 
     # Against an older Tau without the seam, the spawn still works and
     # native discovery stays on.
-    assert result.ok is True
     assert "<name>idxskill</name>" in provider.calls[0][1]
 
 
@@ -1406,19 +1473,20 @@ async def test_usage_surfaced_in_results_and_notifications(tmp_path: Path) -> No
     )
 
     agent_tool = _agent_tool(runtime)
-    result = await agent_tool.execute({"prompt": "fg", "description": "fg"})
-    assert "Agent completed in " in result.content
-    assert "(0 tool uses, ~" in result.content
-    assert "context tokens)." in result.content
+    result = await agent_tool.execute("call-1", {"prompt": "fg", "description": "fg"})
+    assert "Agent completed in " in result.text
+    assert "(0 tool uses, ~" in result.text
+    assert "context tokens)." in result.text
 
     get_result = next(
         tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
     )
-    fetched = await get_result.execute({"agent_id": "agent-1"})
-    assert "Usage: 0 tool uses · ~" in fetched.content
-    assert "context tokens" in fetched.content
+    fetched = await get_result.execute("call-1", {"agent_id": "agent-1"})
+    assert "Usage: 0 tool uses · ~" in fetched.text
+    assert "context tokens" in fetched.text
 
     await agent_tool.execute(
+        "call-1",
         {"prompt": "bg", "description": "bg", "run_in_background": True}
     )
     await _wait_for(lambda: session.followed_up)
@@ -1431,8 +1499,9 @@ def _usage_stream(
     text: str, input_tokens: int, output: int, cache_write: int
 ) -> list[object]:
     return [
-        ProviderResponseStartEvent(model="fake"),
-        ProviderResponseEndEvent(
+        AssistantStartEvent(partial=AssistantMessage(model="fake")),
+        AssistantDoneEvent(
+            reason="stop",
             message=AssistantMessage(
                 content=text,
                 usage=Usage(
@@ -1448,8 +1517,6 @@ def _usage_stream(
 
 
 async def test_real_usage_accumulates_and_surfaces(tmp_path: Path) -> None:
-    if Usage is None:
-        pytest.skip("tau branch lacks the provider-usage seam")
     runtime = _load_runtime(tmp_path)
     session = RecordingSession(tmp_path)
     runtime.bind(session)
@@ -1468,21 +1535,22 @@ async def test_real_usage_accumulates_and_surfaces(tmp_path: Path) -> None:
     )
 
     agent_tool = _agent_tool(runtime)
-    result = await agent_tool.execute({"prompt": "fg", "description": "fg"})
-    assert "(0 tool uses, 127 tokens)." in result.content
+    result = await agent_tool.execute("call-1", {"prompt": "fg", "description": "fg"})
+    assert "(0 tool uses, 127 tokens)." in result.text
 
     get_result = next(
         tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
     )
-    fetched = await get_result.execute({"agent_id": "agent-1"})
-    assert "Usage: 127 tokens · 0 tool uses" in fetched.content
+    fetched = await get_result.execute("call-1", {"agent_id": "agent-1"})
+    assert "Usage: 127 tokens · 0 tool uses" in fetched.text
 
     # Resume keeps accumulating into the lifetime total (127 + 43 = 170),
     # matching pi, which preserves lifetimeUsage across resume.
-    resumed = await agent_tool.execute({"resume": "agent-1", "prompt": "more"})
-    assert "(0 tool uses, 170 tokens)." in resumed.content
+    resumed = await agent_tool.execute("call-1", {"resume": "agent-1", "prompt": "more"})
+    assert "(0 tool uses, 170 tokens)." in resumed.text
 
     await agent_tool.execute(
+        "call-1",
         {"prompt": "bg", "description": "bg", "run_in_background": True}
     )
     await _wait_for(lambda: session.followed_up)
@@ -1507,11 +1575,10 @@ async def test_foreground_run_emits_live_stats_ticker(tmp_path: Path) -> None:
     updates: list[str] = []
 
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "go", "description": "d"},
-        on_update=lambda message, data=None: updates.append(message),
+        on_update=lambda partial: updates.append(partial.text),
     )
-
-    assert result.ok is True
     assert updates, "foreground run should stream the live stats ticker"
     assert "1 tool use" in updates
     assert updates[-1] == "2 turns · 1 tool use"
@@ -1521,12 +1588,6 @@ async def test_foreground_run_emits_live_stats_ticker(tmp_path: Path) -> None:
 
 
 async def test_inherit_context_prepends_parent_conversation(tmp_path: Path) -> None:
-    try:
-        from tau_coding.extensions.api import ExtensionContext
-    except ImportError:
-        pytest.skip("tau branch lacks the parent-context seam")
-    if not hasattr(ExtensionContext, "transcript"):
-        pytest.skip("tau branch lacks the parent-context seam")
     runtime = _load_runtime(tmp_path)
     session = RecordingSession(tmp_path)
     session.messages = [
@@ -1540,16 +1601,15 @@ async def test_inherit_context_prepends_parent_conversation(tmp_path: Path) -> N
 
     agent_tool = _agent_tool(runtime)
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "child task", "description": "d", "inherit_context": True}
     )
-
-    assert result.ok is True
     child_messages = provider.calls[0][2]
     first = child_messages[0]
-    assert first.content.startswith("# Parent Conversation Context")
-    assert "[User]: parent question" in first.content
-    assert "[Assistant]: parent answer" in first.content
-    assert "# Your Task (below)\nchild task" in first.content
+    assert first.text.startswith("# Parent Conversation Context")
+    assert "[User]: parent question" in first.text
+    assert "[Assistant]: parent answer" in first.text
+    assert "# Your Task (below)\nchild task" in first.text
 
 
 def test_notification_renderer_formats_details(tmp_path: Path) -> None:
@@ -1727,8 +1787,9 @@ async def test_hard_cancel_cascades_to_the_child(tmp_path: Path) -> None:
     updates: list[str] = []
     task = asyncio.create_task(
         agent_tool.execute(
+            "call-1",
             {"prompt": "go", "description": "d"},
-            on_update=lambda message, data=None: updates.append(message),
+            on_update=lambda partial: updates.append(partial.text),
         )
     )
     await asyncio.sleep(0.1)  # let the executor enter its wait loop
@@ -1741,8 +1802,8 @@ async def test_hard_cancel_cascades_to_the_child(tmp_path: Path) -> None:
     get_result = next(
         tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
     )
-    probed = await get_result.execute({"agent_id": "agent-1"})
-    assert "[cancelled]" in probed.content
+    probed = await get_result.execute("call-1", {"agent_id": "agent-1"})
+    assert "[cancelled]" in probed.text
 
     updates.clear()
     release.set()
@@ -1750,8 +1811,8 @@ async def test_hard_cancel_cascades_to_the_child(tmp_path: Path) -> None:
     for _ in range(20):
         await asyncio.sleep(0.01)
     assert updates == []
-    probed_again = await get_result.execute({"agent_id": "agent-1"})
-    assert "[cancelled]" in probed_again.content
+    probed_again = await get_result.execute("call-1", {"agent_id": "agent-1"})
+    assert "[cancelled]" in probed_again.text
 
 
 async def test_foreground_cancel_returns_cancelled_card_details(tmp_path: Path) -> None:
@@ -1764,19 +1825,13 @@ async def test_foreground_cancel_returns_cancelled_card_details(tmp_path: Path) 
 
     agent_tool = _agent_tool(runtime)
     signal = SimpleNamespace(is_cancelled=lambda: True)
-    result = await agent_tool.execute({"prompt": "go", "description": "d"}, signal=signal)
-
-    assert result.ok is False
-    assert "Subagent cancelled" in result.content
+    result = await agent_tool.execute("call-1", {"prompt": "go", "description": "d"}, signal=signal)
+    assert "Subagent cancelled" in result.text
     assert result.details is not None
     assert result.details["status"] == "cancelled"
 
 
 async def test_notification_delivered_as_custom_message(tmp_path: Path) -> None:
-    try:
-        from tau_coding.extensions import CustomMessageView  # noqa: F401
-    except ImportError:
-        pytest.skip("tau branch lacks the message-renderers seam")
     runtime = _load_runtime(tmp_path)
     session = RecordingSession(tmp_path)
     runtime.bind(session)
@@ -1784,6 +1839,7 @@ async def test_notification_delivered_as_custom_message(tmp_path: Path) -> None:
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "bg", "description": "bg task", "run_in_background": True}
     )
     await _wait_for(lambda: session.followed_up)
@@ -2005,15 +2061,13 @@ async def test_inherit_context_skips_empty_parent(tmp_path: Path) -> None:
     _patch_provider_factory(module, provider)
 
     agent_tool = _agent_tool(runtime)
-    result = await agent_tool.execute(
+    await agent_tool.execute(
+        "call-1",
         {"prompt": "child task", "description": "d", "inherit_context": True}
     )
 
-    if not result.ok:
-        assert "parent-context seam" in result.content
-        pytest.skip("tau branch lacks the parent-context seam")
     first = provider.calls[0][2][0]
-    assert first.content == "child task"
+    assert first.text == "child task"
 
 
 async def test_consuming_within_nudge_window_suppresses_notification(
@@ -2031,6 +2085,7 @@ async def test_consuming_within_nudge_window_suppresses_notification(
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "run_in_background": True}
     )
     get_result = next(
@@ -2038,11 +2093,11 @@ async def test_consuming_within_nudge_window_suppresses_notification(
     )
     fetched = None
     for _ in range(500):
-        fetched = await get_result.execute({"agent_id": "agent-1"})
-        if "[completed]" in fetched.content:
+        fetched = await get_result.execute("call-1", {"agent_id": "agent-1"})
+        if "[completed]" in fetched.text:
             break
         await asyncio.sleep(0.01)
-    assert fetched is not None and "[completed]" in fetched.content
+    assert fetched is not None and "[completed]" in fetched.text
 
     # The read consumed the result inside the hold window; no nudge arrives.
     await asyncio.sleep(0.5)
@@ -2064,6 +2119,7 @@ async def test_nudge_arrives_when_unconsumed(
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "run_in_background": True}
     )
 
@@ -2086,6 +2142,7 @@ async def test_shutdown_cancels_pending_nudges(
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "run_in_background": True}
     )
     # The record is persisted just before the nudge is scheduled.
@@ -2122,12 +2179,11 @@ async def test_foreground_run_returns_result(tmp_path: Path) -> None:
 
     agent_tool = next(tool for tool in runtime.extension_tools if tool.name == "agent")
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "Investigate the repo", "description": "investigate repo"}
     )
-
-    assert result.ok is True
-    assert "Subagent report: all good." in result.content
-    assert "agent-1 [completed]" in result.content
+    assert "Subagent report: all good." in result.text
+    assert "agent-1 [completed]" in result.text
     # The result carries the completion-card details for the tool's
     # render_result hook (the foreground twin of the background notification).
     assert agent_tool.render_result is not None
@@ -2144,14 +2200,14 @@ async def test_background_run_delivers_notification(tmp_path: Path) -> None:
 
     agent_tool = next(tool for tool in runtime.extension_tools if tool.name == "agent")
     spawn_result = await agent_tool.execute(
+        "call-1",
         {
             "prompt": "Long task",
             "description": "long task",
             "run_in_background": True,
         }
     )
-    assert spawn_result.ok is True
-    assert "agent-1" in spawn_result.content
+    assert "agent-1" in spawn_result.text
     assert spawn_result.details is not None
     assert spawn_result.details["status"] == "background"
     assert spawn_result.details["agent_id"] == "agent-1"
@@ -2174,8 +2230,7 @@ async def test_unknown_agent_type_is_reported(tmp_path: Path) -> None:
 
     agent_tool = next(tool for tool in runtime.extension_tools if tool.name == "agent")
     result = await agent_tool.execute(
+        "call-1",
         {"prompt": "x", "description": "x", "subagent_type": "nope"}
     )
-
-    assert result.ok is False
-    assert "Unknown subagent_type" in result.content
+    assert "Unknown subagent_type" in result.text

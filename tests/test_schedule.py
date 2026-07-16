@@ -367,16 +367,17 @@ async def test_schedule_resume_guard(tmp_path) -> None:  # noqa: ANN001
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     result = await _agent_tool(runtime).execute(
+        "call-1",
         {"prompt": "p", "description": "d", "schedule": "5m", "resume": "agent-1"}
     )
-    assert result.ok is False
-    assert "Cannot combine `schedule` with `resume`" in result.content
+    assert "Cannot combine `schedule` with `resume`" in result.text
 
 
 async def test_schedule_inherit_context_guard(tmp_path) -> None:  # noqa: ANN001
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     result = await _agent_tool(runtime).execute(
+        "call-1",
         {
             "prompt": "p",
             "description": "d",
@@ -384,14 +385,14 @@ async def test_schedule_inherit_context_guard(tmp_path) -> None:  # noqa: ANN001
             "inherit_context": True,
         }
     )
-    assert result.ok is False
-    assert "Cannot combine `schedule` with `inherit_context`" in result.content
+    assert "Cannot combine `schedule` with `inherit_context`" in result.text
 
 
 async def test_schedule_foreground_guard(tmp_path) -> None:  # noqa: ANN001
     runtime = _load_runtime(tmp_path)
     runtime.bind(RecordingSession(tmp_path))
     result = await _agent_tool(runtime).execute(
+        "call-1",
         {
             "prompt": "p",
             "description": "d",
@@ -399,8 +400,7 @@ async def test_schedule_foreground_guard(tmp_path) -> None:  # noqa: ANN001
             "run_in_background": False,
         }
     )
-    assert result.ok is False
-    assert "run_in_background: false" in result.content
+    assert "run_in_background: false" in result.text
 
 
 async def test_schedule_via_tool_creates_and_persists_job(tmp_path) -> None:  # noqa: ANN001
@@ -410,11 +410,11 @@ async def test_schedule_via_tool_creates_and_persists_job(tmp_path) -> None:  # 
     await runtime.emit_session_start("startup")
 
     result = await _agent_tool(runtime).execute(
+        "call-1",
         {"prompt": "check the deploy", "description": "deploy watch", "schedule": "5m"}
     )
-    assert result.ok is True
-    assert "Scheduled" in result.content
-    assert "job-1" in result.content
+    assert "Scheduled" in result.text
+    assert "job-1" in result.text
 
     store_module = _store_module()
     path = store_module.resolve_store_path(tmp_path, "session-1")

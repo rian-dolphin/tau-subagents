@@ -90,10 +90,12 @@ STRAGGLER_TIMEOUT_SECONDS = STRAGGLER_TIMEOUT
 STALE_AFTER_SECONDS = 600.0
 TERMINAL_STATUSES = ("completed", "steered", "aborted", "error", "cancelled")
 # Event types that change what a viewer would show (session.messages / status).
-# Streaming deltas are skipped: they never touch session.messages, so pushing on
-# them would redraw identical content on every token.
+# Streaming (message_update) is skipped: it never touches session.messages, so
+# pushing on it would redraw identical content on every token. Errors need no
+# entry of their own: they arrive as assistant messages with stop_reason
+# "error"/"aborted", i.e. through message_end.
 RUN_PUSH_EVENTS = frozenset(
-    {"message_end", "tool_execution_start", "tool_execution_end", "turn_end", "error"}
+    {"message_end", "tool_execution_start", "tool_execution_end", "turn_end"}
 )
 SOFT_LIMIT_MESSAGE = (
     "You have reached your turn limit. Wrap up immediately — provide your"
@@ -147,7 +149,12 @@ class AgentRun:
     tokens_input: int = 0
     tokens_output: int = 0
     tokens_cache_write: int = 0
-    has_usage: bool = False
+    # Terminal error carried by the last assistant message seen so far. Only a
+    # tentative signal while the run is live: tau (like pi) can recover from a
+    # mid-run overflow error via compaction + auto-retry, so a later successful
+    # assistant message clears it and the final verdict is taken once the event
+    # stream is exhausted (never mid-stream).
+    pending_error: str | None = None
     # Resolved model id actually running this agent (None while queued).
     # requested_model below is only the tool-param request, which frontmatter
     # may override — the viewer header shows this resolved value.
@@ -160,10 +167,11 @@ class AgentRun:
     soft_limit_reached: bool = False
     aborted: bool = False
     pending_steers: list[str] = field(default_factory=list)
-    # Live stats ticker (foreground runs only): tau's tool-progress seam, set
-    # for the duration of the blocking tool call. `last_progress` dedups so
+    # Live stats ticker (foreground runs only): the executor's on_update
+    # callback, set for the duration of the blocking tool call. Takes a partial
+    # AgentToolResult (pi's AgentToolUpdateCallback). `last_progress` dedups so
     # the line only repaints when a stat actually changed.
-    on_update: Callable[[str, dict[str, object] | None], None] | None = None
+    on_update: Callable[[AgentToolResult], None] | None = None
     last_progress: str = ""
     join_mode: str | None = None
     requested_isolation: str | None = None
@@ -177,6 +185,17 @@ class AgentRun:
     # call widget methods from here because runs are asyncio tasks on the TUI
     # event loop (see the design's push-refresh invariant).
     listeners: list[Callable[[], None]] = field(default_factory=list)
+
+    @property
+    def has_usage(self) -> bool:
+        """Whether the provider reported any billed usage (pi gates on total > 0).
+
+        Usage is always present on new-protocol assistant messages (zeros when
+        the provider reports nothing), so presence can't be the signal anymore;
+        a nonzero lifetime total is. Zero-usage runs fall back to the chars/4
+        context estimate everywhere this gate is checked.
+        """
+        return lifetime_tokens(self) > 0
 
 
 class SubagentManager:
@@ -342,6 +361,7 @@ class SubagentManager:
         assert session is not None
         run.status = "running"
         run.error = None
+        run.pending_error = None
         run.result_text = ""
         run.aborted = False
         run.soft_limit_reached = False
@@ -355,8 +375,7 @@ class SubagentManager:
                 self._observe(run, event, final_text)
             run.result_text = final_text[-1] if final_text else ""
             run.context_tokens = session.context_token_estimate
-            if run.status == "running":
-                run.status = "completed"
+            self._finalize_status(run)
         except asyncio.CancelledError:
             # The resume runs inline in the tool coroutine, so a parent Esc
             # (hard-cancel) lands here; settle the record before re-raising.
@@ -630,8 +649,20 @@ class SubagentManager:
                     await run.output_writer.flush(session.messages)
         run.result_text = final_text[-1] if final_text else ""
         run.context_tokens = session.context_token_estimate
+        self._finalize_status(run)
+
+    def _finalize_status(self, run: AgentRun) -> None:
+        """Decide a run's terminal status once its event stream is exhausted.
+
+        Never decided mid-stream (pi semantics): a message_end with
+        stop_reason "error" may be recovered by overflow compaction +
+        auto-retry, so only the error still pending at stream end counts.
+        """
         if run.aborted:
             run.status = "aborted"
+        elif run.pending_error is not None:
+            run.status = "error"
+            run.error = run.pending_error
         elif run.status == "running":
             run.status = "steered" if run.soft_limit_reached else "completed"
 
@@ -658,21 +689,27 @@ class SubagentManager:
         elif event.type == "message_end":
             message = event.message
             if getattr(message, "role", None) == "assistant":
-                # Real billed usage (Tau provider-usage seam). Lifetime sum of
-                # input + output + cache_write per response; cache reads are
-                # excluded because each turn re-reads the whole cached prefix,
-                # so summing them counts the prefix N times (pi issue #38).
-                usage = getattr(message, "usage", None)
-                if usage is not None:
-                    run.tokens_input += getattr(usage, "input", 0) or 0
-                    run.tokens_output += getattr(usage, "output", 0) or 0
-                    run.tokens_cache_write += getattr(usage, "cache_write", 0) or 0
-                    run.has_usage = True
-                if message.content.strip():
-                    final_text.append(message.content.strip())
-        elif event.type == "error" and not event.recoverable:
-            run.status = "error"
-            run.error = event.message
+                # Real billed usage. Lifetime sum of input + output +
+                # cache_write per response; cache reads are excluded because
+                # each turn re-reads the whole cached prefix, so summing them
+                # counts the prefix N times (pi issue #38).
+                usage = message.usage
+                run.tokens_input += usage.input
+                run.tokens_output += usage.output
+                run.tokens_cache_write += usage.cache_write
+                # Terminal errors ride the assistant message now (pi protocol:
+                # there is no separate error event). Tentative until the stream
+                # ends: an overflow error can be compacted away and retried, in
+                # which case the next assistant message clears it.
+                if message.stop_reason == "error":
+                    run.pending_error = (
+                        message.error_message or "subagent provider error"
+                    )
+                else:
+                    run.pending_error = None
+                text = message.text.strip()
+                if text:
+                    final_text.append(text)
         self._emit_progress(run, event)
         if event.type in RUN_PUSH_EVENTS:
             self._notify_run(run)
@@ -701,7 +738,7 @@ class SubagentManager:
         if run.has_usage:
             data["total_tokens"] = lifetime_tokens(run)
         with contextlib.suppress(Exception):
-            run.on_update(message, data)
+            run.on_update(AgentToolResult(content=message, details=data))
 
     def _deliver_background_result(self, run: AgentRun) -> None:
         if run.result_consumed:
@@ -1045,13 +1082,14 @@ def setup(tau: ExtensionAPI) -> None:
     def _current_controller():  # noqa: ANN202 - SubagentUiController | None
         return ui_controller[0] if ui_controller else None
 
-    async def on_session_start(event: SessionStartEvent) -> None:
-        del event
+    async def on_session_start(event: SessionStartEvent, context) -> None:  # noqa: ANN001
+        del event, context
         if not scheduler.is_active():
             start_scheduler()
         _install_ui_components()
 
-    async def run_agent_tool(arguments, signal=None, *, on_update=None):  # noqa: ANN001, ANN202
+    async def run_agent_tool(tool_call_id, arguments, signal=None, on_update=None):  # noqa: ANN001, ANN202
+        del tool_call_id
         await manager.evict_stale()
         if arguments.get("schedule"):
             return await run_schedule(arguments)
@@ -1065,13 +1103,11 @@ def setup(tau: ExtensionAPI) -> None:
         if definition is None:
             available = ", ".join(sorted(definitions))
             return _tool_result(
-                "agent",
-                ok=False,
                 content=f"Unknown subagent_type: {agent_type}. Available: {available}",
             )
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
-            return _tool_result("agent", ok=False, content="prompt is required")
+            return _tool_result(content="prompt is required")
         description = str(arguments.get("description", "")) or f"{agent_type} agent"
         background = bool(arguments.get("run_in_background", False))
         max_turns = _coerce_max_turns(arguments.get("max_turns"))
@@ -1090,8 +1126,6 @@ def setup(tau: ExtensionAPI) -> None:
             )
             if transcript is None:
                 return _tool_result(
-                    "agent",
-                    ok=False,
                     content="inherit_context requires a Tau build with the"
                     " parent-context seam (the parent transcript is not"
                     " exposed to extensions here).",
@@ -1105,8 +1139,6 @@ def setup(tau: ExtensionAPI) -> None:
             thinking = str(thinking)
             if thinking not in THINKING_LEVELS:
                 return _tool_result(
-                    "agent",
-                    ok=False,
                     content=f"Invalid thinking level: {thinking}."
                     f" Valid options: {', '.join(THINKING_LEVELS)}",
                 )
@@ -1123,8 +1155,6 @@ def setup(tau: ExtensionAPI) -> None:
         )
         if background:
             return _tool_result(
-                "agent",
-                ok=True,
                 content=format_background_spawn(run, manager.max_concurrent),
                 # A "background" card: the row confirms the spawn in one dim
                 # line; completion arrives later as a notification card.
@@ -1169,8 +1199,6 @@ def setup(tau: ExtensionAPI) -> None:
                         # the real result, not a phantom cancellation.
                         return _foreground_result(run)
                     return _tool_result(
-                        "agent",
-                        ok=False,
                         content="Subagent cancelled",
                         # Cancelled runs stay in the card family (∅ cancelled).
                         details=build_notification_details(
@@ -1197,33 +1225,25 @@ def setup(tau: ExtensionAPI) -> None:
         run = manager.runs.get(agent_id)
         if run is None:
             return _tool_result(
-                "agent",
-                ok=False,
                 content=f'Agent not found: "{agent_id}". It may have been cleaned up.',
             )
         if run.task is not None and not run.task.done():
             return _tool_result(
-                "agent",
-                ok=False,
                 content=f'Agent "{agent_id}" is still running.'
                 " Use steer_subagent to redirect it.",
             )
         if run.used_worktree:
             return _tool_result(
-                "agent",
-                ok=False,
                 content=f'Agent "{agent_id}" ran in an isolated worktree that has'
                 " been cleaned up; resume is not supported for worktree agents.",
             )
         if run.session is None:
             return _tool_result(
-                "agent",
-                ok=False,
                 content=f'Agent "{agent_id}" has no active session to resume.',
             )
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
-            return _tool_result("agent", ok=False, content="prompt is required")
+            return _tool_result(content="prompt is required")
         run.on_update = on_update
         run.last_progress = ""
         try:
@@ -1238,29 +1258,21 @@ def setup(tau: ExtensionAPI) -> None:
         # foreground run.
         if arguments.get("resume"):
             return _tool_result(
-                "agent",
-                ok=False,
                 content="Cannot combine `schedule` with `resume` —"
                 " schedules create fresh agents.",
             )
         if arguments.get("inherit_context"):
             return _tool_result(
-                "agent",
-                ok=False,
                 content="Cannot combine `schedule` with `inherit_context` —"
                 " there is no parent conversation at fire time.",
             )
         if arguments.get("run_in_background") is False:
             return _tool_result(
-                "agent",
-                ok=False,
                 content="Cannot combine `schedule` with `run_in_background: false`"
                 " — scheduled jobs always run in background.",
             )
         if not scheduler.is_active():
             return _tool_result(
-                "agent",
-                ok=False,
                 content="Scheduler is not active in this session yet."
                 " Try again after the session has fully started.",
             )
@@ -1270,21 +1282,17 @@ def setup(tau: ExtensionAPI) -> None:
         if definition is None:
             available = ", ".join(sorted(definitions))
             return _tool_result(
-                "agent",
-                ok=False,
                 content=f"Unknown subagent_type: {agent_type}. Available: {available}",
             )
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
-            return _tool_result("agent", ok=False, content="prompt is required")
+            return _tool_result(content="prompt is required")
         description = str(arguments.get("description", "")) or f"{agent_type} agent"
         thinking = arguments.get("thinking")
         if thinking is not None:
             thinking = str(thinking)
             if thinking not in THINKING_LEVELS:
                 return _tool_result(
-                    "agent",
-                    ok=False,
                     content=f"Invalid thinking level: {thinking}."
                     f" Valid options: {', '.join(THINKING_LEVELS)}",
                 )
@@ -1302,11 +1310,9 @@ def setup(tau: ExtensionAPI) -> None:
                 isolation=isolation,
             )
         except (ValueError, RuntimeError) as exc:
-            return _tool_result("agent", ok=False, content=str(exc))
+            return _tool_result(content=str(exc))
         next_run = scheduler.get_next_run(job.id) or "(unknown)"
         return _tool_result(
-            "agent",
-            ok=True,
             content=(
                 f'Scheduled "{job.name}" (id: {job.id}, type: {job.schedule_type}).'
                 f" Next run: {next_run}."
@@ -1314,16 +1320,14 @@ def setup(tau: ExtensionAPI) -> None:
             ),
         )
 
-    async def run_get_result_tool(arguments, signal=None):  # noqa: ANN001, ANN202
-        del signal
+    async def run_get_result_tool(tool_call_id, arguments, signal=None, on_update=None):  # noqa: ANN001, ANN202
+        del tool_call_id, signal, on_update
         await manager.evict_stale()
         agent_id = str(arguments.get("agent_id", ""))
         run = manager.runs.get(agent_id)
         if run is None:
             known = ", ".join(sorted(manager.runs)) or "none"
             return _tool_result(
-                "get_subagent_result",
-                ok=False,
                 content=f"Unknown agent_id: {agent_id}. Known agents: {known}",
             )
         if bool(arguments.get("wait", False)) and run.status in ("running", "queued"):
@@ -1341,49 +1345,37 @@ def setup(tau: ExtensionAPI) -> None:
             header += f"\nOutput file: {run.output_file}"
         if run.status == "queued":
             return _tool_result(
-                "get_subagent_result",
-                ok=True,
                 content=f"{header}\n\n"
                 f"Still queued (max {manager.max_concurrent} concurrent).",
             )
         if run.status == "running":
             return _tool_result(
-                "get_subagent_result",
-                ok=True,
                 content=f"{header}\n\nStill running.",
             )
         run.result_consumed = True
         manager.cancel_nudge(agent_id)
         body = run.error if run.status == "error" else run.result_text
         return _tool_result(
-            "get_subagent_result",
-            ok=run.status in ("completed", "steered"),
             content=f"{header}\n\n{body or '(no output)'}",
         )
 
-    async def run_steer_tool(arguments, signal=None):  # noqa: ANN001, ANN202
-        del signal
+    async def run_steer_tool(tool_call_id, arguments, signal=None, on_update=None):  # noqa: ANN001, ANN202
+        del tool_call_id, signal, on_update
         agent_id = str(arguments.get("agent_id", ""))
         message = str(arguments.get("message", ""))
         run = manager.runs.get(agent_id)
         if run is None:
             return _tool_result(
-                "steer_subagent",
-                ok=False,
                 content=f'Agent not found: "{agent_id}". It may have been cleaned up.',
             )
         if run.status not in ("running", "queued"):
             return _tool_result(
-                "steer_subagent",
-                ok=False,
                 content=f'Agent "{agent_id}" is not running (status: {run.status}).'
                 " Cannot steer a non-running agent.",
             )
         if run.session is None:
             run.pending_steers.append(message)
             return _tool_result(
-                "steer_subagent",
-                ok=True,
                 content=f"Steering message queued for agent {agent_id}."
                 " It will be delivered once the session initializes.",
             )
@@ -1397,8 +1389,6 @@ def setup(tau: ExtensionAPI) -> None:
                 f"~{run.session.context_token_estimate} context tokens"
             )
         return _tool_result(
-            "steer_subagent",
-            ok=True,
             content=f"Steering message sent to agent {agent_id}."
             " The agent will process it after its current tool execution.\n"
             f"Current state: {' · '.join(state_parts)}",
@@ -1438,10 +1428,10 @@ def setup(tau: ExtensionAPI) -> None:
             lines.append("No agents have been spawned in this session.")
         return "\n".join(lines)
 
-    async def on_shutdown(event: SessionShutdownEvent) -> None:
+    async def on_shutdown(event: SessionShutdownEvent, context) -> None:  # noqa: ANN001
         # Tear down on every shutdown reason (new/resume/branch/quit): runs
         # belong to the outgoing transcript and would otherwise leak sessions.
-        del event
+        del event, context
         scheduler.stop()
         controller = _current_controller()
         if controller is not None:
@@ -1457,6 +1447,7 @@ def setup(tau: ExtensionAPI) -> None:
     tau.register_tool(
         AgentTool(
             name="agent",
+            label="Agent",
             description=(
                 "Spawn an autonomous subagent to handle a task. The subagent works"
                 " in its own context with its own tools and returns its final"
@@ -1467,7 +1458,7 @@ def setup(tau: ExtensionAPI) -> None:
                 " the agent needs the parent conversation history.\n\nAvailable"
                 f" agent types:\n{type_list}"
             ),
-            input_schema={
+            parameters={
                 "type": "object",
                 "properties": {
                     "prompt": {
@@ -1533,7 +1524,7 @@ def setup(tau: ExtensionAPI) -> None:
                 },
                 "required": ["prompt", "description"],
             },
-            executor=run_agent_tool,
+            execute_fn=run_agent_tool,
             prompt_snippet="Spawn an autonomous subagent for delegated tasks.",
             render_call=render_agent_call,
             render_result=render_agent_result,
@@ -1542,8 +1533,9 @@ def setup(tau: ExtensionAPI) -> None:
     tau.register_tool(
         AgentTool(
             name="get_subagent_result",
+            label="Get subagent result",
             description="Get the status or final result of a spawned subagent.",
-            input_schema={
+            parameters={
                 "type": "object",
                 "properties": {
                     "agent_id": {
@@ -1557,19 +1549,20 @@ def setup(tau: ExtensionAPI) -> None:
                 },
                 "required": ["agent_id"],
             },
-            executor=run_get_result_tool,
+            execute_fn=run_get_result_tool,
             render_call=render_get_result_call,
         )
     )
     tau.register_tool(
         AgentTool(
             name="steer_subagent",
+            label="Steer subagent",
             description=(
                 "Send a steering message to a running subagent. It will be"
                 " delivered after the agent's current tool execution and appear as"
                 " a user message in the agent's conversation."
             ),
-            input_schema={
+            parameters={
                 "type": "object",
                 "properties": {
                     "agent_id": {
@@ -1584,7 +1577,7 @@ def setup(tau: ExtensionAPI) -> None:
                 },
                 "required": ["agent_id", "message"],
             },
-            executor=run_steer_tool,
+            execute_fn=run_steer_tool,
             render_call=render_steer_call,
         )
     )
@@ -1614,14 +1607,10 @@ def _foreground_result(run: AgentRun) -> AgentToolResult:
             f" ({run.tool_calls} tool uses{tokens_note})."
         )
         return _tool_result(
-            "agent",
-            ok=True,
             content=f"{format_run_summary(run)}\n{completed_line}\n\n{content}",
             details=details,
         )
     return _tool_result(
-        "agent",
-        ok=False,
         content=f"{format_run_summary(run)}\n\n{run.error or 'subagent failed'}",
         details=details,
     )
@@ -1634,17 +1623,15 @@ def _coerce_max_turns(value) -> int | None:  # noqa: ANN001
 
 
 def _tool_result(
-    name: str,
     *,
-    ok: bool,
     content: str,
     details: dict | None = None,
 ) -> AgentToolResult:
-    return AgentToolResult(
-        tool_call_id="",
-        name=name,
-        ok=ok,
-        content=content,
-        details=details,
-        error=None if ok else content,
-    )
+    """Build a plain text tool result (pi-subagents' textResult).
+
+    Failures are returned as ordinary results whose text says what went wrong,
+    never raised: pi-subagents does the same on every path, and raising would
+    drop `details` (the completion card) — the loop's error handler rebuilds
+    results with empty details.
+    """
+    return AgentToolResult(content=content, details=details)

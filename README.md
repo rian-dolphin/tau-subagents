@@ -1,7 +1,15 @@
 # tau-subagents
 
-Claude Code-style autonomous subagents for [Tau](https://github.com/rian-dolphin/tau),
+Claude Code-style autonomous subagents for [Tau](https://github.com/huggingface/tau),
 ported from [pi-subagents](https://github.com/tintinweb/pi-subagents).
+
+> **Targets upstream tau-ai ≥ 0.2.0** (migrated 2026-07-16). Upstream tau
+> adopted pi's event and extension protocol wholesale (`feat: adopt
+> Pi-compatible event and extension protocol`, tau #375), and every capability
+> this extension once needed from the rian-dolphin/tau fork's seam branches
+> now exists upstream. Where the text below says a feature needs a particular
+> *seam* or fork branch, read that as historical: on tau-ai 0.2.0 they are all
+> present, and the extension's feature-detection simply always finds them.
 
 Gives the model an `agent` tool that delegates a task to a **subagent** — a
 second, scoped Tau coding session running in-process with its own system

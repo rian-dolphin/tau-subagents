@@ -517,10 +517,12 @@ def _tool_result_session() -> SimpleNamespace:
         messages=[
             UserMessage(content="list files"),
             AssistantMessage(
-                content="",
-                tool_calls=[ToolCall(id="call-1", name="bash", arguments={"command": "ls"})],
+                content=[ToolCall(id="call-1", name="bash", arguments={"command": "ls"})],
+                stop_reason="toolUse",
             ),
-            ToolResultMessage(tool_call_id="call-1", name="bash", content="secret-output-line"),
+            ToolResultMessage(
+                tool_call_id="call-1", tool_name="bash", content="secret-output-line"
+            ),
         ],
         queue_steering_message=lambda m: None,
     )

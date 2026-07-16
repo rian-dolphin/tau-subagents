@@ -1,5 +1,39 @@
 # Handoff: fleshing out tau-subagents
 
+> **Migrated to upstream tau-ai 0.2.0 (2026-07-16).** Upstream tau adopted
+> pi's event/extension protocol wholesale (tau commits `5f26666` "adopt
+> Pi-compatible event and extension protocol", `5c2be1b` turn metadata,
+> `a2db487` event-stream docs), and the fork's entire seam stack described
+> below landed upstream under the same names. This repo now depends on
+> `tau-ai==0.2.0` from PyPI (no path source, no fork). What changed here:
+>
+> - **Events**: no more `error`/`message_delta`/`thinking_delta`/`retry`
+>   agent events. Streaming arrives as `message_update` wrapping provider
+>   `AssistantMessageEvent`s; terminal errors are assistant messages with
+>   `stop_reason == "error"` via `message_end`. Because an overflow error can
+>   be compacted away and auto-retried *inside one* `session.prompt()` stream,
+>   run status is decided only at stream end (`AgentRun.pending_error` +
+>   `_finalize_status`), never mid-stream.
+> - **Messages**: pi-shaped block content (`.text` property, `tool_calls` as
+>   a content-block property), `Usage` always present (zeros when unreported —
+>   `has_usage` is now a derived `lifetime_tokens > 0` property), custom
+>   messages are a separate `CustomMessage` role.
+> - **Tools**: `AgentTool(label=, parameters=, execute_fn=)` with executor
+>   signature `(tool_call_id, arguments, signal, on_update)`;
+>   `AgentToolResult(content=blocks, details=)` — no `ok`/`error` fields.
+>   All old `ok=False` results are plain returns (pi-subagents parity);
+>   nothing raises. `on_update` takes an `AgentToolResult` partial.
+> - **Handlers**: `tau.on(...)` handlers receive `(event, context)`.
+> - **Skills**: fixtures use the upstream `<skills-dir>/<name>/SKILL.md`
+>   layout.
+> - Known upstream gaps to file/fix in tau, not here: `on_update` partials
+>   are buffered until the tool returns (kills the live foreground ticker);
+>   `AgentToolResult` lacks pi's `isError`; a grace-aborted child burns one
+>   throwaway provider call and logs a synthetic error turn (turn counts on
+>   aborted runs read one higher than before).
+>
+> Fork/seam/branch references below are historical context.
+
 > **Superseded on branch `component-seam-experiment` (2026-07-06).** The agents
 > strip / conversation view described below as tau's *transcript-sources* seam
 > (`TranscriptSource`, `set_transcript_source_provider`,

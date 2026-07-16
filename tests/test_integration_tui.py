@@ -23,13 +23,13 @@ import pytest
 from textual.containers import Container
 
 from tau_agent import (
-    QueueUpdateEvent,
     ToolCall,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
 )
+from tau_coding.events import QueueUpdateEvent
 from tau_agent.messages import AssistantMessage
-from tau_ai import FakeProvider, ProviderResponseEndEvent, ProviderResponseStartEvent
+from tau_ai import AssistantDoneEvent, AssistantStartEvent, FakeProvider
 from tau_coding.session import ModelChoice, TerminalCommandResult
 from tau_coding.skills import Skill
 from tau_coding.system_prompt import ProjectContextFile
@@ -241,8 +241,8 @@ class _GatedProvider:
     def stream_response(self, *, model, system, messages, tools, signal=None):  # noqa: ANN001, ANN202
         async def iterator():  # noqa: ANN202
             await self._release.wait()
-            yield ProviderResponseStartEvent(model="fake")
-            yield ProviderResponseEndEvent(message=AssistantMessage(content="done"))
+            yield AssistantStartEvent(partial=AssistantMessage(model="fake"))
+            yield AssistantDoneEvent(reason="stop", message=AssistantMessage(content="done"))
 
         return iterator()
 
@@ -273,6 +273,7 @@ async def test_real_spawn_lights_strip_and_keyboard_opens_viewer(tmp_path) -> No
         # Spawn through the REAL agent tool, in the background so it returns at once
         # while the run keeps executing on the TUI event loop.
         result = await agent_tool.execute(
+            "call-1",
             {
                 "prompt": "look around",
                 "description": "survey the repo",
@@ -280,7 +281,7 @@ async def test_real_spawn_lights_strip_and_keyboard_opens_viewer(tmp_path) -> No
                 "run_in_background": True,
             }
         )
-        assert result.ok, result.content
+        assert "Agent started in background." in result.text
 
         slot = app.query_one("#below-prompt-slot", Container)
         strip = slot.query(AgentStripWidget).first()
@@ -467,6 +468,7 @@ async def test_journey_switch_viewers_then_back_to_main(tmp_path) -> None:  # no
         agent_tool = _agent_tool(session.extension_runtime)
         for description, agent_type in (("survey the repo", "explore"), ("plan work", "general")):
             result = await agent_tool.execute(
+                "call-1",
                 {
                     "prompt": "look around",
                     "description": description,
@@ -474,7 +476,7 @@ async def test_journey_switch_viewers_then_back_to_main(tmp_path) -> None:  # no
                     "run_in_background": True,
                 }
             )
-            assert result.ok, result.content
+            assert "Agent started in background." in result.text
 
         slot = app.query_one("#below-prompt-slot", Container)
         strip = slot.query(AgentStripWidget).first()
@@ -667,25 +669,28 @@ async def test_foreground_result_renders_completion_card(tmp_path) -> None:  # n
         )
         agent_tool = _agent_tool(session.extension_runtime)
         result = await agent_tool.execute(
+            "call-1",
             {"prompt": "go", "description": "survey the repo"}
         )
-        # In production the loop stamps the id; the tool returns it blank.
-        result = result.model_copy(update={"tool_call_id": "call-1"})
-
         async def stream(event) -> None:  # noqa: ANN001
             app.adapter.apply(event)
             await app._apply_streaming_transcript_event(event)
 
         await stream(
             ToolExecutionStartEvent(
-                tool_call=ToolCall(
-                    id="call-1",
-                    name="agent",
-                    arguments={"prompt": "go", "description": "survey the repo"},
-                )
+                tool_call_id="call-1",
+                tool_name="agent",
+                args={"prompt": "go", "description": "survey the repo"},
             )
         )
-        await stream(ToolExecutionEndEvent(result=result))
+        await stream(
+            ToolExecutionEndEvent(
+                tool_call_id="call-1",
+                tool_name="agent",
+                result=result,
+                is_error=False,
+            )
+        )
         await pilot.pause()
 
         widget = next(

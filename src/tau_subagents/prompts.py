@@ -65,10 +65,14 @@ def build_parent_context(transcript: object) -> str:
     parts: list[str] = []
     for message in transcript or ():  # type: ignore[union-attr]
         role = getattr(message, "role", None)
-        content = getattr(message, "content", None)
-        if role not in ("user", "assistant") or not isinstance(content, str):
+        if role not in ("user", "assistant"):
             continue
-        text = content.strip()
+        # Pi-protocol messages carry block content; `.text` joins the text
+        # blocks (and is a plain-str passthrough on user messages).
+        text = getattr(message, "text", None)
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
         if text:
             label = "User" if role == "user" else "Assistant"
             parts.append(f"[{label}]: {text}")
