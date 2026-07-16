@@ -415,10 +415,15 @@ class ConversationViewer(Vertical):
         line.append(run.agent_type, style=f"bold {theme.prompt_text}")
         line.append(f" [{run.status}]", style=theme.muted_text)
         if self._notice is not None:
-            # Ahead of the description/hints: the line ellipsizes from the
-            # right, and on a narrow terminal the notice is the one part that
-            # must survive (it explains why Enter is doing nothing).
+            # Ahead of the model/description/hints: the line ellipsizes from
+            # the right, and on a narrow terminal the notice is the one part
+            # that must survive (it explains why Enter is doing nothing).
             line.append(f"  {self._notice}", style=theme.role_styles["error"].border)
+        # Resolved model once the run has one; the requested model while
+        # queued. Always shown so "same as the main thread" is visible too.
+        model = run.model or run.requested_model
+        if model:
+            line.append(f" · {model}", style=theme.muted_text)
         if run.description:
             line.append(f"  {run.description}", style=theme.muted_text)
         # Right-hand action hints, mirroring pi's footer affordances.

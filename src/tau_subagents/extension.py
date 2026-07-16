@@ -148,6 +148,10 @@ class AgentRun:
     tokens_output: int = 0
     tokens_cache_write: int = 0
     has_usage: bool = False
+    # Resolved model id actually running this agent (None while queued).
+    # requested_model below is only the tool-param request, which frontmatter
+    # may override — the viewer header shows this resolved value.
+    model: str | None = None
     requested_model: str | None = None
     requested_thinking: str | None = None
     requested_max_turns: int | None = None
@@ -524,6 +528,10 @@ class SubagentManager:
             ),
         )
         run.provider = provider
+        run.model = selection.model
+        # A viewer opened on the queued run painted its header without a
+        # model; push so it picks the resolved one up immediately.
+        self._notify_run(run)
         child_cwd = cwd
         if (definition.isolation or run.requested_isolation) == "worktree":
             worktree = await create_worktree(cwd, run.agent_id)

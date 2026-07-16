@@ -249,16 +249,43 @@ async def test_viewer_renders_messages_and_header() -> None:
         queue_steering_message=lambda msg: None,
     )
     run = _run("agent-1", agent_type="explore", status="running", session=session)
+    run.model = "claude-sonnet-5"
     viewer = _viewer_for(run)
     app = _Harness(viewer)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
         texts = [w.item.text for w in viewer.query(TranscriptMessageWidget)]
         assert any("on it" in t for t in texts)
-        # Header carries label + status.
+        # Header carries label + status + the run's resolved model.
         header_plain = viewer._header_text.plain
         assert "explore" in header_plain
         assert "[running]" in header_plain
+        assert "claude-sonnet-5" in header_plain
+
+
+async def test_viewer_header_model_fallback_and_omission() -> None:
+    # Queued run, model not yet resolved: fall back to the requested model.
+    run = _run("agent-1", status="queued", started=False, session=None)
+    run.requested_model = "haiku"
+    viewer = _viewer_for(run)
+    app = _Harness(viewer)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert "[queued] · haiku" in viewer._header_text.plain
+
+        # Resolution wins over the request (frontmatter may override it).
+        run.model = "claude-sonnet-5"
+        viewer.on_external_change()
+        header_plain = viewer._header_text.plain
+        assert "[queued] · claude-sonnet-5" in header_plain
+        assert "haiku" not in header_plain
+
+        # Neither known: the model segment is omitted entirely (the hints on
+        # the right still legitimately contain "·" separators).
+        run.model = None
+        run.requested_model = None
+        viewer.on_external_change()
+        assert "[queued] ·" not in viewer._header_text.plain
 
 
 async def test_viewer_composer_steers_the_run() -> None:
