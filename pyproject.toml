@@ -20,7 +20,7 @@ dependencies = [
 dev = ["pytest>=8.0", "anyio>=4.0"]
 
 # Tau extension manifest (tau branch `extension-manifest`, ported from pi's
-# package.json "pi.extensions"): lets `tau -x` on this repo root find the
+# package.json "pi.extensions"): lets `tau -e` on this repo root find the
 # entry inside the src layout, no root shim needed.
 [tool.tau]
 extensions = ["src/tau_subagents/extension.py"]

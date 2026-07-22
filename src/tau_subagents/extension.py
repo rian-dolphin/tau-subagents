@@ -13,7 +13,7 @@ as slots free up.
 
 Install by copying this directory into `~/.tau/extensions/subagents/`, or run:
 
-    tau -x examples/extensions/subagents
+    tau -e examples/extensions/subagents
 """
 
 from __future__ import annotations

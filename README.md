@@ -35,7 +35,7 @@ extensions = ["src/tau_subagents/extension.py"]`), so the repo itself is
 loadable as a Tau extension. Either try it per-run:
 
 ```bash
-tau -x /path/to/tau-subagents
+tau -e /path/to/tau-subagents
 ```
 
 or install it permanently by symlinking the clone into Tau's user extensions:
