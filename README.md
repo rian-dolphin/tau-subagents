@@ -3,13 +3,12 @@
 Claude Code-style autonomous subagents for [Tau](https://github.com/huggingface/tau),
 ported from [pi-subagents](https://github.com/tintinweb/pi-subagents).
 
-> **Targets upstream tau-ai ≥ 0.2.0** (migrated 2026-07-16). Upstream tau
-> adopted pi's event and extension protocol wholesale (`feat: adopt
-> Pi-compatible event and extension protocol`, tau #375), and every capability
-> this extension once needed from the rian-dolphin/tau fork's seam branches
-> now exists upstream. Where the text below says a feature needs a particular
-> *seam* or fork branch, read that as historical: on tau-ai 0.2.0 they are all
-> present, and the extension's feature-detection simply always finds them.
+> **Requires upstream tau-ai ≥ 0.3.0.** Upstream tau adopted pi's event and
+> extension protocol wholesale (tau #375), so everything this extension needs
+> — the extension API, the component seam, dialogs, message renderers, the
+> `skills_enabled` config, provider usage fields — is present in every
+> supported Tau. Older 0.2.x releases (and the pre-0.2.0 fork branches) are no
+> longer supported.
 
 Gives the model an `agent` tool that delegates a task to a **subagent** — a
 second, scoped Tau coding session running in-process with its own system
@@ -23,9 +22,8 @@ Also registers:
 - `get_subagent_result` — poll a background agent, or `wait=true` to block for it
 - `steer_subagent` — inject a message into a running (or queued) agent
 - `/agents` — interactive menu over agent types, runs, and scheduled jobs
-- an **agents strip** under the prompt (Tau builds with the component seam):
-  live subagent list with an embedded conversation viewer (see "The agents
-  strip")
+- an **agents strip** under the prompt (TUI mode): live subagent list with an
+  embedded conversation viewer (see "The agents strip")
 
 ## Install
 
@@ -47,9 +45,9 @@ ln -s ~/code/tau-subagents ~/.tau/extensions/tau-subagents
 
 Update with `git pull`, then restart `tau` (or `/reload`).
 
-Beyond Tau, this branch takes a direct dependency on `textual`: on the
-`component-seam-experiment` branch the agents strip and conversation viewer are
-extension-owned Textual widgets (see "The agents strip").
+Beyond Tau, the extension takes a direct dependency on `textual`: the agents
+strip and conversation viewer are extension-owned Textual widgets (see "The
+agents strip").
 
 ## Use
 
@@ -60,23 +58,22 @@ Ask the model to delegate:
 > Spawn an explore subagent to find where slash commands are registered,
 > run it in the background.
 
-`/agents` manages agents. On Tau builds with the `ui-dialogs` seam it opens
-an interactive menu (ported from pi's showAgentsMenu): selecting a run opens
-its conversation viewer (see "The agents strip"), falling back to a dialog
-submenu (view result / steer / stop) on hosts without the component seam. pi's
-create wizard and settings menu are not ported yet. Without the seam — or
-headless — it prints the plain-text list instead.
+`/agents` manages agents. In the TUI it opens an interactive menu (ported
+from pi's showAgentsMenu): selecting a run opens its conversation viewer (see
+"The agents strip"), falling back to a dialog submenu (view result / steer /
+stop) on hosts without mounted components. pi's create wizard and settings
+menu are not ported yet. Headless (print mode) it prints the plain-text list
+instead.
 
 ## The agents strip
 
-> **Experimental (branch `component-seam-experiment`).** On this branch the
-> whole agent UI is owned by the extension as real Textual widgets
-> (`src/tau_subagents/ui/`), mounted through Tau's generic *component seam*
-> (`context.ui.components`: `set_slot_widget` / `open_main_view` /
-> `register_key_interceptor`) rather than Tau core's older transcript-sources
-> seam. Tau core stays agent-agnostic — it only hosts widgets.
+The whole agent UI is owned by the extension as real Textual widgets
+(`src/tau_subagents/ui/`), mounted through Tau's generic *component seam*
+(`context.ui.components`: `set_slot_widget` / `open_main_view` /
+`register_key_interceptor`). Tau core stays agent-agnostic — it only hosts
+widgets.
 
-On component-capable Tau builds, spawning a subagent shows a strip under the
+In the TUI, spawning a subagent shows a strip under the
 prompt (`AgentStripWidget`) listing `main` plus every queued/running agent (the
 Claude Code pattern). Rows are deliberately quiet: a status glyph (a hollow
 circle while running — the spinner/timer/token stats live on the agent
@@ -214,8 +211,7 @@ that:
   doesn't have to read them on demand. Native discovery is turned off for
   such agents (matching pi, which sets `noSkills` for named preloads so the
   same skill isn't both preloaded and indexed) — the child gets exactly the
-  named skills. Requires the `skills_enabled` seam; against an older Tau the
-  index stays on alongside the preloaded bodies.
+  named skills.
 - `skills: true` (or `*` / `all`) — pins the child's resource discovery
   (skills **and** project context files such as AGENTS.md) to the **parent**
   working directory. This only makes a difference under
@@ -223,11 +219,7 @@ that:
   against the worktree copy — e.g. uncommitted project skills would be
   invisible to the isolated child.
 - `skills: none` / `false` — disables the child's skill discovery entirely
-  (no `<available_skills>` index, no `/skill:` expansion) when Tau supports
-  the `CodingSessionConfig.skills_enabled` seam (tau fork branch
-  `skills-seam`). Against an older Tau without the seam, the extension
-  feature-detects and falls back to the previous behavior: native discovery
-  stays on and this value only skips preloading.
+  (no `<available_skills>` index, no `/skill:` expansion).
 
 In `prompt_mode: append` the parent prompt prefix already carries the
 parent's skill index verbatim.
@@ -286,16 +278,14 @@ notifications (`<total_tokens>`), and the `steer_subagent` confirmation's
 
 Token figures come in two flavors:
 
-- **Real billed tokens** (`<total_tokens>`, `<K> tokens`) — available when Tau
-  has the `provider-usage` seam (branch `provider-usage`; usage fields on
-  `AssistantMessage` populated by the provider adapters). Following pi's
-  semantics, the lifetime total sums `input + output + cache_write` per
-  assistant response; cache *reads* are excluded because each turn re-reads
-  the whole cached prefix, so summing them would count the prefix once per
-  turn (pi issue #38).
+- **Real billed tokens** (`<total_tokens>`, `<K> tokens`) — from the usage
+  fields on `AssistantMessage`, populated by Tau's provider adapters.
+  Following pi's semantics, the lifetime total sums
+  `input + output + cache_write` per assistant response; cache *reads* are
+  excluded because each turn re-reads the whole cached prefix, so summing
+  them would count the prefix once per turn (pi issue #38).
 - **Context estimate** (`~<K> context tokens`, `<context_tokens>`) — Tau's
-  deterministic chars/4 estimate of the child's current context size. Always
-  available; the only token figure on Tau branches without the usage seam.
+  deterministic chars/4 estimate of the child's current context size.
 
 ## Live activity
 
@@ -307,13 +297,11 @@ removed as transcript noise.
 
 ## Notification rendering
 
-On Tau builds with the `message-renderers` seam, background completion
-notifications render as pi-style cards (status icon, bold description, dim
-stats line with turns/tools/tokens/duration, collapsed result preview,
-transcript path) instead of raw `<task-notification>` XML bubbles — the raw
-XML still enters the model's context unchanged. Group notifications stack
-one card per run. Without the seam, notifications arrive as plain user
-messages exactly as before.
+Background completion notifications render as pi-style cards (status icon,
+bold description, dim stats line with turns/tools/tokens/duration, collapsed
+result preview, transcript path) instead of raw `<task-notification>` XML
+bubbles — the raw XML still enters the model's context unchanged. Group
+notifications stack one card per run.
 
 ## Concurrency and the background queue
 
@@ -378,10 +366,6 @@ time, so queued background runs see the conversation as of the tool call.
 Compaction summaries appear as `[User]` turns (Tau folds them into user
 messages during replay) rather than pi's `[Summary]:` framing.
 
-Requires a Tau build with the `parent-context` seam
-(`tau.context.transcript`); without it the tool call fails with an
-explanatory error rather than silently spawning without context.
-
 ## Settings
 
 Settings are read from two JSON files and shallow-merged, project overriding
@@ -407,17 +391,14 @@ default.
   MCP tools — pi's `isolated` param (which strips them) has nothing to strip
   here and is deliberately not ported.
 - Live activity while a subagent works is the spinner + elapsed timer on its
-  tool row and the in-place view (see "Live activity"); on older Tau builds
-  without those seams, runs are silent while they work — prefer background
-  mode for long tasks there.
+  tool row and the in-place view (see "Live activity").
 - `/reload` rebuilds extension state; background runs in flight at reload
   time are orphaned.
 
 ## Tests
 
 The tests need Tau's packages importable. The repo's own environment resolves
-Tau via the path source in `pyproject.toml` (`[tool.uv.sources]` — edit it if
-your Tau checkout lives elsewhere):
+`tau-ai` from PyPI:
 
 ```bash
 uv run pytest

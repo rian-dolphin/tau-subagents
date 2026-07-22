@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
-import functools
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -101,14 +99,6 @@ SOFT_LIMIT_MESSAGE = (
     "You have reached your turn limit. Wrap up immediately — provide your"
     " final answer now."
 )
-
-
-@functools.cache
-def _supports_skills_enabled() -> bool:
-    """Whether this Tau has the CodingSessionConfig.skills_enabled seam."""
-    return "skills_enabled" in {
-        config_field.name for config_field in dataclasses.fields(CodingSessionConfig)
-    }
 
 
 class _MemoryStorage:
@@ -594,11 +584,8 @@ class SubagentManager:
         extra_config: dict[str, bool] = {}
         # skills: none/false disables skill discovery; a named CSV also
         # disables it so preloaded bodies aren't double-listed in the index
-        # (pi sets noSkills for both). Requires the skills_enabled seam;
-        # otherwise fall back to default discovery.
-        if (
-            definition.skills is False or isinstance(definition.skills, tuple)
-        ) and _supports_skills_enabled():
+        # (pi sets noSkills for both).
+        if definition.skills is False or isinstance(definition.skills, tuple):
             extra_config["skills_enabled"] = False
         session = await CodingSession.load(
             CodingSessionConfig(
@@ -811,17 +798,13 @@ class SubagentManager:
     def _deliver_notification(
         self, content: str, details: dict[str, object]
     ) -> None:
-        """Send via the message-renderers seam when present, else raw."""
-        send_custom = getattr(self._api, "send_custom_message", None)
-        if send_custom is not None:
-            send_custom(
-                content,
-                custom_type="subagent-notification",
-                details=details,
-                deliver_as="follow_up",
-            )
-        else:
-            self._api.send_user_message(content, deliver_as="follow_up")
+        """Send as a custom message so the registered renderer draws the card."""
+        self._api.send_custom_message(
+            content,
+            custom_type="subagent-notification",
+            details=details,
+            deliver_as="follow_up",
+        )
 
 
 def _effective_max_turns(
@@ -1028,10 +1011,9 @@ def render_steer_call(arguments: Mapping[str, object]) -> str:
 def setup(tau: ExtensionAPI) -> None:
     """Register subagent tools, the /agents command, and shutdown cleanup."""
     manager = SubagentManager(tau)
-    if hasattr(tau, "register_message_renderer"):
-        # message-renderers seam: notifications render as pi-style cards
-        # instead of raw <task-notification> XML bubbles.
-        tau.register_message_renderer("subagent-notification", render_notification)
+    # Notifications render as pi-style cards instead of raw
+    # <task-notification> XML bubbles.
+    tau.register_message_renderer("subagent-notification", render_notification)
     scheduler = SubagentScheduler(manager)
 
     def start_scheduler() -> None:
@@ -1048,7 +1030,7 @@ def setup(tau: ExtensionAPI) -> None:
         except Exception:  # noqa: BLE001 - scheduling must never break the session
             pass
 
-    # Component seam (experimental): the extension owns the agents strip and the
+    # Component seam: the extension owns the agents strip and the
     # conversation viewer as Textual widgets mounted through the component
     # bridge. Installed lazily on session_start — NOT in setup() — because the
     # host attaches its UI bridge (making supports_components True) only after
@@ -1056,11 +1038,11 @@ def setup(tau: ExtensionAPI) -> None:
     ui_controller: list[object] = []  # 0 or 1 element (a nonlocal-friendly cell)
 
     def _install_ui_components() -> None:
-        # getattr-guard keeps the extension loadable on an older tau without the
-        # component seam (constraint 8): it then runs dialog-only, no strip.
-        components = getattr(getattr(tau, "context", None), "ui", None)
-        components = getattr(components, "components", None)
-        if components is None or not getattr(components, "supports_components", False):
+        # supports_components is a runtime gate, not feature detection: the
+        # print-mode NullUiBridge reports False, and the extension then runs
+        # dialog-only, no strip.
+        components = tau.context.ui.components
+        if not components.supports_components:
             return
         # Defensive reinstall (bug fix 2): a controller can survive into the next
         # bind if a session_start arrives without a matching shutdown (or the host
@@ -1120,17 +1102,7 @@ def setup(tau: ExtensionAPI) -> None:
         if inherit:
             # Captured at spawn time (pi semantics): the digest reflects the
             # parent conversation as of this tool call, even for queued runs.
-            context = getattr(tau, "context", None)
-            transcript = (
-                getattr(context, "transcript", None) if context is not None else None
-            )
-            if transcript is None:
-                return _tool_result(
-                    content="inherit_context requires a Tau build with the"
-                    " parent-context seam (the parent transcript is not"
-                    " exposed to extensions here).",
-                )
-            parent_context = build_parent_context(transcript)
+            parent_context = build_parent_context(tau.context.transcript)
             if parent_context:
                 prompt = parent_context + prompt
         model = str(arguments.get("model")) if arguments.get("model") else None
@@ -1398,7 +1370,7 @@ def setup(tau: ExtensionAPI) -> None:
 
     def agents_command(args: str, context) -> str | None:  # noqa: ANN001
         del args, context
-        ui = getattr(getattr(tau, "context", None), "ui", None)
+        ui = tau.context.ui
         if supports_menu(ui):
             try:
                 loop = asyncio.get_running_loop()

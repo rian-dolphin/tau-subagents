@@ -15,9 +15,7 @@ Children discover skills natively through Tau's own machinery by default.
 `skills: <csv>` additionally preloads the named skills' bodies into the
 system prompt; `skills: true`/`*`/`all` pins resource discovery (skills and
 project context files) to the parent cwd, which only matters under worktree
-isolation; `skills: none`/`false` disables skill discovery entirely when Tau
-supports the `skills_enabled` config seam (otherwise it only skips
-preloading).
+isolation; `skills: none`/`false` disables skill discovery entirely.
 """
 
 from __future__ import annotations
@@ -144,8 +142,7 @@ def _parse_skills(raw: str | None) -> tuple[str, ...] | bool | None:
 
     None = omitted (Tau's native discovery, default); tuple = named preload;
     True (`true`/`*`/`all`) = pin discovery to the parent cwd; False
-    (`none`/`false`) = disable skill discovery (needs Tau's skills_enabled
-    seam; otherwise same as omitted).
+    (`none`/`false`) = disable skill discovery.
     """
     if raw is None:
         return None

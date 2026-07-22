@@ -7,10 +7,9 @@ view — NOT a modal — so the fleet strip stays visible for peripheral awarene
 Rendering deliberately REUSES tau core's own transcript internals rather than
 reinventing them: it feeds a :class:`tau_coding.tui.state.TuiState` (via
 ``load_messages``) into a :class:`tau_coding.tui.widgets.TranscriptView` and
-calls ``update_from_state`` — exactly the ``TuiState`` + ``#agent-transcript-pane``
-mechanics tau core's ``_activate_source``/``_tick_agent_view`` used before this
-migration. Importing those host internals is the coupling this experiment
-measures; it is called out here because it is non-obvious.
+calls ``update_from_state``, so subagent transcripts render pixel-identical to
+the main chat. Importing those host internals is a deliberate coupling; it is
+called out here because it is non-obvious.
 
 Live updates are push, not poll: the viewer subscribes to the run's listener
 registry on mount and unsubscribes on unmount (the analog of pi's

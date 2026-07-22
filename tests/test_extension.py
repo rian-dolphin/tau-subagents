@@ -1430,35 +1430,6 @@ async def test_named_skills_preload_disables_native_index(tmp_path: Path) -> Non
     assert "<available_skills>" not in system  # pi: named preload sets noSkills
 
 
-async def test_skills_none_falls_back_without_seam(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    runtime = _load_runtime(tmp_path)
-    runtime.bind(RecordingSession(tmp_path))
-    module = _extension_module()
-    (tmp_path / ".tau" / "skills" / "idxskill").mkdir(parents=True)
-    (tmp_path / ".tau" / "skills" / "idxskill" / "SKILL.md").write_text(
-        "---\ndescription: Indexed skill\n---\nDo indexed things."
-    )
-    (tmp_path / ".tau" / "agents").mkdir(exist_ok=True)
-    (tmp_path / ".tau" / "agents" / "noskills.md").write_text(
-        "---\ndescription: No skills\nskills: none\n---\nBody."
-    )
-    monkeypatch.setattr(module, "_supports_skills_enabled", lambda: False)
-    provider = FakeProvider([_text_stream("done")])
-    _patch_provider_factory(module, provider)
-
-    agent_tool = _agent_tool(runtime)
-    result = await agent_tool.execute(
-        "call-1",
-        {"prompt": "x", "description": "x", "subagent_type": "noskills"}
-    )
-
-    # Against an older Tau without the seam, the spawn still works and
-    # native discovery stays on.
-    assert "<name>idxskill</name>" in provider.calls[0][1]
-
-
 async def test_usage_surfaced_in_results_and_notifications(tmp_path: Path) -> None:
     runtime = _load_runtime(tmp_path)
     session = RecordingSession(tmp_path)
