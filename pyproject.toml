@@ -6,7 +6,21 @@ build-backend = "uv_build"
 name = "tau-subagents"
 version = "0.1.0"
 description = "Subagents extension for Tau (a port of pi-subagents)."
-requires-python = ">=3.14"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rian Dolphin", email = "dolphrian@gmail.com" }]
+requires-python = ">=3.12"
+classifiers = [
+ "Development Status :: 3 - Alpha",
+ "Intended Audience :: Developers",
+ "Operating System :: OS Independent",
+ "Programming Language :: Python :: 3",
+ "Programming Language :: Python :: 3.12",
+ "Programming Language :: Python :: 3.13",
+ "Programming Language :: Python :: 3.14",
+]
+keywords = ["tau", "subagents", "extension", "agents", "tui"]
 # textual is a direct dependency on the component-seam-experiment branch: the
 # extension's agents strip and conversation viewer are real Textual widgets
 # mounted through tau's component seam (previously it reached textual only
@@ -15,6 +29,11 @@ dependencies = [
  "tau-ai>=0.2.0",
  "textual>=1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/rian-dolphin/tau-subagents"
+Repository = "https://github.com/rian-dolphin/tau-subagents"
+Issues = "https://github.com/rian-dolphin/tau-subagents/issues"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "anyio>=4.0"]
