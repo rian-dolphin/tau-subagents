@@ -1,0 +1,29 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Required for PyPI trusted publishing (OIDC).
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: Check release tag matches package version
+        run: |
+          version="$(uv version --short)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "Release tag $GITHUB_REF_NAME does not match pyproject.toml version $version (expected tag v$version)" >&2
+            exit 1
+          fi
+      - name: Run tests
+        run: uv run pytest
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Publish to PyPI
+        run: uv publish
