@@ -1,0 +1,22 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Required for PyPI trusted publishing (OIDC).
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
+      - name: Run tests
+        run: uv run pytest
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Publish to PyPI
+        run: uv publish
