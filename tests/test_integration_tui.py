@@ -31,6 +31,7 @@ from tau_coding.events import QueueUpdateEvent
 from tau_agent.messages import AssistantMessage
 from tau_ai import AssistantDoneEvent, AssistantStartEvent, FakeProvider
 from tau_coding.session import ModelChoice, TerminalCommandResult
+from tau_coding.session_stats import SessionStats
 from tau_coding.skills import Skill
 from tau_coding.system_prompt import ProjectContextFile
 from tau_coding.tools import create_coding_tools
@@ -101,6 +102,8 @@ class _FakeSession:
         self.available_thinking_levels = ("off", "low", "medium", "high")
         self.state = _FakeSessionState()
         self.resource_diagnostics = ()
+        self.extension_names = ("subagents",)
+        self.session_stats = SessionStats()
         self.system_prompt = "You are Tau."
         self.session_manager = None
         self._session_title: str | None = None

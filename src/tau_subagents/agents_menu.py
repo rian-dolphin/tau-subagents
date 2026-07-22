@@ -47,12 +47,12 @@ class DialogUi(Protocol):
 
 
 def supports_menu(ui: object) -> bool:
-    """True when the bound UI can drive the interactive menu."""
-    return (
-        ui is not None
-        and bool(getattr(ui, "has_ui", False))
-        and hasattr(ui, "select")
-    )
+    """True when the bound UI can drive the interactive menu.
+
+    ``has_ui`` is a runtime signal, not feature detection: print mode's
+    NullUiBridge reports False, and /agents falls back to the plain-text list.
+    """
+    return ui is not None and bool(getattr(ui, "has_ui", False))
 
 
 async def show_agents_menu(
@@ -128,7 +128,7 @@ def view_run_conversation(
     With a component-capable host the extension opens its own conversation
     viewer (the widget seam that replaced tau's removed ``view_transcript``):
     on success the whole menu closes ("exit") so the user lands in the view.
-    Component-less hosts (print mode / older tau) fall to the action submenu
+    Component-less hosts (print mode) fall to the action submenu
     ("actions"), exactly as the old ``view_transcript``-missing branch did.
     """
     if controller is not None:
