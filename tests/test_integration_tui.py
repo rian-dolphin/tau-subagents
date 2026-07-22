@@ -82,6 +82,7 @@ class _FakeSession:
         self.events: tuple[object, ...] = ()
         self.provider_name = "openai"
         self.model = "fake-model"
+        self.extension_names = runtime.extension_names
         self.available_models = ("fake-model",)
         self.available_model_choices = (
             ModelChoice(provider_name="openai", model="fake-model"),
@@ -97,6 +98,13 @@ class _FakeSession:
         self.context_token_estimate = 100
         self.auto_compact_token_threshold = 200000
         self.context_window_tokens = 216384
+        self.session_stats = SimpleNamespace(
+            turn_count=0,
+            tool_call_count=0,
+            input_tokens=0,
+            output_tokens=0,
+            estimated_cost=None,
+        )
         self.thinking_level = "medium"
         self.available_thinking_levels = ("off", "low", "medium", "high")
         self.state = _FakeSessionState()
