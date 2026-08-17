@@ -72,6 +72,10 @@ from .worktree import (
 if TYPE_CHECKING:
     from tau_agent.events import AgentEvent
 
+# Fit-or-fetch caps for the model-visible completion notifications: a result
+# that fits is included whole; a longer one is omitted entirely (with a
+# get_subagent_result pointer) rather than truncated — a partial preview
+# tempts the parent to act on incomplete information instead of fetching.
 INDIVIDUAL_RESULT_CHARS = 500
 GROUP_RESULT_CHARS = 300
 # Display-only budget for the foreground card's expanded view (Ctrl+O). More
@@ -80,7 +84,6 @@ GROUP_RESULT_CHARS = 300
 # here would be a regression.
 FOREGROUND_RESULT_CHARS = 6_000
 RECORD_RESULT_CHARS = 4_000
-TRUNCATION_SUFFIX = "\n...(truncated, use get_subagent_result for full output)"
 BATCH_DEBOUNCE_SECONDS = 0.1
 NUDGE_HOLD_SECONDS = 0.2
 GROUP_TIMEOUT_SECONDS = DEFAULT_TIMEOUT
@@ -766,13 +769,8 @@ class SubagentManager:
                 f"Subagent {run.agent_id} ({run.description}) {run.status}.",
                 "info" if run.status in ("completed", "steered") else "warning",
             )
-            footer = (
-                f"\nFull transcript available at: {run.output_file}"
-                if run.output_file
-                else ""
-            )
             self._deliver_notification(
-                f"{format_task_notification(run)}\n{COMPLETION_NOTICE}{footer}",
+                f"{format_task_notification(run)}\n{COMPLETION_NOTICE}",
                 build_notification_details(run),
             )
         except Exception:  # noqa: BLE001 - timer callbacks must never crash the loop
@@ -856,33 +854,34 @@ COMPLETION_NOTICE = (
 def format_task_notification(
     run: AgentRun, max_result_chars: int = INDIVIDUAL_RESULT_CHARS
 ) -> str:
-    """Format one run's completion as a <task-notification> block."""
+    """Format one run's completion as a minimal <task-notification> block.
+
+    Deliberately minimal: turns and usage stats are omitted (the
+    get_subagent_result header repeats them, and the TUI card renders them
+    from `details`, outside the model's context). The result is fit-or-fetch:
+    included whole when it fits `max_result_chars`, otherwise replaced by a
+    pointer to get_subagent_result — never truncated.
+    """
     body = run.error if run.status == "error" else run.result_text
-    truncated = _truncate_result(body or "(no output)", max_result_chars)
+    body = body or "(no output)"
+    if len(body) <= max_result_chars:
+        result_line = f"<result>{body}</result>\n"
+    else:
+        result_line = (
+            f"<result-pending>Result is {len(body)} chars. Call "
+            f'get_subagent_result("{run.agent_id}") to read it before acting.'
+            "</result-pending>\n"
+        )
     output_line = (
         f"<output-file>{run.output_file}</output-file>\n" if run.output_file else ""
     )
-    usage_parts = []
-    if run.has_usage:
-        usage_parts.append(f"<total_tokens>{lifetime_tokens(run)}</total_tokens>")
-    usage_parts.append(f"<tool_uses>{run.tool_calls}</tool_uses>")
-    if run.context_tokens:
-        usage_parts.append(
-            f"<context_tokens>{run.context_tokens}</context_tokens>"
-        )
-    duration = _duration_ms(run)
-    if duration is not None:
-        usage_parts.append(f"<duration_ms>{duration}</duration_ms>")
     return (
         "<task-notification>\n"
         f"<agent-id>{run.agent_id}</agent-id>\n"
-        f"<type>{run.agent_type}</type>\n"
         f"<description>{run.description}</description>\n"
         f"{output_line}"
         f"<status>{run.status}</status>\n"
-        f"<turns>{run.turns}</turns>\n"
-        f"<result>{truncated}</result>\n"
-        f"<usage>{''.join(usage_parts)}</usage>\n"
+        f"{result_line}"
         "</task-notification>"
     )
 
@@ -922,12 +921,6 @@ def format_group_notification(records: list[AgentRun], *, partial: bool) -> str:
         f"{blocks}\n\n"
         "Use get_subagent_result for full output."
     )
-
-
-def _truncate_result(body: str, max_chars: int) -> str:
-    if len(body) > max_chars:
-        return body[:max_chars] + TRUNCATION_SUFFIX
-    return body
 
 
 def format_run_summary(run: AgentRun) -> str:

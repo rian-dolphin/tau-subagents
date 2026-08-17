@@ -1099,7 +1099,9 @@ async def test_output_file_streams_transcript(tmp_path: Path) -> None:
     await _wait_for(lambda: session.followed_up)
     note = session.followed_up[0]
     assert f"<output-file>{output_path}</output-file>" in note
-    assert f"Full transcript available at: {output_path}" in note
+    # The transcript path appears exactly once (the old duplicate
+    # "Full transcript available at:" footer was dropped).
+    assert note.count(str(output_path)) == 1
 
     entries = [
         json.loads(line) for line in output_path.read_text().splitlines() if line
@@ -1462,8 +1464,51 @@ async def test_usage_surfaced_in_results_and_notifications(tmp_path: Path) -> No
     )
     await _wait_for(lambda: session.followed_up)
     note = session.followed_up[0]
-    assert "<usage><tool_uses>0</tool_uses><context_tokens>" in note
-    assert "<duration_ms>" in note
+    # Notifications stay minimal: usage lives in the get_subagent_result
+    # header and the TUI card details, not in the model-visible XML.
+    assert "<usage>" not in note
+    assert "<turns>" not in note
+    assert "<result>bg done</result>" in note
+
+
+def test_task_notification_is_fit_or_fetch() -> None:
+    # A result that fits the cap is included whole; a longer one is omitted
+    # entirely with a get_subagent_result pointer — never truncated, so the
+    # parent is never tempted to act on partial output. Turns/usage/type are
+    # omitted too: get_subagent_result repeats them in its header.
+    from tau_subagents.extension import AgentRun, format_task_notification
+
+    def _run(text: str) -> AgentRun:
+        return AgentRun(
+            agent_id="agent-9",
+            agent_type="general",
+            description="d",
+            prompt="p",
+            background=True,
+            status="completed",
+            result_text=text,
+        )
+
+    short = format_task_notification(_run("all done"))
+    assert "<result>all done</result>" in short
+    assert "<result-pending>" not in short
+    assert "<usage>" not in short
+    assert "<turns>" not in short
+    assert "<type>" not in short
+
+    long_text = "x" * 501
+    long = format_task_notification(_run(long_text))
+    assert long_text not in long
+    assert "x" * 50 not in long  # no partial preview either
+    assert "<result>" not in long
+    assert (
+        '<result-pending>Result is 501 chars. Call get_subagent_result("agent-9")'
+        in long
+    )
+
+    # Boundary: exactly at the cap still ships inline.
+    exact = format_task_notification(_run("y" * 500))
+    assert f"<result>{'y' * 500}</result>" in exact
 
 
 def _usage_stream(
@@ -1526,7 +1571,8 @@ async def test_real_usage_accumulates_and_surfaces(tmp_path: Path) -> None:
     )
     await _wait_for(lambda: session.followed_up)
     note = session.followed_up[0]
-    assert "<usage><total_tokens>60</total_tokens><tool_uses>0</tool_uses>" in note
+    assert "<usage>" not in note
+    assert "<result>bg done</result>" in note
 
 
 async def test_foreground_run_emits_live_stats_ticker(tmp_path: Path) -> None:

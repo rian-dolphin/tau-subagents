@@ -269,22 +269,28 @@ cancels the now-redundant notification.
 
 ## Usage reporting
 
-Results and notifications include usage stats: tool uses, tokens, an
-estimated context size, and run duration. They appear in the foreground
-completion line (`Agent completed in <X>s (<N> tool uses, <K> tokens).`),
-the `get_subagent_result` header (`Usage:`), the `<usage>` block of task
-notifications (`<total_tokens>`), and the `steer_subagent` confirmation's
-`Current state:` line.
+Results include usage stats: tool uses, tokens, an estimated context size,
+and run duration. They appear in the foreground completion line
+(`Agent completed in <X>s (<N> tool uses, <K> tokens).`), the
+`get_subagent_result` header (`Usage:`), and the `steer_subagent`
+confirmation's `Current state:` line. Task notifications deliberately omit
+usage and turn counts — they stay minimal (id, description, status, result)
+since `get_subagent_result` repeats the stats and the TUI card renders them
+from `details` outside the model's context. The notification's `<result>` is
+**fit-or-fetch**: included whole when it fits the cap (500 chars individual,
+300 in group notices), otherwise replaced by a `<result-pending>` pointer to
+`get_subagent_result` — never truncated, so the parent is never tempted to
+act on partial output.
 
 Token figures come in two flavors:
 
-- **Real billed tokens** (`<total_tokens>`, `<K> tokens`) — from the usage
+- **Real billed tokens** (`<K> tokens`) — from the usage
   fields on `AssistantMessage`, populated by Tau's provider adapters.
   Following pi's semantics, the lifetime total sums
   `input + output + cache_write` per assistant response; cache *reads* are
   excluded because each turn re-reads the whole cached prefix, so summing
   them would count the prefix once per turn (pi issue #38).
-- **Context estimate** (`~<K> context tokens`, `<context_tokens>`) — Tau's
+- **Context estimate** (`~<K> context tokens`) — Tau's
   deterministic chars/4 estimate of the child's current context size.
 
 ## Live activity
