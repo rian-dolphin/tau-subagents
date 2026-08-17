@@ -7,7 +7,7 @@ user:
     <cwd>/.tau/subagents.json      project overrides
 
 Keys mirror pi's camelCase (`maxConcurrent`, `defaultMaxTurns`, `graceTurns`,
-`defaultJoinMode`). Missing files are treated as empty; malformed JSON is
+`defaultJoinMode`, `transcriptRetentionDays`). Missing files are treated as empty; malformed JSON is
 ignored rather than crashing the session. Out-of-range or wrong-typed values
 are silently dropped and the field keeps its default.
 """
@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 JOIN_MODES = ("async", "group", "smart")
+TRANSCRIPT_RETENTION_DAYS_DEFAULT = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,9 @@ class SubagentSettings:
     default_max_turns: int | None = None
     grace_turns: int = 5
     default_join_mode: str = "smart"
+    # ADR 0003: durable transcripts under ~/.tau/subagents/, swept after this
+    # many days. 0 disables durability (old temp-directory behavior).
+    transcript_retention_days: int = TRANSCRIPT_RETENTION_DAYS_DEFAULT
 
 
 def load_subagent_settings(cwd: Path, home: Path | None = None) -> SubagentSettings:
@@ -72,6 +76,9 @@ def _from_dict(data: dict[str, object]) -> SubagentSettings:
     join_mode = data.get("defaultJoinMode")
     if isinstance(join_mode, str) and join_mode in JOIN_MODES:
         settings = replace(settings, default_join_mode=join_mode)
+    retention = _int_in_range(data.get("transcriptRetentionDays"), 0, 3650)
+    if retention is not None:
+        settings = replace(settings, transcript_retention_days=retention)
     return settings
 
 

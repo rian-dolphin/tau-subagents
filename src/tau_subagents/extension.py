@@ -50,7 +50,7 @@ from .agents_menu import (
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
 from .notification_render import render_agent_result, render_notification, stat_parts
-from .output_file import OutputFileWriter, output_file_path
+from .output_file import OutputFileWriter, output_file_path, sweep_transcripts
 from .prompts import (
     build_child_system_prompt,
     build_parent_context,
@@ -273,6 +273,9 @@ class SubagentManager:
                 self._api.context.cwd,
                 self._api.context.session_id,
                 run.agent_id,
+                # transcriptRetentionDays: 0 opts out of durable storage
+                # (ADR 0003) and keeps the old temp-directory location.
+                durable=self._get_settings().transcript_retention_days > 0,
             ),
             run.agent_id,
             self._api.context.cwd,
@@ -1062,6 +1065,14 @@ def setup(tau: ExtensionAPI) -> None:
         if not scheduler.is_active():
             start_scheduler()
         _install_ui_components()
+        # ADR 0003: age out durable transcripts. Best-effort and off-loop so
+        # an enormous or slow ~/.tau/subagents/ tree cannot delay startup.
+        retention = manager._get_settings().transcript_retention_days
+        if retention > 0:
+            try:
+                await asyncio.to_thread(sweep_transcripts, retention)
+            except OSError:
+                pass
 
     async def run_agent_tool(tool_call_id, arguments, signal=None, on_update=None):  # noqa: ANN001, ANN202
         del tool_call_id

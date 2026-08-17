@@ -165,13 +165,23 @@ their working directory is removed when the run finishes.
 
 ## Output files
 
-Every run streams its child transcript as JSONL to
-`<tmpdir>/tau-subagents-<uid>/<encoded-cwd>/<session>/tasks/<agent-id>.jsonl`
+Every run streams its child transcript as JSONL to a durable directory
+under the Tau home:
+
+    ~/.tau/subagents/<cwd-slug>-<hash>/<session>/tasks/<agent-id>.jsonl
+
 (first entry is the prompt; new messages are flushed after each turn). The
+project directory name matches Tau's own `~/.tau/sessions/` naming, but the
+files live outside `sessions/` so Tau's session index never sees them. The
 path is shown in background spawn results (`Output file: ...`), in completion
-notifications (`<output-file>` tag plus a transcript footer), and in
-`get_subagent_result` output, so you can `tail` a long-running agent from
-outside the conversation.
+notifications (`<output-file>` tag), and in `get_subagent_result` output, so
+you can `tail` a long-running agent from outside the conversation.
+
+A retention sweep runs on session start and deletes transcripts older than
+`transcriptRetentionDays` (default 14). Set it to `0` to opt out of durable
+storage entirely — transcripts then go to the old per-uid location in the
+system temp directory. `TAU_SUBAGENTS_DIR` overrides the durable root
+(useful for tests or a relocated Tau home).
 
 ## Per-agent memory (`memory:` frontmatter)
 
@@ -386,6 +396,7 @@ user (missing or malformed files are ignored):
 | `defaultMaxTurns` | int 0–10000 | unlimited | default turn limit (`0` = unlimited) |
 | `graceTurns` | int 1–1000 | 5 | extra turns allowed after the soft limit |
 | `defaultJoinMode` | `async`\|`group`\|`smart` | `smart` | background notification batching (see Join modes) |
+| `transcriptRetentionDays` | int 0–3650 | 14 | days to keep durable transcripts (`0` = temp-dir storage, no sweep) |
 
 Out-of-range or wrong-typed values are silently dropped and the field keeps its
 default.

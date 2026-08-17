@@ -268,9 +268,17 @@ async def test_settings_defaults_overrides_and_validation(tmp_path: Path) -> Non
     assert defaults.default_max_turns is None
     assert defaults.grace_turns == 5
     assert defaults.default_join_mode == "smart"
+    assert defaults.transcript_retention_days == 14
+
+    # transcriptRetentionDays: 0 (opt out) is in range; negatives are dropped.
+    (cwd / ".tau").mkdir(parents=True)
+    (cwd / ".tau" / "subagents.json").write_text('{"transcriptRetentionDays": 0}')
+    assert load(cwd, home=home).transcript_retention_days == 0
+    (cwd / ".tau" / "subagents.json").write_text('{"transcriptRetentionDays": -1}')
+    assert load(cwd, home=home).transcript_retention_days == 14
+    (cwd / ".tau" / "subagents.json").write_text('{}')
 
     (home / ".tau").mkdir(parents=True)
-    (cwd / ".tau").mkdir(parents=True)
     (home / ".tau" / "subagents.json").write_text(
         '{"maxConcurrent": 8, "graceTurns": 9, "defaultJoinMode": "group"}'
     )
@@ -1091,7 +1099,10 @@ async def test_output_file_streams_transcript(tmp_path: Path) -> None:
         if line.startswith("Output file: ")
     )
     output_path = Path(output_line.removeprefix("Output file: "))
-    assert "tau-subagents-" in str(output_path)
+    # Durable location (ADR 0003): under the transcript root (redirected to
+    # tmp_path by the autouse conftest fixture), not the system temp dir.
+    assert str(output_path).startswith(str(tmp_path / "subagents-transcripts"))
+    assert output_path.parent.name == "tasks"
     assert output_path.name == "agent-1.jsonl"
     output_mod = _submodule("output_file")
     assert output_mod.encode_cwd("/") == "root"  # type: ignore[attr-defined]
@@ -1120,6 +1131,62 @@ async def test_output_file_streams_transcript(tmp_path: Path) -> None:
     )
     fetched = await get_result.execute("call-1", {"agent_id": "agent-1"})
     assert f"Output file: {output_path}" in fetched.text
+
+
+async def test_retention_zero_uses_temp_directory(tmp_path: Path) -> None:
+    # transcriptRetentionDays: 0 opts out of durable storage (ADR 0003) and
+    # keeps the old per-uid location in the system temp directory.
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    (tmp_path / ".tau").mkdir(exist_ok=True)
+    (tmp_path / ".tau" / "subagents.json").write_text(
+        '{"transcriptRetentionDays": 0}'
+    )
+    _patch_provider_factory(module, FakeProvider([_text_stream("done")]))
+
+    result = await _agent_tool(runtime).execute(
+        "call-1", {"prompt": "p", "description": "d"}
+    )
+    import tempfile
+
+    output_file = str(result.details["output_file"])
+    assert output_file.startswith(tempfile.gettempdir())
+    assert "tau-subagents-" in output_file
+
+
+def test_sweep_transcripts_deletes_old_and_prunes(tmp_path: Path) -> None:
+    import os
+    import time
+
+    from tau_subagents.output_file import sweep_transcripts, transcripts_root
+
+    root = transcripts_root()  # redirected to tmp_path by the conftest fixture
+    assert str(root).startswith(str(tmp_path))
+    old_dir = root / "proj-aaaaaa" / "session-old" / "tasks"
+    new_dir = root / "proj-aaaaaa" / "session-new" / "tasks"
+    old_dir.mkdir(parents=True)
+    new_dir.mkdir(parents=True)
+    old_file = old_dir / "agent-1.jsonl"
+    new_file = new_dir / "agent-2.jsonl"
+    old_file.write_text("{}\n")
+    new_file.write_text("{}\n")
+    stale = time.time() - 15 * 86_400
+    os.utime(old_file, (stale, stale))
+
+    assert sweep_transcripts(14) == 1
+    assert not old_file.exists()
+    assert new_file.exists()
+    # Emptied ancestors are pruned; populated ones and the root survive.
+    assert not old_dir.exists()
+    assert not (root / "proj-aaaaaa" / "session-old").exists()
+    assert new_dir.exists()
+    assert root.exists()
+
+    # Retention 0 never deletes anything.
+    os.utime(new_file, (stale, stale))
+    assert sweep_transcripts(0) == 0
+    assert new_file.exists()
 
 
 async def test_memory_dir_layout_and_validation(tmp_path: Path) -> None:
