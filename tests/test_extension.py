@@ -2318,3 +2318,51 @@ async def test_unknown_agent_type_is_reported(tmp_path: Path) -> None:
         {"prompt": "x", "description": "x", "subagent_type": "nope"}
     )
     assert "Unknown subagent_type" in result.text
+
+
+class CapturingProvider:
+    """Records system + messages + tools per request, then plays scripted streams."""
+
+    def __init__(self, streams: list[list[object]]) -> None:
+        self._streams = iter(streams)
+        self.calls: list[dict[str, object]] = []
+
+    def stream_response(self, *, model, system, messages, tools, signal=None):  # noqa: ANN001, ANN202
+        self.calls.append(
+            {"system": system, "messages": list(messages), "tools": list(tools or ())}
+        )
+        events = next(self._streams)
+
+        async def iterator():  # noqa: ANN202
+            for event in events:
+                yield event
+
+        return iterator()
+
+
+async def test_children_load_extensions_and_isolated_opts_out(
+    tmp_path: Path, _isolate_home: Path
+) -> None:
+    """Children discover extensions natively, so subagents can spawn subagents;
+    `isolated: true` restores a core-tools-only child."""
+    extensions_dir = _isolate_home / ".tau" / "extensions"
+    extensions_dir.mkdir(parents=True)
+    (extensions_dir / "tau-subagents").symlink_to(EXTENSION_DIR)
+
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(RecordingSession(tmp_path))
+    module = _extension_module()
+    providers = [CapturingProvider([_text_stream("done")]) for _ in range(2)]
+    _patch_provider_sequence(module, list(providers))
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute("call-1", {"prompt": "t", "description": "d"})
+    await agent_tool.execute(
+        "call-2", {"prompt": "t", "description": "d", "isolated": True}
+    )
+
+    def tool_names(provider: CapturingProvider) -> set[str]:
+        return {tool.name for tool in provider.calls[0]["tools"]}
+
+    assert "agent" in tool_names(providers[0])
+    assert "agent" not in tool_names(providers[1])

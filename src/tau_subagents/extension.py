@@ -168,6 +168,9 @@ class AgentRun:
     last_progress: str = ""
     join_mode: str | None = None
     requested_isolation: str | None = None
+    # `isolated: true` (pi's param): spawn the child without extensions, so
+    # it gets core tools only and cannot spawn subagents of its own.
+    requested_isolated: bool = False
     worktree: Worktree | None = None
     used_worktree: bool = False
     output_writer: OutputFileWriter | None = None
@@ -255,6 +258,7 @@ class SubagentManager:
         model: str | None = None,
         thinking: str | None = None,
         bypass_queue: bool = False,
+        isolated: bool = False,
     ) -> AgentRun:
         self._counter += 1
         run = AgentRun(
@@ -267,6 +271,7 @@ class SubagentManager:
             requested_thinking=thinking,
             requested_max_turns=max_turns,
             requested_isolation=isolation,
+            requested_isolated=isolated,
         )
         run.output_writer = OutputFileWriter(
             output_file_path(
@@ -612,8 +617,10 @@ class SubagentManager:
                 ),
                 provider_name=selection.provider.name,
                 auto_compact_enabled=False,
-                # Subagents load no extensions, so they cannot spawn recursively.
-                extensions_enabled=False,
+                # Children load extensions natively (pi parity), so subagents
+                # can spawn subagents. `isolated: true` opts a child out,
+                # restoring a core-tools-only session.
+                extensions_enabled=not run.requested_isolated,
                 **extra_config,
             )
         )
@@ -1100,6 +1107,7 @@ def setup(tau: ExtensionAPI) -> None:
         isolation = (
             "worktree" if arguments.get("isolation") == "worktree" else None
         )
+        isolated = bool(arguments.get("isolated", False))
         inherit = arguments.get("inherit_context")
         if inherit is None:
             inherit = definition.inherit_context
@@ -1128,6 +1136,7 @@ def setup(tau: ExtensionAPI) -> None:
             isolation=isolation,
             model=model,
             thinking=thinking,
+            isolated=isolated,
         )
         if background:
             return _tool_result(
@@ -1481,6 +1490,12 @@ def setup(tau: ExtensionAPI) -> None:
                         "description": "Set to \"worktree\" to run the agent in an"
                         " isolated git worktree; changes are saved to a"
                         " tau-agent-<id> branch.",
+                    },
+                    "isolated": {
+                        "type": "boolean",
+                        "description": "If true, spawn the agent without"
+                        " extension tools (core tools only); it cannot spawn"
+                        " subagents of its own. Default: false.",
                     },
                     "inherit_context": {
                         "type": "boolean",

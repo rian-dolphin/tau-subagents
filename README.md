@@ -403,10 +403,12 @@ default.
 
 ## Notes and limits
 
-- Subagents run with `extensions_enabled=False`, so they cannot spawn
-  subagents recursively. This also means children never receive extension or
-  MCP tools — pi's `isolated` param (which strips them) has nothing to strip
-  here and is deliberately not ported.
+- Children load extensions natively (pi parity), so subagents can spawn
+  subagents recursively — including this extension's own tools. There is no
+  depth limit; pass `isolated: true` on the `agent` tool to spawn a child
+  without extensions (core tools only, no further spawning), pi's `isolated`
+  param. Child sessions never fire `session_start`, so a child's extension
+  instance registers tools but starts no scheduler, UI, or retention sweep.
 - Live activity while a subagent works is the spinner + elapsed timer on its
   tool row and the in-place view (see "Live activity").
 - `/reload` rebuilds extension state; background runs in flight at reload

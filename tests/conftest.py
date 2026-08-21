@@ -18,3 +18,17 @@ def _isolate_transcript_root(
     root = tmp_path / "subagents-transcripts"
     monkeypatch.setenv("TAU_SUBAGENTS_DIR", str(root))
     return root
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point HOME at a per-test directory.
+
+    Children run with extensions enabled and discover them from
+    `Path.home()/.tau/extensions`, so without this every child spawned in a
+    test would load the developer's real installed extensions.
+    """
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
