@@ -60,8 +60,10 @@ Details, each chosen over an alternative:
 - **The output file skips seeded messages** (`inherited=N` on the writer);
   otherwise every fork would dump the whole parent transcript into
   durable storage under ADR 0003 retention.
-- **Guards:** model/thinking params ignored (parent wins), resume and
-  schedule rejected, `inherit_context` ignored as redundant. Foreground
+- **Guards:** model/thinking/isolated params rejected with an explanation
+  — never silently dropped, so the parent cannot believe it spawned a
+  cheaper model while the fork runs the parent's. Resume and schedule
+  rejected; `inherit_context` accepted as fulfilled. Foreground
   forks are allowed — a deliberate divergence from Claude Code's
   background-only forks; there is no reason to forbid blocking on one.
 

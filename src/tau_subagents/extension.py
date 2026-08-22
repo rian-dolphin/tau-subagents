@@ -1156,15 +1156,29 @@ def setup(tau: ExtensionAPI) -> None:
         isolated = bool(arguments.get("isolated", False))
         fork_capture = None
         if definition.fork:
+            # Reject, never silently ignore: a fork always runs the parent's
+            # model, thinking config, and tool pool (anything else breaks the
+            # shared prompt cache). Dropping a `model` param quietly would let
+            # the parent believe it spawned a cheaper model while the fork
+            # actually runs the parent's — a silent cost surprise.
+            rejected = [
+                name for name in ("model", "thinking", "isolated")
+                if arguments.get(name)
+            ]
+            if rejected:
+                return _tool_result(
+                    content=f"A fork cannot take {', '.join(rejected)} — it"
+                    " always runs the parent's model, thinking config, and"
+                    " tool pool (a different one would break the shared"
+                    " prompt cache). Omit the parameter(s), or spawn a"
+                    " different agent type with inherit_context=true to use"
+                    " another model with the conversation context.",
+                )
             # Captured at tool-call time (like inherit_context): queued forks
-            # see the conversation as of this call. Model/thinking overrides
-            # are ignored — a fork always runs the parent's model — and
-            # inherit_context would duplicate history it already has.
+            # see the conversation as of this call. inherit_context stays
+            # accepted — the fork fulfills exactly that request.
             fork_capture = capture_fork(tau.context)
             prompt = wrap_fork_task(prompt, worktree=isolation == "worktree")
-            # Forks skip the isolated filter (Claude Code parity): stripping
-            # extensions would break the tool-pool match with the parent.
-            isolated = False
         inherit = arguments.get("inherit_context")
         if inherit is None:
             inherit = definition.inherit_context
@@ -1176,11 +1190,6 @@ def setup(tau: ExtensionAPI) -> None:
                 prompt = parent_context + prompt
         model = str(arguments.get("model")) if arguments.get("model") else None
         thinking = arguments.get("thinking")
-        if definition.fork:
-            # Ignored (not rejected) even when invalid: forks run the parent's
-            # model, and the parent's thinking level is not exposed.
-            model = None
-            thinking = None
         if thinking is not None:
             thinking = str(thinking)
             if thinking not in THINKING_LEVELS:
@@ -1515,7 +1524,8 @@ def setup(tau: ExtensionAPI) -> None:
                 " continue a finished agent's session. Use inherit_context if"
                 " the agent needs a digest of the parent conversation, or the"
                 " fork type to hand it the full conversation verbatim (history,"
-                " system prompt, model — model/thinking params are ignored;"
+                " system prompt, model — model/thinking/isolated params are"
+                " rejected, a fork always runs the parent's setup;"
                 " forks cannot be resumed or scheduled).\n\nAvailable"
                 f" agent types:\n{type_list}"
             ),
@@ -1571,7 +1581,7 @@ def setup(tau: ExtensionAPI) -> None:
                         "type": "boolean",
                         "description": "If true, spawn the agent without"
                         " extension tools (core tools only); it cannot spawn"
-                        " subagents of its own. Default: false. Ignored for"
+                        " subagents of its own. Default: false. Rejected for"
                         " forks.",
                     },
                     "inherit_context": {

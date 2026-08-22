@@ -160,7 +160,9 @@ Agent-type frontmatter also supports:
 `subagent_type: fork` spawns a child that **inherits the entire
 conversation** (Claude Code's fork subagent, ADR 0005): the parent's system
 prompt byte-identical, the parent's model and provider (`model`/`thinking`
-params are ignored), the full toolset — children discover the same
+params are rejected with an explanation, never silently dropped — the
+parent must not believe it spawned a cheaper model), the full toolset —
+children discover the same
 extensions as the parent, so the serialized tool pool matches and the
 prompt cache prefix is shared — and the real message history, seeded into
 the child session as actual entries, not the text digest `inherit_context`
@@ -442,7 +444,7 @@ default.
   subagents recursively — including this extension's own tools. There is no
   depth limit; pass `isolated: true` on the `agent` tool to spawn a child
   without extensions (core tools only, no further spawning), pi's `isolated`
-  param. Forks ignore `isolated` — their tool pool must match the parent's.
+  param. Forks reject `isolated` — their tool pool must match the parent's.
   Child sessions never fire `session_start`, so a child's extension instance
   registers tools but starts no scheduler, UI, or retention sweep.
 - Live activity while a subagent works is the spinner + elapsed timer on its

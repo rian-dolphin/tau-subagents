@@ -2390,15 +2390,13 @@ async def test_fork_inherits_history_prompt_and_model(tmp_path: Path) -> None:
             "prompt": "review the diff",
             "description": "d",
             "subagent_type": "fork",
-            "model": "gpt-9",  # ignored: forks run the parent's model
-            "thinking": "nonsense",  # ignored (not rejected) likewise
-            "inherit_context": True,  # ignored: redundant with the real history
+            "inherit_context": True,  # accepted: a fork fulfills the request
         },
     )
     assert "fork done" in result.text
-    # Parent's provider and model, not the gpt-9 override; no thinking
-    # override, so the provider's persisted per-model level applies (the
-    # same source the parent used — any other level costs cache).
+    # Parent's provider and model; no thinking override, so the provider's
+    # persisted per-model level applies (the same source the parent used —
+    # any other level costs cache).
     assert resolutions == [["fake", "fake", None]]
     call = provider.calls[0]
     # System prompt is the parent's, byte-identical.
@@ -2548,7 +2546,7 @@ async def test_children_load_extensions_and_isolated_opts_out(
     )
     await agent_tool.execute(
         "call-3",
-        {"prompt": "t", "description": "d", "subagent_type": "fork", "isolated": True},
+        {"prompt": "t", "description": "d", "subagent_type": "fork"},
     )
 
     def tool_names(provider: CapturingProvider) -> set[str]:
@@ -2556,5 +2554,30 @@ async def test_children_load_extensions_and_isolated_opts_out(
 
     assert "agent" in tool_names(providers[0])
     assert "agent" not in tool_names(providers[1])
-    # Fork ignores `isolated`: parity with the parent's pool wins.
+    # A fork keeps the extension tools: parity with the parent's pool.
     assert "agent" in tool_names(providers[2])
+
+
+async def test_fork_rejects_model_thinking_and_isolated(tmp_path: Path) -> None:
+    """Never silently drop a fork override: the parent must not believe it
+    spawned a cheaper model while the fork runs the parent's."""
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(_fork_parent(tmp_path))
+    module = _extension_module()
+    provider = CapturingProvider([_text_stream("unused")])
+    _patch_fork_resolution(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        "call-1",
+        {
+            "prompt": "t",
+            "description": "d",
+            "subagent_type": "fork",
+            "model": "haiku",
+            "isolated": True,
+        },
+    )
+    assert "A fork cannot take model, isolated" in result.text
+    assert "inherit_context" in result.text  # the suggested alternative
+    assert provider.calls == []  # nothing was spawned
