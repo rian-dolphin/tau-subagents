@@ -19,6 +19,12 @@ digest of user/assistant turns, tool results dropped) and
 block). Neither gives the child real history, and the bridge block breaks
 the byte-identical prefix.
 
+`inherit_context` stays, because the two mechanisms serve different needs.
+A fork gives the full history — tool results included — on the parent's
+model, and shares the parent's prompt cache. `inherit_context` gives a
+summary to a fresh agent on any model, which a fork cannot do. The README
+carries the comparison ("Fork or `inherit_context`?").
+
 Tau has no API for handing a new session an existing history. But
 `CodingSession.load` replays whatever entries its storage already holds —
 sessions are derived state over an append-only entry log.
