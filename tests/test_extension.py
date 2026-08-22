@@ -203,7 +203,7 @@ class BlockingProvider:
 def _patch_provider_settings(module: object) -> None:
     module.load_provider_settings = lambda: None  # type: ignore[attr-defined]
     module.resolve_provider_selection = (  # type: ignore[attr-defined]
-        lambda settings, model=None: SimpleNamespace(
+        lambda settings, provider_name=None, model=None: SimpleNamespace(
             provider=SimpleNamespace(name="fake"), model="fake"
         )
     )
@@ -2321,7 +2321,7 @@ async def test_unknown_agent_type_is_reported(tmp_path: Path) -> None:
 
 
 class CapturingProvider:
-    """Records system + messages + tools per request, then plays scripted streams."""
+    """Records system + messages per request, then plays scripted streams."""
 
     def __init__(self, streams: list[list[object]]) -> None:
         self._streams = iter(streams)
@@ -2340,19 +2340,201 @@ class CapturingProvider:
         return iterator()
 
 
+def _fork_parent(tmp_path: Path) -> RecordingSession:
+    session = RecordingSession(tmp_path)
+    session.messages = [
+        UserMessage(content="find the bug"),
+        AssistantMessage(
+            content=[
+                TextContent(text="spawning a fork"),
+                ToolCall(id="call-fork", name="agent"),
+            ],
+            stop_reason="toolUse",
+        ),
+    ]
+    return session
+
+
+def _patch_fork_resolution(module: object, provider: object) -> list[tuple]:
+    """Patch provider factories, recording (provider_name, model) per resolve."""
+    resolutions: list[tuple] = []
+    module.load_provider_settings = lambda: None  # type: ignore[attr-defined]
+
+    def fake_resolve(settings, provider_name=None, model=None):  # noqa: ANN001, ANN202
+        resolutions.append((provider_name, model))
+        return SimpleNamespace(
+            provider=SimpleNamespace(name=provider_name or "fake"),
+            model=model or "fake",
+        )
+
+    module.resolve_provider_selection = fake_resolve  # type: ignore[attr-defined]
+    module.create_model_provider = (  # type: ignore[attr-defined]
+        lambda provider_arg, model, thinking_level: provider
+    )
+    return resolutions
+
+
+async def test_fork_inherits_history_prompt_and_model(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(_fork_parent(tmp_path))
+    module = _extension_module()
+    provider = CapturingProvider([_text_stream("fork done")])
+    resolutions = _patch_fork_resolution(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    result = await agent_tool.execute(
+        "call-1",
+        {
+            "prompt": "review the diff",
+            "description": "d",
+            "subagent_type": "fork",
+            "model": "gpt-9",  # ignored: forks run the parent's model
+            "thinking": "nonsense",  # ignored (not rejected) likewise
+            "inherit_context": True,  # ignored: redundant with the real history
+        },
+    )
+    assert "fork done" in result.text
+    # Parent's provider and model, not the gpt-9 override.
+    assert resolutions == [("fake", "fake")]
+    call = provider.calls[0]
+    # System prompt is the parent's, byte-identical.
+    assert call["system"] == "You are Tau."
+    messages = call["messages"]
+    assert messages[0].text == "find the bug"
+    assert messages[1].tool_calls[0].id == "call-fork"
+    # The dangling agent call is closed with a neutral (non-error) filler.
+    filler = messages[2]
+    assert filler.role == "toolResult"
+    assert filler.tool_call_id == "call-fork"
+    assert filler.is_error is False
+    # The task prompt is the next user turn, wrapped in the fork framing.
+    task = messages[3].text
+    assert task.startswith("<fork_task>")
+    assert "review the diff" in task
+    # inherit_context is ignored: no digest on top of the real history.
+    assert "# Parent Conversation Context" not in task
+
+
+async def test_fork_entries_are_parent_chained(tmp_path: Path) -> None:
+    """The parent_id chain is load-bearing: the child's first persisted turn
+    replays root-to-leaf, and unchained entries are silently dropped by Tau's
+    missing-parent detachment."""
+    _load_runtime(tmp_path)
+    fork_mod = _submodule("fork")
+    capture = fork_mod.ForkCapture(
+        system_prompt="You are Tau.",
+        model="fake",
+        provider_name="fake",
+        messages=(
+            UserMessage(content="q"),
+            AssistantMessage(content="a"),
+        ),
+    )
+    entries = fork_mod.build_fork_entries(capture, tmp_path)
+    assert entries[0].type == "session_info"
+    assert entries[0].parent_id is None
+    for previous, entry in zip(entries, entries[1:], strict=False):
+        assert entry.parent_id == previous.id
+
+
+async def test_fork_keeps_seed_in_provider_context_across_turns(
+    tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(_fork_parent(tmp_path))
+    module = _extension_module()
+    provider = CapturingProvider(
+        [_tool_call_stream("working", "c1"), _text_stream("done")]
+    )
+    _patch_fork_resolution(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        "call-1",
+        {"prompt": "task", "description": "d", "subagent_type": "fork"},
+    )
+    # Second request still carries the full seed: 3 seeded (user, assistant,
+    # filler) + task prompt + assistant tool call + its tool result.
+    second = provider.calls[1]["messages"]
+    assert len(second) == 6
+    assert second[0].text == "find the bug"
+
+
+async def test_fork_output_file_skips_inherited_messages(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(_fork_parent(tmp_path))
+    module = _extension_module()
+    provider = CapturingProvider([_text_stream("fork done")])
+    _patch_fork_resolution(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        "call-1",
+        {"prompt": "task", "description": "d", "subagent_type": "fork"},
+    )
+    transcripts = list(Path(tmp_path, "subagents-transcripts").rglob("*.jsonl"))
+    assert len(transcripts) == 1
+    lines = transcripts[0].read_text().splitlines()
+    entries = [json.loads(line) for line in lines]
+    # Prompt entry (with the inherited count) + the one new assistant message.
+    assert len(entries) == 2
+    assert entries[0]["inheritedMessages"] == 3
+    assert "find the bug" not in transcripts[0].read_text()
+
+
+async def test_fork_cannot_be_resumed_and_name_is_reserved(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(_fork_parent(tmp_path))
+    module = _extension_module()
+    provider = CapturingProvider([_text_stream("fork done")])
+    _patch_fork_resolution(module, provider)
+
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        "call-1",
+        {"prompt": "task", "description": "d", "subagent_type": "fork"},
+    )
+    result = await agent_tool.execute(
+        "call-2", {"prompt": "more", "description": "d", "resume": "agent-1"}
+    )
+    assert "cannot be resumed" in result.text
+
+    result = await agent_tool.execute(
+        "call-3",
+        {
+            "prompt": "x",
+            "description": "d",
+            "subagent_type": "fork",
+            "schedule": "5m",
+        },
+    )
+    assert "Cannot schedule a fork" in result.text
+
+    # A user fork.md must not overwrite the built-in fork type.
+    agents_mod = _submodule("agents")
+    home = tmp_path / "fake-home"
+    (home / ".tau" / "agents").mkdir(parents=True)
+    (home / ".tau" / "agents" / "fork.md").write_text(
+        "---\ndescription: not a fork\n---\nplain prompt\n"
+    )
+    definitions = agents_mod.load_agent_definitions(tmp_path, home)
+    assert definitions["fork"].fork is True
+
+
 async def test_children_load_extensions_and_isolated_opts_out(
     tmp_path: Path, _isolate_home: Path
 ) -> None:
-    """Children discover extensions natively, so subagents can spawn subagents;
-    `isolated: true` restores a core-tools-only child."""
+    """Children discover extensions natively (subagents can spawn subagents);
+    `isolated: true` restores a core-tools-only child; forks always keep the
+    extension tools so their tool pool matches the parent's."""
     extensions_dir = _isolate_home / ".tau" / "extensions"
     extensions_dir.mkdir(parents=True)
     (extensions_dir / "tau-subagents").symlink_to(EXTENSION_DIR)
 
     runtime = _load_runtime(tmp_path)
-    runtime.bind(RecordingSession(tmp_path))
+    runtime.bind(_fork_parent(tmp_path))
     module = _extension_module()
-    providers = [CapturingProvider([_text_stream("done")]) for _ in range(2)]
+    providers = [CapturingProvider([_text_stream("done")]) for _ in range(3)]
     _patch_provider_sequence(module, list(providers))
 
     agent_tool = _agent_tool(runtime)
@@ -2360,9 +2542,15 @@ async def test_children_load_extensions_and_isolated_opts_out(
     await agent_tool.execute(
         "call-2", {"prompt": "t", "description": "d", "isolated": True}
     )
+    await agent_tool.execute(
+        "call-3",
+        {"prompt": "t", "description": "d", "subagent_type": "fork", "isolated": True},
+    )
 
     def tool_names(provider: CapturingProvider) -> set[str]:
         return {tool.name for tool in provider.calls[0]["tools"]}
 
     assert "agent" in tool_names(providers[0])
     assert "agent" not in tool_names(providers[1])
+    # Fork ignores `isolated`: parity with the parent's pool wins.
+    assert "agent" in tool_names(providers[2])
