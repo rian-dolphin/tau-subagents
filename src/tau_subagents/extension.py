@@ -566,8 +566,16 @@ class SubagentManager:
         provider = create_model_provider(
             selection.provider,
             model=selection.model,
+            # Forks pass no override so the provider's persisted per-model
+            # level applies — the same source the parent's session used. Any
+            # other level would put a different thinking config in the fork's
+            # request and cost (part of) the shared prompt cache.
             thinking_level=(
-                definition.thinking or run.requested_thinking or DEFAULT_THINKING_LEVEL
+                None
+                if definition.fork
+                else definition.thinking
+                or run.requested_thinking
+                or DEFAULT_THINKING_LEVEL
             ),
         )
         run.provider = provider

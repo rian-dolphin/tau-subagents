@@ -2356,21 +2356,23 @@ def _fork_parent(tmp_path: Path) -> RecordingSession:
 
 
 def _patch_fork_resolution(module: object, provider: object) -> list[tuple]:
-    """Patch provider factories, recording (provider_name, model) per resolve."""
+    """Patch provider factories, recording (provider_name, model, thinking)."""
     resolutions: list[tuple] = []
     module.load_provider_settings = lambda: None  # type: ignore[attr-defined]
 
     def fake_resolve(settings, provider_name=None, model=None):  # noqa: ANN001, ANN202
-        resolutions.append((provider_name, model))
+        resolutions.append([provider_name, model])
         return SimpleNamespace(
             provider=SimpleNamespace(name=provider_name or "fake"),
             model=model or "fake",
         )
 
+    def fake_create(provider_arg, model, thinking_level):  # noqa: ANN001, ANN202
+        resolutions[-1].append(thinking_level)
+        return provider
+
     module.resolve_provider_selection = fake_resolve  # type: ignore[attr-defined]
-    module.create_model_provider = (  # type: ignore[attr-defined]
-        lambda provider_arg, model, thinking_level: provider
-    )
+    module.create_model_provider = fake_create  # type: ignore[attr-defined]
     return resolutions
 
 
@@ -2394,8 +2396,10 @@ async def test_fork_inherits_history_prompt_and_model(tmp_path: Path) -> None:
         },
     )
     assert "fork done" in result.text
-    # Parent's provider and model, not the gpt-9 override.
-    assert resolutions == [("fake", "fake")]
+    # Parent's provider and model, not the gpt-9 override; no thinking
+    # override, so the provider's persisted per-model level applies (the
+    # same source the parent used — any other level costs cache).
+    assert resolutions == [["fake", "fake", None]]
     call = provider.calls[0]
     # System prompt is the parent's, byte-identical.
     assert call["system"] == "You are Tau."

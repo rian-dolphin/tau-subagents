@@ -180,8 +180,9 @@ Notes:
 - `inherit_context` is redundant for forks and ignored.
 - Token figures are not comparable to other agent types: the inherited
   prefix bills as input on the fork's first turn.
-- The parent's thinking level is not exposed to extensions, so forks run
-  the default thinking level.
+- Forks pass no thinking override: the provider's persisted per-model
+  level applies — the same source the parent used, keeping the thinking
+  config in the fork's requests identical to the parent's.
 - The fork's output file records only its own messages
   (`inheritedMessages: N` marks the seeded prefix).
 
