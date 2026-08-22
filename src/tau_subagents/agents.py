@@ -43,6 +43,10 @@ class AgentDefinition:
     memory: str | None = None
     isolation: str | None = None
     inherit_context: bool | None = None
+    # Built-in only (not parseable from frontmatter): fork-ness overrides
+    # tools, model, thinking, and the whole prompt assembly, so a .md file
+    # declaring it would have every other key silently ignored.
+    fork: bool = False
 
 
 DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
@@ -52,6 +56,15 @@ DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
             "General-purpose agent with the full coding toolset for research and"
             " multi-step tasks."
         ),
+    ),
+    AgentDefinition(
+        name="fork",
+        description=(
+            "Fork of the current conversation: inherits the full history,"
+            " system prompt, tools, and model. Use for side tasks that need"
+            " everything discussed so far without re-explaining it."
+        ),
+        fork=True,
     ),
     AgentDefinition(
         name="explore",
@@ -74,6 +87,10 @@ def load_agent_definitions(cwd: Path, home: Path | None = None) -> dict[str, Age
         if not agents_dir.is_dir():
             continue
         for path in sorted(agents_dir.glob("*.md")):
+            # "fork" is reserved: a user file would silently turn forks into
+            # ordinary subagents (fork-ness is not a frontmatter feature).
+            if path.stem == "fork":
+                continue
             definition = _load_definition(path)
             if definition is not None:
                 definitions[definition.name] = definition
