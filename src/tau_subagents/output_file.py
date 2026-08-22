@@ -170,11 +170,17 @@ def sweep_transcripts(
 class OutputFileWriter:
     """Appends transcript entries for one run to its JSONL output file."""
 
-    def __init__(self, path: Path, agent_id: str, cwd: Path) -> None:
+    def __init__(
+        self, path: Path, agent_id: str, cwd: Path, *, inherited: int = 0
+    ) -> None:
         self.path = path
         self._agent_id = agent_id
         self._cwd = cwd
-        self._written = 1  # index 0 is the prompt, written by write_initial
+        # index 0 is the prompt, written by write_initial. Forks additionally
+        # seed `inherited` parent messages into the session; skipping them
+        # keeps the whole parent transcript out of the durable file.
+        self._inherited = inherited
+        self._written = 1 + inherited
 
     async def write_initial(self, prompt: str) -> None:
         await asyncio.to_thread(self._write_initial_blocking, prompt)
@@ -188,9 +194,10 @@ class OutputFileWriter:
             root.mkdir(parents=True, exist_ok=True)
             os.chmod(root, 0o700)
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._append(
-                self._entry("user", {"role": "user", "content": prompt})
-            )
+            entry = self._entry("user", {"role": "user", "content": prompt})
+            if self._inherited:
+                entry["inheritedMessages"] = self._inherited
+            self._append(entry)
         except OSError:
             pass
 

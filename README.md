@@ -122,10 +122,11 @@ rebinds always land exactly one strip.
 
 ## Agent types
 
-Two built-in types ship with the extension:
+Three built-in types ship with the extension:
 
 - `general` — full coding toolset, for research and multi-step tasks
 - `explore` — read-only (`read` + `bash`), for searching and summarizing
+- `fork` — a fork of the current conversation (see "Forking the conversation")
 
 Add your own as markdown files at `.tau/agents/<name>.md` (project) or
 `~/.tau/agents/<name>.md` (user). The filename is the type name, the body is
@@ -141,7 +142,10 @@ You are a security reviewer. Investigate the code you are pointed at and
 report vulnerabilities with file references.
 ```
 
-Project definitions win over user definitions with the same name.
+Project definitions win over user definitions with the same name. The name
+`fork` is reserved — a `fork.md` file is ignored (fork behavior overrides
+tools, model, and prompt assembly, so nothing in a definition file could
+apply).
 
 Agent-type frontmatter also supports:
 
@@ -150,6 +154,58 @@ Agent-type frontmatter also supports:
 - `prompt_mode` — `replace` (default) or `append` (see below)
 - `memory` — `user`, `project`, or `local` persistent memory (see below)
 - `isolation` — `worktree` to run in an isolated git worktree (see below)
+
+## Forking the conversation (`fork`)
+
+`subagent_type: fork` spawns a child that **inherits the entire
+conversation** (Claude Code's fork subagent, ADR 0005): the parent's system
+prompt byte-identical, the parent's model and provider (`model`/`thinking`
+params are rejected with an explanation, never silently dropped — the
+parent must not believe it spawned a cheaper model), the full toolset —
+children discover the same
+extensions as the parent, so the serialized tool pool matches and the
+prompt cache prefix is shared — and the real message history, seeded into
+the child session as actual entries, not the text digest `inherit_context`
+builds. The task prompt becomes the next user turn, wrapped in a
+`<fork_task>` block.
+
+> Fork the conversation to draft unit tests for the parser changes so far,
+> in the background.
+
+Notes:
+
+- The in-flight `agent` call that spawned the fork is closed in the fork's
+  copy with a neutral `(forked here …)` tool result.
+- Forks are one-shot: `resume` and `schedule` are rejected. Worktree
+  isolation and foreground/background both work (foreground forks are a
+  deliberate divergence from Claude Code's background-only forks).
+- `inherit_context` is redundant for forks and ignored.
+- Token figures are not comparable to other agent types: the inherited
+  prefix bills as input on the fork's first turn.
+- Forks pass no thinking override: the provider's persisted per-model
+  level applies — the same source the parent used, keeping the thinking
+  config in the fork's requests identical to the parent's.
+- The fork's output file records only its own messages
+  (`inheritedMessages: N` marks the seeded prefix).
+
+### Fork or `inherit_context`?
+
+Both give a subagent the parent conversation. They are different tools.
+
+| | `general` + `inherit_context` | `fork` |
+|---|---|---|
+| History | A text digest of the user and assistant turns. Tool calls and tool results are not included. | The real messages, complete. |
+| System prompt | The prompt of the agent type. | The prompt of the parent. The bytes are identical. |
+| Model, thinking | Free choice. | The parent's. Overrides are rejected. |
+| Tools | The allow-list of the agent type. | The exact tool pool of the parent. |
+| Prompt cache | Its own cache, cold at the start. | The cache of the parent, shared. |
+| Resume, schedule | Both work. | Both are rejected. |
+
+Use a fork when the task needs the full context on the same model. The
+digest does not contain the file contents, the command output, or the
+diffs that tool calls produced; a fork saw all of them. Use `general`
+with `inherit_context` when a summary is sufficient, or when you want a
+different or cheaper model — a fork cannot change the model.
 
 ## Worktree isolation
 
@@ -407,8 +463,9 @@ default.
   subagents recursively — including this extension's own tools. There is no
   depth limit; pass `isolated: true` on the `agent` tool to spawn a child
   without extensions (core tools only, no further spawning), pi's `isolated`
-  param. Child sessions never fire `session_start`, so a child's extension
-  instance registers tools but starts no scheduler, UI, or retention sweep.
+  param. Forks reject `isolated` — their tool pool must match the parent's.
+  Child sessions never fire `session_start`, so a child's extension instance
+  registers tools but starts no scheduler, UI, or retention sweep.
 - Live activity while a subagent works is the spinner + elapsed timer on its
   tool row and the in-place view (see "Live activity").
 - `/reload` rebuilds extension state; background runs in flight at reload
