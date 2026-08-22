@@ -42,7 +42,11 @@ Details, each chosen over an alternative:
   model fidelity lives in provider selection instead, which resolves
   against the parent's provider name and model explicitly (the default
   provider may not declare the parent's model). The parent's thinking
-  level is not exposed to extensions, so the default applies.
+  level is not exposed to extensions, so forks pass no override and the
+  provider's persisted per-model level applies — the same source the
+  parent's session used, keeping the thinking config in the fork's
+  requests identical (a differing thinking config costs prompt cache;
+  exposing the live level on `ExtensionContext` is a small upstream ask).
 - **Dangling tool calls are closed at capture time** with a neutral
   non-error filler result. Tau's own repair would fill them with an
   is-error "interrupted" message — the fork's first sight of its origin
