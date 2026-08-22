@@ -69,9 +69,10 @@ def run_messages(run: AgentRun) -> tuple:
     session = run.session
     if session is not None:
         try:
-            # Forks seed the parent transcript into the session; show only
-            # the run's own messages, not a replay of the parent view.
-            return tuple(session.messages)[run.fork_inherited or 0 :]
+            # Forks seed the parent transcript into the session; it is shown
+            # too — the viewer is the fork's full context, and hiding the
+            # inherited prefix made the fork look like it started fresh.
+            return tuple(session.messages)
         except Exception:  # noqa: BLE001 - a closing session must not break the view
             return ()
     if run.status == "queued":
