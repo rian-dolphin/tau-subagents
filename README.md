@@ -188,6 +188,25 @@ Notes:
 - The fork's output file records only its own messages
   (`inheritedMessages: N` marks the seeded prefix).
 
+### Fork or `inherit_context`?
+
+Both give a subagent the parent conversation. They are different tools.
+
+| | `general` + `inherit_context` | `fork` |
+|---|---|---|
+| History | A text digest of the user and assistant turns. Tool calls and tool results are not included. | The real messages, complete. |
+| System prompt | The prompt of the agent type. | The prompt of the parent. The bytes are identical. |
+| Model, thinking | Free choice. | The parent's. Overrides are rejected. |
+| Tools | The allow-list of the agent type. | The exact tool pool of the parent. |
+| Prompt cache | Its own cache, cold at the start. | The cache of the parent, shared. |
+| Resume, schedule | Both work. | Both are rejected. |
+
+Use a fork when the task needs the full context on the same model. The
+digest does not contain the file contents, the command output, or the
+diffs that tool calls produced; a fork saw all of them. Use `general`
+with `inherit_context` when a summary is sufficient, or when you want a
+different or cheaper model — a fork cannot change the model.
+
 ## Worktree isolation
 
 Pass `isolation: "worktree"` to the `agent` tool (or set it in agent-type
