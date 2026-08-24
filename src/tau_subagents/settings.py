@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 JOIN_MODES = ("async", "group", "smart")
-TRANSCRIPT_RETENTION_DAYS_DEFAULT = 14
+TRANSCRIPT_RETENTION_DAYS_DEFAULT: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,9 +30,9 @@ class SubagentSettings:
     default_max_turns: int | None = None
     grace_turns: int = 5
     default_join_mode: str = "smart"
-    # ADR 0003: durable transcripts under ~/.tau/subagents/, swept after this
-    # many days. 0 disables durability (old temp-directory behavior).
-    transcript_retention_days: int = TRANSCRIPT_RETENTION_DAYS_DEFAULT
+    # ADR 0003: durable transcripts under ~/.tau/subagents/. None keeps them
+    # indefinitely; a positive value sweeps by age; 0 uses ephemeral storage.
+    transcript_retention_days: int | None = TRANSCRIPT_RETENTION_DAYS_DEFAULT
 
 
 def load_subagent_settings(cwd: Path, home: Path | None = None) -> SubagentSettings:

@@ -268,14 +268,14 @@ async def test_settings_defaults_overrides_and_validation(tmp_path: Path) -> Non
     assert defaults.default_max_turns is None
     assert defaults.grace_turns == 5
     assert defaults.default_join_mode == "smart"
-    assert defaults.transcript_retention_days == 14
+    assert defaults.transcript_retention_days is None  # unlimited retention
 
     # transcriptRetentionDays: 0 (opt out) is in range; negatives are dropped.
     (cwd / ".tau").mkdir(parents=True)
     (cwd / ".tau" / "subagents.json").write_text('{"transcriptRetentionDays": 0}')
     assert load(cwd, home=home).transcript_retention_days == 0
     (cwd / ".tau" / "subagents.json").write_text('{"transcriptRetentionDays": -1}')
-    assert load(cwd, home=home).transcript_retention_days == 14
+    assert load(cwd, home=home).transcript_retention_days is None
     (cwd / ".tau" / "subagents.json").write_text('{}')
 
     (home / ".tau").mkdir(parents=True)

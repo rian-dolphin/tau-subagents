@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-08-17).
+Accepted (2026-08-17). Amended 2026-08-24 to retain transcripts indefinitely by default.
 
 ## Context
 
@@ -36,7 +36,8 @@ Add a retention sweep:
 - Run the sweep on the `session_start` hook, in a thread.
 - Delete transcript files that are older than the retention period.
 - Remove the directories that become empty. Keep the root.
-- Make the period a setting, `transcriptRetentionDays`, with a default of 14 days.
+- Make the period a setting, `transcriptRetentionDays`. By default it is unset
+  and transcripts are retained indefinitely; a positive value enables the sweep.
 - A value of 0 keeps the old temp-directory behavior and stops the sweep.
 
 Add the environment variable `TAU_SUBAGENTS_DIR`.
@@ -57,6 +58,7 @@ Until then, `TAU_SUBAGENTS_DIR` is the manual escape hatch.
 ## Consequences
 
 - Transcripts of scheduled and background jobs survive a reboot.
-- Disk use stays bounded because the sweep removes old files.
+- Disk use is unbounded by default, matching regular Tau sessions. Users can
+  opt into age-based cleanup with `transcriptRetentionDays`.
 - The `<output-file>` tag, the spawn result, and the `get_subagent_result` header show the new path.
 - The files stay out of the Tau session pickers because they are not in `~/.tau/sessions/`.

@@ -177,8 +177,9 @@ path is shown in background spawn results (`Output file: ...`), in completion
 notifications (`<output-file>` tag), and in `get_subagent_result` output, so
 you can `tail` a long-running agent from outside the conversation.
 
-A retention sweep runs on session start and deletes transcripts older than
-`transcriptRetentionDays` (default 14). Set it to `0` to opt out of durable
+Transcripts are retained indefinitely by default. Set
+`transcriptRetentionDays` to a positive number to run a retention sweep on
+session start and delete older transcripts. Set it to `0` to opt out of durable
 storage entirely — transcripts then go to the old per-uid location in the
 system temp directory. `TAU_SUBAGENTS_DIR` overrides the durable root
 (useful for tests or a relocated Tau home).
@@ -396,7 +397,7 @@ user (missing or malformed files are ignored):
 | `defaultMaxTurns` | int 0–10000 | unlimited | default turn limit (`0` = unlimited) |
 | `graceTurns` | int 1–1000 | 5 | extra turns allowed after the soft limit |
 | `defaultJoinMode` | `async`\|`group`\|`smart` | `smart` | background notification batching (see Join modes) |
-| `transcriptRetentionDays` | int 0–3650 | 14 | days to keep durable transcripts (`0` = temp-dir storage, no sweep) |
+| `transcriptRetentionDays` | int 0–3650 | unlimited | days to keep durable transcripts (`0` = temp-dir storage, no sweep) |
 
 Out-of-range or wrong-typed values are silently dropped and the field keeps its
 default.

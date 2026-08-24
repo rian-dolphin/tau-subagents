@@ -278,9 +278,9 @@ class SubagentManager:
                 self._api.context.cwd,
                 self._api.context.session_id,
                 run.agent_id,
-                # transcriptRetentionDays: 0 opts out of durable storage
-                # (ADR 0003) and keeps the old temp-directory location.
-                durable=self._get_settings().transcript_retention_days > 0,
+                # transcriptRetentionDays: 0 opts out of durable storage;
+                # an unset value keeps durable transcripts indefinitely.
+                durable=self._get_settings().transcript_retention_days != 0,
             ),
             run.agent_id,
             self._api.context.cwd,
@@ -1075,7 +1075,7 @@ def setup(tau: ExtensionAPI) -> None:
         # ADR 0003: age out durable transcripts. Best-effort and off-loop so
         # an enormous or slow ~/.tau/subagents/ tree cannot delay startup.
         retention = manager._get_settings().transcript_retention_days
-        if retention > 0:
+        if retention is not None and retention > 0:
             try:
                 await asyncio.to_thread(sweep_transcripts, retention)
             except OSError:

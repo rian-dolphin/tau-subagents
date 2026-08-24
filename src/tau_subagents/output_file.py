@@ -8,9 +8,10 @@ survives reboots (upstream pi-subagents keeps child sessions durable too):
 
 The directory name mirrors `tau_coding.paths.project_session_dir` but lives
 outside `~/.tau/sessions/` so Tau's session index never sees these files.
-A retention sweep (`sweep_transcripts`, run on session_start) deletes files
-older than `transcriptRetentionDays`; setting that to 0 falls back to the
-old ephemeral location in the system temp directory.
+By default transcripts are kept indefinitely. When `transcriptRetentionDays`
+is positive, a retention sweep (`sweep_transcripts`, run on session_start)
+deletes older files; setting it to 0 falls back to the old ephemeral location
+in the system temp directory.
 
 The initial entry is the prompt; each `turn_end` flushes new session
 messages. Write errors are swallowed and all IO runs in a thread.
