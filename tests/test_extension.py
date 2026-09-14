@@ -108,7 +108,7 @@ def _extension_module() -> object:
 def _patch_fake_provider(module: object, *, response: str) -> None:
     module.load_provider_settings = lambda: None  # type: ignore[attr-defined]
     module.resolve_provider_selection = (  # type: ignore[attr-defined]
-        lambda settings, model=None: SimpleNamespace(
+        lambda settings, provider_name=None, model=None: SimpleNamespace(
             provider=SimpleNamespace(name="fake"),
             model="fake",
         )
@@ -203,7 +203,7 @@ class BlockingProvider:
 def _patch_provider_settings(module: object) -> None:
     module.load_provider_settings = lambda: None  # type: ignore[attr-defined]
     module.resolve_provider_selection = (  # type: ignore[attr-defined]
-        lambda settings, model=None: SimpleNamespace(
+        lambda settings, provider_name=None, model=None: SimpleNamespace(
             provider=SimpleNamespace(name="fake"), model="fake"
         )
     )
@@ -225,18 +225,20 @@ def _patch_provider_sequence(module: object, providers: list[object]) -> None:
 
 
 def _patch_recording_provider(
-    module: object, providers: list[object]
-) -> tuple[list[object], list[object]]:
-    """Patch provider factories, recording model and thinking_level per spawn."""
+    module: object, provider_instances: list[object]
+) -> tuple[list[object], list[object], list[object]]:
+    """Patch provider factories, recording provider, model, and thinking per spawn."""
+    provider_names: list[object] = []
     models: list[object] = []
     thinking_levels: list[object] = []
     module.load_provider_settings = lambda: None  # type: ignore[attr-defined]
 
-    def fake_resolve(settings, model=None):  # noqa: ANN001, ANN202
+    def fake_resolve(settings, provider_name=None, model=None):  # noqa: ANN001, ANN202
+        provider_names.append(provider_name)
         models.append(model)
         return SimpleNamespace(provider=SimpleNamespace(name="fake"), model="fake")
 
-    provider_iter = iter(providers)
+    provider_iter = iter(provider_instances)
 
     def fake_create(provider, model, thinking_level):  # noqa: ANN001, ANN202
         thinking_levels.append(thinking_level)
@@ -244,7 +246,7 @@ def _patch_recording_provider(
 
     module.resolve_provider_selection = fake_resolve  # type: ignore[attr-defined]
     module.create_model_provider = fake_create  # type: ignore[attr-defined]
-    return models, thinking_levels
+    return provider_names, models, thinking_levels
 
 
 async def _wait_for(condition, *, tries: int = 500) -> None:  # noqa: ANN001
@@ -1351,20 +1353,28 @@ async def test_model_and_thinking_param_precedence(tmp_path: Path) -> None:
     (tmp_path / ".tau" / "agents" / "pinned.md").write_text(
         "---\ndescription: Pinned agent\nmodel: pinned-model\nthinking: low\n---\nBody."
     )
-    models, thinking_levels = _patch_recording_provider(
+    provider_names, models, thinking_levels = _patch_recording_provider(
         module, [FakeProvider([_text_stream("done")]) for _ in range(3)]
     )
 
     agent_tool = _agent_tool(runtime)
     await agent_tool.execute(
         "call-1",
-        {"prompt": "x", "description": "x", "model": "haiku", "thinking": "high"}
+        {
+            "prompt": "x",
+            "description": "x",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "thinking": "high",
+        }
     )
-    assert models[-1] == "haiku"  # param used when frontmatter has none
+    assert provider_names[-1] == "openai-codex"
+    assert models[-1] == "gpt-5.6-sol"  # param used when frontmatter has none
     assert thinking_levels[-1] == "high"
 
     await agent_tool.execute("call-1", {"prompt": "x", "description": "x"})
-    assert models[-1] is None  # parent default
+    assert provider_names[-1] is None  # configured default
+    assert models[-1] is None  # configured default
     assert thinking_levels[-1] == "medium"  # DEFAULT_THINKING_LEVEL
 
     await agent_tool.execute(

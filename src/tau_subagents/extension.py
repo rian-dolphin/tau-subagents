@@ -152,6 +152,7 @@ class AgentRun:
     # requested_model below is only the tool-param request, which frontmatter
     # may override — the viewer header shows this resolved value.
     model: str | None = None
+    requested_provider: str | None = None
     requested_model: str | None = None
     requested_thinking: str | None = None
     requested_max_turns: int | None = None
@@ -255,6 +256,7 @@ class SubagentManager:
         background: bool,
         max_turns: int | None = None,
         isolation: str | None = None,
+        provider: str | None = None,
         model: str | None = None,
         thinking: str | None = None,
         bypass_queue: bool = False,
@@ -267,6 +269,7 @@ class SubagentManager:
             description=description,
             prompt=prompt,
             background=background,
+            requested_provider=provider,
             requested_model=model,
             requested_thinking=thinking,
             requested_max_turns=max_turns,
@@ -538,7 +541,9 @@ class SubagentManager:
         # Frontmatter wins over the tool param, per pi precedence.
         provider_settings = load_provider_settings()
         selection = resolve_provider_selection(
-            provider_settings, model=definition.model or run.requested_model
+            provider_settings,
+            provider_name=run.requested_provider,
+            model=definition.model or run.requested_model,
         )
         provider = create_model_provider(
             selection.provider,
@@ -1117,6 +1122,9 @@ def setup(tau: ExtensionAPI) -> None:
             parent_context = build_parent_context(tau.context.transcript)
             if parent_context:
                 prompt = parent_context + prompt
+        provider = (
+            str(arguments.get("provider")) if arguments.get("provider") else None
+        )
         model = str(arguments.get("model")) if arguments.get("model") else None
         thinking = arguments.get("thinking")
         if thinking is not None:
@@ -1134,6 +1142,7 @@ def setup(tau: ExtensionAPI) -> None:
             background=background,
             max_turns=max_turns,
             isolation=isolation,
+            provider=provider,
             model=model,
             thinking=thinking,
             isolated=isolated,
@@ -1289,6 +1298,11 @@ def setup(tau: ExtensionAPI) -> None:
                 schedule=str(arguments.get("schedule")),
                 subagent_type=agent_type,
                 prompt=prompt,
+                provider=(
+                    str(arguments.get("provider"))
+                    if arguments.get("provider")
+                    else None
+                ),
                 model=str(arguments.get("model")) if arguments.get("model") else None,
                 thinking=thinking,
                 max_turns=_coerce_max_turns(arguments.get("max_turns")),
@@ -1462,10 +1476,15 @@ def setup(tau: ExtensionAPI) -> None:
                         "type": "boolean",
                         "description": "Return immediately and notify on completion.",
                     },
+                    "provider": {
+                        "type": "string",
+                        "description": "Exact Tau provider ID for the subagent"
+                        " (default: the configured provider).",
+                    },
                     "model": {
                         "type": "string",
-                        "description": "Model for the subagent (default: the agent"
-                        " type's model, else the parent's).",
+                        "description": "Exact model ID for the subagent (default:"
+                        " the agent type's model, else the configured model).",
                     },
                     "thinking": {
                         "type": "string",

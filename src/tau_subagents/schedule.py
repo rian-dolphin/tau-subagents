@@ -120,6 +120,7 @@ class SubagentScheduler:
         schedule: str,
         subagent_type: str,
         prompt: str,
+        provider: str | None = None,
         model: str | None = None,
         thinking: str | None = None,
         max_turns: int | None = None,
@@ -139,6 +140,7 @@ class SubagentScheduler:
             interval_ms=interval_ms,
             subagent_type=subagent_type,
             prompt=prompt,
+            provider=provider,
             model=model,
             thinking=thinking,
             max_turns=max_turns,
@@ -259,6 +261,7 @@ class SubagentScheduler:
                 bypass_queue=True,
                 max_turns=job.max_turns,
                 isolation=job.isolation,
+                provider=job.provider,
                 model=job.model,
                 thinking=job.thinking,
             )

@@ -41,6 +41,7 @@ class ScheduledSubagent:
     created_at: str
     run_count: int = 0
     interval_ms: int | None = None
+    provider: str | None = None
     model: str | None = None
     thinking: str | None = None
     max_turns: int | None = None
@@ -66,6 +67,7 @@ class ScheduledSubagent:
             "created_at",
             "run_count",
             "interval_ms",
+            "provider",
             "model",
             "thinking",
             "max_turns",
