@@ -235,15 +235,27 @@ that:
 In `prompt_mode: append` the parent prompt prefix already carries the
 parent's skill index verbatim.
 
-## Model and thinking overrides
+## Provider, model, and thinking overrides
 
-The `agent` tool accepts `model` (fuzzy or full model selection for the
-subagent; default is the agent type's `model`, else the parent's) and
-`thinking` (one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`;
-default `medium`). Agent-type frontmatter `model:` and `thinking:` win over
-the tool params, matching pi's precedence. Note: a typo'd frontmatter
-`thinking:` value is silently ignored (falls back to the param/default),
-unlike the tool param, which errors.
+The `agent` tool accepts exact `provider` and `model` IDs for the subagent. If
+`provider` is omitted, the calling session's active provider is used; if `model`
+is also omitted (and the agent type's frontmatter doesn't pin one), the calling
+session's active model is used — so subagents naturally match the parent. This
+also allows a child to use a different provider from its parent, provided that
+provider is configured and authenticated in Tau:
+
+```json
+{
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol"
+}
+```
+
+The tool also accepts `thinking` (one of `off`, `minimal`, `low`, `medium`,
+`high`, `xhigh`; default `medium`). Agent-type frontmatter `model:` and
+`thinking:` win over the corresponding tool params, matching pi's precedence.
+Note: a typo'd frontmatter `thinking:` value is silently ignored (falls back to
+the param/default), unlike the tool param, which errors.
 
 ## `prompt_mode: append`
 

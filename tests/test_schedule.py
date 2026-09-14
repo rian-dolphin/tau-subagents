@@ -186,14 +186,17 @@ def test_store_round_trip(tmp_path) -> None:  # noqa: ANN001
     store_module = _store_module()
     path = store_module.resolve_store_path(tmp_path, "session-x")
     store = store_module.ScheduleStore(path)
-    job = _make_job(store_module, model="fake", max_turns=7)
+    job = _make_job(
+        store_module, provider="openai-codex", model="gpt-5.6-sol", max_turns=7
+    )
     store.add(job)
     assert path.exists()
 
     reloaded = store_module.ScheduleStore(path)
     got = reloaded.get("job-1")
     assert got is not None
-    assert got.model == "fake"
+    assert got.provider == "openai-codex"
+    assert got.model == "gpt-5.6-sol"
     assert got.max_turns == 7
     assert got.schedule == "0 9 * * 1"
 
@@ -227,7 +230,9 @@ class _FakeApi:
     """Minimal ExtensionAPI stand-in for driving SubagentManager directly."""
 
     def __init__(self, cwd, session_id="session-1") -> None:  # noqa: ANN001
-        self.context = SimpleNamespace(cwd=cwd, session_id=session_id)
+        self.context = SimpleNamespace(
+            cwd=cwd, session_id=session_id, provider_name="fake", model="fake"
+        )
         self.followed_up: list[str] = []
         self.notifications: list[str] = []
         self.custom_entries: list[tuple[str, dict]] = []
@@ -284,6 +289,8 @@ async def test_job_fires_bypassing_full_queue(tmp_path) -> None:  # noqa: ANN001
         schedule="10s",
         subagent_type="general",
         prompt="do work",
+        provider="openai-codex",
+        model="gpt-5.6-sol",
     )
     # Fire via the real timer callback path, then await the launched run.
     scheduler._on_fire(job.id)  # noqa: SLF001
@@ -294,6 +301,7 @@ async def test_job_fires_bypassing_full_queue(tmp_path) -> None:  # noqa: ANN001
     # was occupied by the still-blocked agent-1 — proof it bypassed the queue.
     assert manager.runs["agent-1"].status == "running"
     assert manager.runs["agent-2"].status == "completed"
+    assert manager.runs["agent-2"].requested_provider == "openai-codex"
     finished = store.get(job.id)
     assert finished is not None
     assert finished.last_status == "success"
@@ -411,7 +419,13 @@ async def test_schedule_via_tool_creates_and_persists_job(tmp_path) -> None:  # 
 
     result = await _agent_tool(runtime).execute(
         "call-1",
-        {"prompt": "check the deploy", "description": "deploy watch", "schedule": "5m"}
+        {
+            "prompt": "check the deploy",
+            "description": "deploy watch",
+            "schedule": "5m",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+        }
     )
     assert "Scheduled" in result.text
     assert "job-1" in result.text
@@ -422,6 +436,8 @@ async def test_schedule_via_tool_creates_and_persists_job(tmp_path) -> None:  # 
     data = json.loads(path.read_text())
     assert data["jobs"][0]["name"] == "deploy watch"
     assert data["jobs"][0]["schedule_type"] == "interval"
+    assert data["jobs"][0]["provider"] == "openai-codex"
+    assert data["jobs"][0]["model"] == "gpt-5.6-sol"
 
     await runtime.emit_session_shutdown("quit")
 
