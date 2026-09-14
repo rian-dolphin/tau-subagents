@@ -230,7 +230,9 @@ class _FakeApi:
     """Minimal ExtensionAPI stand-in for driving SubagentManager directly."""
 
     def __init__(self, cwd, session_id="session-1") -> None:  # noqa: ANN001
-        self.context = SimpleNamespace(cwd=cwd, session_id=session_id)
+        self.context = SimpleNamespace(
+            cwd=cwd, session_id=session_id, provider_name="fake", model="fake"
+        )
         self.followed_up: list[str] = []
         self.notifications: list[str] = []
         self.custom_entries: list[tuple[str, dict]] = []

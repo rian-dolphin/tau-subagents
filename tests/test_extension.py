@@ -1373,8 +1373,8 @@ async def test_model_and_thinking_param_precedence(tmp_path: Path) -> None:
     assert thinking_levels[-1] == "high"
 
     await agent_tool.execute("call-1", {"prompt": "x", "description": "x"})
-    assert provider_names[-1] is None  # configured default
-    assert models[-1] is None  # configured default
+    assert provider_names[-1] == "fake"  # inherited from parent session
+    assert models[-1] == "fake"  # inherited from parent session
     assert thinking_levels[-1] == "medium"  # DEFAULT_THINKING_LEVEL
 
     await agent_tool.execute(

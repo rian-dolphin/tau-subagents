@@ -539,11 +539,17 @@ class SubagentManager:
         # Create the provider before the first await so concurrent spawns
         # claim providers in spawn order (tests script provider sequences).
         # Frontmatter wins over the tool param, per pi precedence.
+        # When neither the agent definition nor the tool call specifies a
+        # provider/model, inherit the parent session's active selection so
+        # subagents naturally match the caller instead of falling back to
+        # the durable Tau settings default.
+        parent_provider = self._api.context.provider_name
+        parent_model = self._api.context.model
         provider_settings = load_provider_settings()
         selection = resolve_provider_selection(
             provider_settings,
-            provider_name=run.requested_provider,
-            model=definition.model or run.requested_model,
+            provider_name=run.requested_provider or parent_provider,
+            model=definition.model or run.requested_model or parent_model,
         )
         provider = create_model_provider(
             selection.provider,
@@ -1479,12 +1485,13 @@ def setup(tau: ExtensionAPI) -> None:
                     "provider": {
                         "type": "string",
                         "description": "Exact Tau provider ID for the subagent"
-                        " (default: the configured provider).",
+                        " (default: the calling session's provider).",
                     },
                     "model": {
                         "type": "string",
                         "description": "Exact model ID for the subagent (default:"
-                        " the agent type's model, else the configured model).",
+                        " the agent type's model, else the calling session's"
+                        " model).",
                     },
                     "thinking": {
                         "type": "string",
