@@ -238,10 +238,11 @@ parent's skill index verbatim.
 ## Provider, model, and thinking overrides
 
 The `agent` tool accepts exact `provider` and `model` IDs for the subagent. If
-`provider` is omitted, Tau's configured default provider is used; if `model` is
-also omitted, that provider's configured default model is used. This allows a
-child to use a different provider from its parent, provided that provider is
-configured and authenticated in Tau:
+`provider` is omitted, the calling session's active provider is used; if `model`
+is also omitted (and the agent type's frontmatter doesn't pin one), the calling
+session's active model is used — so subagents naturally match the parent. This
+also allows a child to use a different provider from its parent, provided that
+provider is configured and authenticated in Tau:
 
 ```json
 {
