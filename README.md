@@ -159,9 +159,10 @@ Agent-type frontmatter also supports:
 
 `subagent_type: fork` spawns a child that **inherits the entire
 conversation** (Claude Code's fork subagent, ADR 0005): the parent's system
-prompt byte-identical, the parent's model and provider (`model`/`thinking`
-params are rejected with an explanation, never silently dropped — the
-parent must not believe it spawned a cheaper model), the full toolset —
+prompt byte-identical, the parent's provider, model, and thinking level
+(`provider`/`model`/`thinking` params are rejected with an explanation,
+never silently dropped — the parent must not believe it spawned a cheaper
+model), the full toolset —
 children discover the same
 extensions as the parent, so the serialized tool pool matches and the
 prompt cache prefix is shared — and the real message history, seeded into
@@ -182,9 +183,12 @@ Notes:
 - `inherit_context` is redundant for forks and ignored.
 - Token figures are not comparable to other agent types: the inherited
   prefix bills as input on the fork's first turn.
-- Forks pass no thinking override: the provider's persisted per-model
-  level applies — the same source the parent used, keeping the thinking
-  config in the fork's requests identical to the parent's.
+- Provider, model, and thinking level are snapshotted at the tool call, so
+  a queued fork runs what the parent had when it forked even if the parent
+  switches `/model` or thinking level before the fork starts. On tau-ai
+  < 0.4.0 the live thinking level is not exposed to extensions; the fork
+  then passes no override and the provider's persisted per-model level
+  applies.
 - The fork's output file records only its own messages
   (`inheritedMessages: N` marks the seeded prefix).
 

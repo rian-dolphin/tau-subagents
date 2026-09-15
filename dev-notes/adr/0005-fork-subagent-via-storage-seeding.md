@@ -47,12 +47,15 @@ Details, each chosen over an alternative:
   `state.model` would override the provider instance the manager builds;
   model fidelity lives in provider selection instead, which resolves
   against the parent's provider name and model explicitly (the default
-  provider may not declare the parent's model). The parent's thinking
-  level is not exposed to extensions, so forks pass no override and the
-  provider's persisted per-model level applies — the same source the
-  parent's session used, keeping the thinking config in the fork's
-  requests identical (a differing thinking config costs prompt cache;
-  exposing the live level on `ExtensionContext` is a small upstream ask).
+  provider may not declare the parent's model). Provider, model, and
+  thinking level are captured at tool-call time — not read live in
+  `_execute` as ordinary subagents do since #9 — so a queued fork runs
+  what the parent had when it forked, not what it switched to afterwards
+  (a differing model or thinking config costs prompt cache). The thinking
+  level comes from `ExtensionContext.thinking_level` (tau-ai >= 0.4.0,
+  tau #643); on older releases the capture is None and the provider's
+  persisted per-model level applies, which is what the parent used unless
+  it changed the level in-session.
 - **Dangling tool calls are closed at capture time** with a neutral
   non-error filler result. Tau's own repair would fill them with an
   is-error "interrupted" message — the fork's first sight of its origin
@@ -66,7 +69,7 @@ Details, each chosen over an alternative:
 - **The output file skips seeded messages** (`inherited=N` on the writer);
   otherwise every fork would dump the whole parent transcript into
   durable storage under ADR 0003 retention.
-- **Guards:** model/thinking/isolated params rejected with an explanation
+- **Guards:** provider/model/thinking/isolated params rejected with an explanation
   — never silently dropped, so the parent cannot believe it spawned a
   cheaper model while the fork runs the parent's. Resume and schedule
   rejected; `inherit_context` accepted as fulfilled. Foreground

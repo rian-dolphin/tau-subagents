@@ -579,12 +579,14 @@ class SubagentManager:
         provider = create_model_provider(
             selection.provider,
             model=selection.model,
-            # Forks pass no override so the provider's persisted per-model
-            # level applies — the same source the parent's session used. Any
-            # other level would put a different thinking config in the fork's
-            # request and cost (part of) the shared prompt cache.
+            # Forks run the parent's live thinking level (captured at
+            # tool-call time). Any other level would put a different thinking
+            # config in the fork's request and cost (part of) the shared
+            # prompt cache. When Tau does not expose the level (pre-0.4.0)
+            # the capture is None and the provider's persisted per-model
+            # level applies instead.
             thinking_level=(
-                None
+                capture.thinking_level
                 if definition.fork
                 else definition.thinking
                 or run.requested_thinking
@@ -1175,17 +1177,18 @@ def setup(tau: ExtensionAPI) -> None:
             # the parent believe it spawned a cheaper model while the fork
             # actually runs the parent's — a silent cost surprise.
             rejected = [
-                name for name in ("model", "thinking", "isolated")
+                name
+                for name in ("provider", "model", "thinking", "isolated")
                 if arguments.get(name)
             ]
             if rejected:
                 return _tool_result(
                     content=f"A fork cannot take {', '.join(rejected)} — it"
-                    " always runs the parent's model, thinking config, and"
-                    " tool pool (a different one would break the shared"
-                    " prompt cache). Omit the parameter(s), or spawn a"
+                    " always runs the parent's provider, model, thinking"
+                    " config, and tool pool (a different one would break the"
+                    " shared prompt cache). Omit the parameter(s), or spawn a"
                     " different agent type with inherit_context=true to use"
-                    " another model with the conversation context.",
+                    " another provider/model with the conversation context.",
                 )
             # Captured at tool-call time (like inherit_context): queued forks
             # see the conversation as of this call. inherit_context stays
@@ -1546,8 +1549,8 @@ def setup(tau: ExtensionAPI) -> None:
                 " continue a finished agent's session. Use inherit_context if"
                 " the agent needs a digest of the parent conversation, or the"
                 " fork type to hand it the full conversation verbatim (history,"
-                " system prompt, model — model/thinking/isolated params are"
-                " rejected, a fork always runs the parent's setup;"
+                " system prompt, model — provider/model/thinking/isolated"
+                " params are rejected, a fork always runs the parent's setup;"
                 " forks cannot be resumed or scheduled).\n\nAvailable"
                 f" agent types:\n{type_list}"
             ),
@@ -1573,19 +1576,20 @@ def setup(tau: ExtensionAPI) -> None:
                     "provider": {
                         "type": "string",
                         "description": "Exact Tau provider ID for the subagent"
-                        " (default: the calling session's provider).",
+                        " (default: the calling session's provider). Rejected"
+                        " for forks.",
                     },
                     "model": {
                         "type": "string",
                         "description": "Exact model ID for the subagent (default:"
                         " the agent type's model, else the calling session's"
-                        " model).",
+                        " model). Rejected for forks.",
                     },
                     "thinking": {
                         "type": "string",
                         "enum": list(THINKING_LEVELS),
                         "description": "Reasoning effort for the subagent"
-                        " (default: medium).",
+                        " (default: medium). Rejected for forks.",
                     },
                     "max_turns": {
                         "type": "number",

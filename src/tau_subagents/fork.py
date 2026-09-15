@@ -53,6 +53,11 @@ class ForkCapture:
     model: str
     provider_name: str
     messages: tuple[AgentMessage, ...]
+    # The parent's live thinking level, or None when the running Tau does
+    # not expose it (pre-0.4.0); None lets the provider's persisted
+    # per-model level apply, which is what the parent used unless it was
+    # changed in-session.
+    thinking_level: str | None = None
 
 
 def capture_fork(context) -> ForkCapture:  # noqa: ANN001 - ExtensionContext
@@ -70,6 +75,9 @@ def capture_fork(context) -> ForkCapture:  # noqa: ANN001 - ExtensionContext
         model=context.model,
         provider_name=context.provider_name,
         messages=tuple(messages),
+        # tau-ai >= 0.4.0 exposes the live level (tau #643); older releases
+        # fall back to the persisted per-model level.
+        thinking_level=getattr(context, "thinking_level", None),
     )
 
 

@@ -2404,9 +2404,10 @@ async def test_fork_inherits_history_prompt_and_model(tmp_path: Path) -> None:
         },
     )
     assert "fork done" in result.text
-    # Parent's provider and model; no thinking override, so the provider's
-    # persisted per-model level applies (the same source the parent used —
-    # any other level costs cache).
+    # Parent's provider and model. The pinned tau-ai (< 0.4.0) does not
+    # expose the live thinking level, so the capture is None and the
+    # provider's persisted per-model level applies; see
+    # test_fork_passes_captured_thinking_level for the >= 0.4.0 path.
     assert resolutions == [["fake", "fake", None]]
     call = provider.calls[0]
     # System prompt is the parent's, byte-identical.
@@ -2425,6 +2426,45 @@ async def test_fork_inherits_history_prompt_and_model(tmp_path: Path) -> None:
     assert "review the diff" in task
     # inherit_context is ignored: no digest on top of the real history.
     assert "# Parent Conversation Context" not in task
+
+
+async def test_fork_passes_captured_thinking_level(tmp_path: Path) -> None:
+    """With tau-ai >= 0.4.0 the parent's live thinking level is captured at
+    the tool call and forwarded verbatim, so the fork's thinking config
+    matches the parent's request (anything else costs prompt cache)."""
+    runtime = _load_runtime(tmp_path)
+    runtime.bind(_fork_parent(tmp_path))
+    module = _extension_module()
+    fork_mod = _submodule("fork")
+    provider = CapturingProvider([_text_stream("fork done")])
+    resolutions = _patch_fork_resolution(module, provider)
+
+    # capture_fork reads `thinking_level` off the context when present.
+    context = SimpleNamespace(
+        system_prompt="You are Tau.",
+        # Differs from the live session's "fake" to prove the snapshot wins
+        # over the live parent selection the non-fork path reads.
+        model="snapshot-model",
+        provider_name="snapshot-provider",
+        thinking_level="high",
+        transcript=(UserMessage(content="q"),),
+    )
+    capture = fork_mod.capture_fork(context)
+    assert capture.thinking_level == "high"
+    assert fork_mod.capture_fork(
+        SimpleNamespace(
+            system_prompt="s", model="m", provider_name="p", transcript=()
+        )
+    ).thinking_level is None
+
+    # ...and the manager hands the captured level to the provider factory.
+    module.capture_fork = lambda ctx: capture  # type: ignore[attr-defined]
+    agent_tool = _agent_tool(runtime)
+    await agent_tool.execute(
+        "call-1",
+        {"prompt": "task", "description": "d", "subagent_type": "fork"},
+    )
+    assert resolutions == [["snapshot-provider", "snapshot-model", "high"]]
 
 
 async def test_fork_entries_are_parent_chained(tmp_path: Path) -> None:
@@ -2584,10 +2624,11 @@ async def test_fork_rejects_model_thinking_and_isolated(tmp_path: Path) -> None:
             "prompt": "t",
             "description": "d",
             "subagent_type": "fork",
+            "provider": "openai-codex",
             "model": "haiku",
             "isolated": True,
         },
     )
-    assert "A fork cannot take model, isolated" in result.text
+    assert "A fork cannot take provider, model, isolated" in result.text
     assert "inherit_context" in result.text  # the suggested alternative
     assert provider.calls == []  # nothing was spawned
