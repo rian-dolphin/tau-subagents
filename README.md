@@ -158,17 +158,21 @@ Agent-type frontmatter also supports:
 ## Forking the conversation (`fork`)
 
 `subagent_type: fork` spawns a child that **inherits the entire
-conversation** (Claude Code's fork subagent, ADR 0005): the parent's system
-prompt byte-identical, the parent's provider, model, and thinking level
-(`provider`/`model`/`thinking` params are rejected with an explanation,
-never silently dropped — the parent must not believe it spawned a cheaper
-model), the full toolset —
-children discover the same
-extensions as the parent, so the serialized tool pool matches and the
-prompt cache prefix is shared — and the real message history, seeded into
-the child session as actual entries, not the text digest `inherit_context`
-builds. The task prompt becomes the next user turn, wrapped in a
-`<fork_task>` block.
+conversation** (Claude Code's fork subagent, ADR 0005):
+
+- the parent's system prompt, byte-identical;
+- the parent's provider, model, and thinking level (`provider`/`model`/
+  `thinking`/`isolated` params are rejected with an explanation, never
+  silently dropped — the parent must not believe it spawned a cheaper
+  model);
+- the full toolset — children discover the same extensions as the parent,
+  so the serialized tool pool matches and the prompt cache prefix is
+  shared;
+- the real message history, seeded into the child session as actual
+  entries, not the text digest `inherit_context` builds.
+
+The task prompt becomes the next user turn, wrapped in a `<fork_task>`
+block.
 
 > Fork the conversation to draft unit tests for the parser changes so far,
 > in the background.
@@ -206,7 +210,8 @@ Both give a subagent the parent conversation. They are different tools.
 | Model, thinking | Free choice. | The parent's. Overrides are rejected. |
 | Tools | The allow-list of the agent type. | The exact tool pool of the parent. |
 | Prompt cache | Its own cache, cold at the start. | The cache of the parent, shared. |
-| Resume, schedule | Both work. | Resume works; schedule is rejected. |
+| Resume | Works. | Works. |
+| Schedule | Works. | Rejected: a job fires later with no conversation to fork. |
 
 Use a fork when the task needs the full context on the same model. The
 digest does not contain the file contents, the command output, or the
@@ -319,6 +324,9 @@ The tool also accepts `thinking` (one of `off`, `minimal`, `low`, `medium`,
 `thinking:` win over the corresponding tool params, matching pi's precedence.
 Note: a typo'd frontmatter `thinking:` value is silently ignored (falls back to
 the param/default), unlike the tool param, which errors.
+
+None of these apply to `fork`, which always runs the parent's provider,
+model, and thinking level (see "Forking the conversation").
 
 ## `prompt_mode: append`
 

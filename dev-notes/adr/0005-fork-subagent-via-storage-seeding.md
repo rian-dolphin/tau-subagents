@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted (2026-08-21).
+Accepted (2026-08-21). Amended (2026-09-15): forks are resumable; the
+parent's thinking level is captured via `ExtensionContext.thinking_level`
+(tau-ai >= 0.4.0); the `provider` param (#9) is rejected alongside
+model/thinking/isolated; the tool description states mechanics rather than
+usage guidance.
 
 ## Context
 
@@ -65,7 +69,7 @@ Details, each chosen over an alternative:
   shared cache. Under worktree isolation it warns that absolute paths from
   the conversation point at the parent checkout. (Cache sharing also
   requires the tool pool to match — see ADR 0004, which enables extensions
-  in children; forks ignore the `isolated` param for the same reason.)
+  in children; forks reject the `isolated` param for the same reason.)
 - **The output file skips seeded messages** (`inherited=N` on the writer);
   otherwise every fork would dump the whole parent transcript into
   durable storage under ADR 0003 retention.
