@@ -1546,12 +1546,13 @@ def setup(tau: ExtensionAPI) -> None:
                 " report. Set run_in_background=true for long tasks; a completion"
                 " notification will arrive when it finishes. Use steer_subagent to"
                 " redirect a running agent, and resume=<id> with a new prompt to"
-                " continue a finished agent's session. Use inherit_context if"
-                " the agent needs a digest of the parent conversation, or the"
-                " fork type to hand it the full conversation verbatim (history,"
-                " system prompt, model — provider/model/thinking/isolated"
-                " params are rejected, a fork always runs the parent's setup;"
-                " forks cannot be resumed or scheduled).\n\nAvailable"
+                " continue a finished agent's session. Two ways to share this"
+                " conversation: inherit_context=true prepends a text digest of"
+                " the user and assistant messages only (no tool calls or"
+                " results) to a fresh agent of any type/model; subagent_type"
+                " fork runs on this conversation's actual messages, including"
+                " every tool call and result, with the same system prompt,"
+                " tools, and model, so the prompt cache is shared.\n\nAvailable"
                 f" agent types:\n{type_list}"
             ),
             parameters={
@@ -1576,20 +1577,19 @@ def setup(tau: ExtensionAPI) -> None:
                     "provider": {
                         "type": "string",
                         "description": "Exact Tau provider ID for the subagent"
-                        " (default: the calling session's provider). Rejected"
-                        " for forks.",
+                        " (default: the calling session's provider).",
                     },
                     "model": {
                         "type": "string",
                         "description": "Exact model ID for the subagent (default:"
                         " the agent type's model, else the calling session's"
-                        " model). Rejected for forks.",
+                        " model).",
                     },
                     "thinking": {
                         "type": "string",
                         "enum": list(THINKING_LEVELS),
                         "description": "Reasoning effort for the subagent"
-                        " (default: medium). Rejected for forks.",
+                        " (default: medium).",
                     },
                     "max_turns": {
                         "type": "number",
@@ -1613,14 +1613,15 @@ def setup(tau: ExtensionAPI) -> None:
                         "type": "boolean",
                         "description": "If true, spawn the agent without"
                         " extension tools (core tools only); it cannot spawn"
-                        " subagents of its own. Default: false. Rejected for"
-                        " forks.",
+                        " subagents of its own. Default: false.",
                     },
                     "inherit_context": {
                         "type": "boolean",
-                        "description": "If true, prepend the parent conversation"
-                        " history to the agent's prompt. Default: false"
-                        " (fresh context).",
+                        "description": "If true, prepend a text digest of the"
+                        " parent conversation (user and assistant messages;"
+                        " tool calls and results omitted) to the agent's"
+                        " prompt. Default: false (fresh context). No effect on"
+                        " forks, which already have the full history.",
                     },
                     "schedule": {
                         "type": "string",

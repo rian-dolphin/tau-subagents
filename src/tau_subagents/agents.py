@@ -60,9 +60,10 @@ DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
     AgentDefinition(
         name="fork",
         description=(
-            "Fork of the current conversation: inherits the full history,"
-            " system prompt, tools, and model. Use for side tasks that need"
-            " everything discussed so far without re-explaining it."
+            "Continues this conversation: starts with its full message history"
+            " (tool calls and results included), system prompt, tools, and"
+            " model. One-shot: cannot be resumed or scheduled; provider,"
+            " model, thinking, and isolated are fixed to the parent's."
         ),
         fork=True,
     ),
