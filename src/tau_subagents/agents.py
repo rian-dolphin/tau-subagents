@@ -63,7 +63,7 @@ DEFAULT_AGENT_TYPES: tuple[AgentDefinition, ...] = (
             "Continues this conversation: starts with its full message history"
             " (tool calls and results included), system prompt, tools, and"
             " model. Provider, model, thinking, and isolated are fixed to the"
-            " parent's; cannot be scheduled."
+            " parent's."
         ),
         fork=True,
     ),
