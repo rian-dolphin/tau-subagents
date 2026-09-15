@@ -47,6 +47,7 @@ from .agents_menu import (
     show_agents_menu,
     supports_menu,
 )
+from .fork import ForkCapture, build_fork_entries, capture_fork, wrap_fork_task
 from .group_join import DEFAULT_TIMEOUT, STRAGGLER_TIMEOUT, GroupJoinManager
 from .memory import prepare_memory
 from .notification_render import render_agent_result, render_notification, stat_parts
@@ -172,6 +173,12 @@ class AgentRun:
     # `isolated: true` (pi's param): spawn the child without extensions, so
     # it gets core tools only and cannot spawn subagents of its own.
     requested_isolated: bool = False
+    # Parent-session snapshot for fork runs, captured at tool-call time and
+    # cleared once the seed entries are built (it pins a full transcript copy).
+    fork_capture: ForkCapture | None = None
+    # Seeded parent message count for fork runs; None for every other agent
+    # type. Sizes the output-file skip so the seeded prefix stays out of it.
+    fork_inherited: int | None = None
     worktree: Worktree | None = None
     used_worktree: bool = False
     output_writer: OutputFileWriter | None = None
@@ -260,6 +267,7 @@ class SubagentManager:
         model: str | None = None,
         thinking: str | None = None,
         bypass_queue: bool = False,
+        fork_capture: ForkCapture | None = None,
         isolated: bool = False,
     ) -> AgentRun:
         self._counter += 1
@@ -275,6 +283,8 @@ class SubagentManager:
             requested_max_turns=max_turns,
             requested_isolation=isolation,
             requested_isolated=isolated,
+            fork_capture=fork_capture,
+            fork_inherited=len(fork_capture.messages) if fork_capture else None,
         )
         run.output_writer = OutputFileWriter(
             output_file_path(
@@ -287,6 +297,8 @@ class SubagentManager:
             ),
             run.agent_id,
             self._api.context.cwd,
+            # Seeded parent messages stay out of the durable transcript.
+            inherited=run.fork_inherited or 0,
         )
         run.output_file = str(run.output_writer.path)
         self._runs[run.agent_id] = run
@@ -546,16 +558,39 @@ class SubagentManager:
         parent_provider = self._api.context.provider_name
         parent_model = self._api.context.model
         provider_settings = load_provider_settings()
-        selection = resolve_provider_selection(
-            provider_settings,
-            provider_name=run.requested_provider or parent_provider,
-            model=definition.model or run.requested_model or parent_model,
-        )
+        if definition.fork:
+            capture = run.fork_capture
+            assert capture is not None
+            # A fork resolves against the snapshot taken at tool-call time,
+            # not the live parent: a queued fork must run the model the
+            # parent had when it forked (a /model switch in between would
+            # otherwise break the shared prompt cache).
+            selection = resolve_provider_selection(
+                provider_settings,
+                provider_name=capture.provider_name,
+                model=capture.model,
+            )
+        else:
+            selection = resolve_provider_selection(
+                provider_settings,
+                provider_name=run.requested_provider or parent_provider,
+                model=definition.model or run.requested_model or parent_model,
+            )
         provider = create_model_provider(
             selection.provider,
             model=selection.model,
+            # Forks run the parent's live thinking level (captured at
+            # tool-call time). Any other level would put a different thinking
+            # config in the fork's request and cost (part of) the shared
+            # prompt cache. When Tau does not expose the level (pre-0.4.0)
+            # the capture is None and the provider's persisted per-model
+            # level applies instead.
             thinking_level=(
-                definition.thinking or run.requested_thinking or DEFAULT_THINKING_LEVEL
+                capture.thinking_level
+                if definition.fork
+                else definition.thinking
+                or run.requested_thinking
+                or DEFAULT_THINKING_LEVEL
             ),
         )
         run.provider = provider
@@ -574,47 +609,61 @@ class SubagentManager:
             child_cwd = worktree.work_path
         if run.output_writer is not None:
             await run.output_writer.write_initial(run.prompt)
-        skill_blocks = resolve_skill_blocks(
-            definition.skills if isinstance(definition.skills, tuple) else None, cwd
-        )
+        storage = _MemoryStorage()
+        extra_config: dict[str, bool] = {}
         memory_block: str | None = None
         memory_rw = False
-        if definition.memory is not None:
-            memory_rw = definition.tools is None or bool(
-                {"write", "edit"} & set(definition.tools)
+        if definition.fork:
+            # Fork: seed the child storage with the parent transcript and keep
+            # the parent system prompt byte-identical (shared prompt cache).
+            # No memory, skill preloads, or tool gating — the fork is the
+            # parent session continued, minus recursive subagent tools.
+            assert capture is not None
+            storage.entries = build_fork_entries(capture, child_cwd)
+            prompt_text: str | None = capture.system_prompt
+            append_active = True
+            # The snapshot pins a full transcript copy; the seed has it now.
+            run.fork_capture = None
+        else:
+            skill_blocks = resolve_skill_blocks(
+                definition.skills if isinstance(definition.skills, tuple) else None,
+                cwd,
             )
-            memory_block = await prepare_memory(
-                definition.name, definition.memory, cwd, read_write=memory_rw
+            if definition.memory is not None:
+                memory_rw = definition.tools is None or bool(
+                    {"write", "edit"} & set(definition.tools)
+                )
+                memory_block = await prepare_memory(
+                    definition.name, definition.memory, cwd, read_write=memory_rw
+                )
+            parent_prompt: str | None = None
+            if definition.prompt_mode == "append":
+                try:
+                    parent_prompt = self._api.context.system_prompt
+                except Exception:  # noqa: BLE001 - fall back to replace-mode assembly
+                    parent_prompt = None
+            environment = ""
+            if definition.prompt_mode == "append" and parent_prompt:
+                environment = await detect_environment(child_cwd)
+            prompt_text = build_child_system_prompt(
+                definition,
+                parent_prompt=parent_prompt,
+                environment=environment,
+                skill_blocks=skill_blocks,
+                memory_block=memory_block,
             )
-        parent_prompt: str | None = None
-        if definition.prompt_mode == "append":
-            try:
-                parent_prompt = self._api.context.system_prompt
-            except Exception:  # noqa: BLE001 - fall back to replace-mode assembly
-                parent_prompt = None
-        environment = ""
-        if definition.prompt_mode == "append" and parent_prompt:
-            environment = await detect_environment(child_cwd)
-        prompt_text = build_child_system_prompt(
-            definition,
-            parent_prompt=parent_prompt,
-            environment=environment,
-            skill_blocks=skill_blocks,
-            memory_block=memory_block,
-        )
-        append_active = definition.prompt_mode == "append" and bool(parent_prompt)
-        extra_config: dict[str, bool] = {}
-        # skills: none/false disables skill discovery; a named CSV also
-        # disables it so preloaded bodies aren't double-listed in the index
-        # (pi sets noSkills for both).
-        if definition.skills is False or isinstance(definition.skills, tuple):
-            extra_config["skills_enabled"] = False
+            append_active = definition.prompt_mode == "append" and bool(parent_prompt)
+            # skills: none/false disables skill discovery; a named CSV also
+            # disables it so preloaded bodies aren't double-listed in the index
+            # (pi sets noSkills for both).
+            if definition.skills is False or isinstance(definition.skills, tuple):
+                extra_config["skills_enabled"] = False
         session = await CodingSession.load(
             CodingSessionConfig(
                 provider=provider,
                 model=selection.model,
                 cwd=child_cwd,
-                storage=_MemoryStorage(),
+                storage=storage,
                 system=prompt_text if append_active else None,
                 custom_system_prompt=None if append_active else prompt_text,
                 # Children always discover skills natively (Tau defaults
@@ -629,8 +678,9 @@ class SubagentManager:
                 provider_name=selection.provider.name,
                 auto_compact_enabled=False,
                 # Children load extensions natively (pi parity), so subagents
-                # can spawn subagents. `isolated: true` opts a child out,
-                # restoring a core-tools-only session.
+                # can spawn subagents and a fork's tool pool matches the
+                # parent's (shared prompt cache). `isolated: true` opts a
+                # child out, restoring a core-tools-only session.
                 extensions_enabled=not run.requested_isolated,
                 **extra_config,
             )
@@ -1119,10 +1169,36 @@ def setup(tau: ExtensionAPI) -> None:
             "worktree" if arguments.get("isolation") == "worktree" else None
         )
         isolated = bool(arguments.get("isolated", False))
+        fork_capture = None
+        if definition.fork:
+            # Reject, never silently ignore: a fork always runs the parent's
+            # model, thinking config, and tool pool (anything else breaks the
+            # shared prompt cache). Dropping a `model` param quietly would let
+            # the parent believe it spawned a cheaper model while the fork
+            # actually runs the parent's — a silent cost surprise.
+            rejected = [
+                name
+                for name in ("provider", "model", "thinking", "isolated")
+                if arguments.get(name)
+            ]
+            if rejected:
+                return _tool_result(
+                    content=f"A fork cannot take {', '.join(rejected)} — it"
+                    " always runs the parent's provider, model, thinking"
+                    " config, and tool pool (a different one would break the"
+                    " shared prompt cache). Omit the parameter(s), or spawn a"
+                    " different agent type with inherit_context=true to use"
+                    " another provider/model with the conversation context.",
+                )
+            # Captured at tool-call time (like inherit_context): queued forks
+            # see the conversation as of this call. inherit_context stays
+            # accepted — the fork fulfills exactly that request.
+            fork_capture = capture_fork(tau.context)
+            prompt = wrap_fork_task(prompt, worktree=isolation == "worktree")
         inherit = arguments.get("inherit_context")
         if inherit is None:
             inherit = definition.inherit_context
-        if inherit:
+        if inherit and not definition.fork:
             # Captured at spawn time (pi semantics): the digest reflects the
             # parent conversation as of this tool call, even for queued runs.
             parent_context = build_parent_context(tau.context.transcript)
@@ -1151,6 +1227,7 @@ def setup(tau: ExtensionAPI) -> None:
             provider=provider,
             model=model,
             thinking=thinking,
+            fork_capture=fork_capture,
             isolated=isolated,
         )
         if background:
@@ -1271,11 +1348,6 @@ def setup(tau: ExtensionAPI) -> None:
                 content="Cannot combine `schedule` with `run_in_background: false`"
                 " — scheduled jobs always run in background.",
             )
-        if not scheduler.is_active():
-            return _tool_result(
-                content="Scheduler is not active in this session yet."
-                " Try again after the session has fully started.",
-            )
         definitions = manager.definitions()
         agent_type = str(arguments.get("subagent_type", "general"))
         definition = definitions.get(agent_type)
@@ -1283,6 +1355,16 @@ def setup(tau: ExtensionAPI) -> None:
             available = ", ".join(sorted(definitions))
             return _tool_result(
                 content=f"Unknown subagent_type: {agent_type}. Available: {available}",
+            )
+        if definition.fork:
+            return _tool_result(
+                content="Cannot schedule a fork — there is no parent"
+                " conversation to inherit at fire time.",
+            )
+        if not scheduler.is_active():
+            return _tool_result(
+                content="Scheduler is not active in this session yet."
+                " Try again after the session has fully started.",
             )
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
@@ -1459,8 +1541,13 @@ def setup(tau: ExtensionAPI) -> None:
                 " report. Set run_in_background=true for long tasks; a completion"
                 " notification will arrive when it finishes. Use steer_subagent to"
                 " redirect a running agent, and resume=<id> with a new prompt to"
-                " continue a finished agent's session. Use inherit_context if"
-                " the agent needs the parent conversation history.\n\nAvailable"
+                " continue a finished agent's session. Two ways to share this"
+                " conversation: inherit_context=true prepends a text digest of"
+                " the user and assistant messages only (no tool calls or"
+                " results) to a fresh agent of any type/model; subagent_type"
+                " fork runs on this conversation's actual messages, including"
+                " every tool call and result, with the same system prompt,"
+                " tools, and model, so the prompt cache is shared.\n\nAvailable"
                 f" agent types:\n{type_list}"
             ),
             parameters={
@@ -1525,9 +1612,11 @@ def setup(tau: ExtensionAPI) -> None:
                     },
                     "inherit_context": {
                         "type": "boolean",
-                        "description": "If true, prepend the parent conversation"
-                        " history to the agent's prompt. Default: false"
-                        " (fresh context).",
+                        "description": "If true, prepend a text digest of the"
+                        " parent conversation (user and assistant messages;"
+                        " tool calls and results omitted) to the agent's"
+                        " prompt. Default: false (fresh context). No effect on"
+                        " forks, which already have the full history.",
                     },
                     "schedule": {
                         "type": "string",
