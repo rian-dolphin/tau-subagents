@@ -2534,11 +2534,15 @@ async def test_fork_output_file_skips_inherited_messages(tmp_path: Path) -> None
     assert "find the bug" not in transcripts[0].read_text()
 
 
-async def test_fork_cannot_be_resumed_and_name_is_reserved(tmp_path: Path) -> None:
+async def test_fork_resumes_and_cannot_be_scheduled_and_name_is_reserved(
+    tmp_path: Path,
+) -> None:
     runtime = _load_runtime(tmp_path)
     runtime.bind(_fork_parent(tmp_path))
     module = _extension_module()
-    provider = CapturingProvider([_text_stream("fork done")])
+    provider = CapturingProvider(
+        [_text_stream("fork done"), _text_stream("resumed")]
+    )
     _patch_fork_resolution(module, provider)
 
     agent_tool = _agent_tool(runtime)
@@ -2546,10 +2550,15 @@ async def test_fork_cannot_be_resumed_and_name_is_reserved(tmp_path: Path) -> No
         "call-1",
         {"prompt": "task", "description": "d", "subagent_type": "fork"},
     )
+    # A fork's session is an ordinary live session; resume is another user
+    # turn on top of the seeded history plus the fork's own turns.
     result = await agent_tool.execute(
         "call-2", {"prompt": "more", "description": "d", "resume": "agent-1"}
     )
-    assert "cannot be resumed" in result.text
+    assert "resumed" in result.text
+    resumed = provider.calls[1]["messages"]
+    assert resumed[0].text == "find the bug"  # seeded prefix still present
+    assert resumed[-1].text == "more"
 
     result = await agent_tool.execute(
         "call-3",

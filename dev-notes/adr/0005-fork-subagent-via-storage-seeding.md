@@ -71,10 +71,14 @@ Details, each chosen over an alternative:
   durable storage under ADR 0003 retention.
 - **Guards:** provider/model/thinking/isolated params rejected with an explanation
   — never silently dropped, so the parent cannot believe it spawned a
-  cheaper model while the fork runs the parent's. Resume and schedule
-  rejected; `inherit_context` accepted as fulfilled. Foreground
-  forks are allowed — a deliberate divergence from Claude Code's
-  background-only forks; there is no reason to forbid blocking on one.
+  cheaper model while the fork runs the parent's. Schedule rejected: a
+  job fires later with no parent conversation to snapshot.
+  `inherit_context` accepted as fulfilled. Foreground and resumable forks
+  are allowed — deliberate divergences from Claude Code's one-shot,
+  background-only forks. A fork's session is an ordinary live
+  `CodingSession` once seeded, so resume is just another user turn on it
+  (and a cheap one: the prefix is already cached); there is no reason to
+  forbid it or blocking on a foreground fork.
 
 ## Consequences
 

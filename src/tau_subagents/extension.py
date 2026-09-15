@@ -177,7 +177,7 @@ class AgentRun:
     # cleared once the seed entries are built (it pins a full transcript copy).
     fork_capture: ForkCapture | None = None
     # Seeded parent message count for fork runs; None for every other agent
-    # type. Doubles as the "is a fork" flag for guards and the viewer slice.
+    # type. Sizes the output-file skip so the seeded prefix stays out of it.
     fork_inherited: int | None = None
     worktree: Worktree | None = None
     used_worktree: bool = False
@@ -1313,11 +1313,6 @@ def setup(tau: ExtensionAPI) -> None:
             return _tool_result(
                 content=f'Agent "{agent_id}" ran in an isolated worktree that has'
                 " been cleaned up; resume is not supported for worktree agents.",
-            )
-        if run.fork_inherited is not None:
-            return _tool_result(
-                content=f'Agent "{agent_id}" is a fork; forks are one-shot and'
-                " cannot be resumed. Spawn a new fork instead.",
             )
         if run.session is None:
             return _tool_result(

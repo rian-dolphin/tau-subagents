@@ -177,9 +177,12 @@ Notes:
 
 - The in-flight `agent` call that spawned the fork is closed in the fork's
   copy with a neutral `(forked here …)` tool result.
-- Forks are one-shot: `resume` and `schedule` are rejected. Worktree
-  isolation and foreground/background both work (foreground forks are a
-  deliberate divergence from Claude Code's background-only forks).
+- `resume` works on a fork like any other agent (its session stays live,
+  with the seeded history and its own turns). `schedule` is rejected: a
+  job fires later with no parent conversation to snapshot. Worktree
+  isolation and foreground/background both work (foreground and resumable
+  forks are deliberate divergences from Claude Code's one-shot,
+  background-only forks).
 - `inherit_context` is redundant for forks and ignored.
 - Token figures are not comparable to other agent types: the inherited
   prefix bills as input on the fork's first turn.
@@ -203,7 +206,7 @@ Both give a subagent the parent conversation. They are different tools.
 | Model, thinking | Free choice. | The parent's. Overrides are rejected. |
 | Tools | The allow-list of the agent type. | The exact tool pool of the parent. |
 | Prompt cache | Its own cache, cold at the start. | The cache of the parent, shared. |
-| Resume, schedule | Both work. | Both are rejected. |
+| Resume, schedule | Both work. | Resume works; schedule is rejected. |
 
 Use a fork when the task needs the full context on the same model. The
 digest does not contain the file contents, the command output, or the
