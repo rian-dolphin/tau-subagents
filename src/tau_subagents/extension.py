@@ -3,7 +3,8 @@
 Registers an `agent` tool that spawns autonomous subagents in-process (a
 scoped `CodingSession` with its own tools and system prompt), a
 `get_subagent_result` tool for background runs, a `steer_subagent` tool for
-redirecting live runs, and an `/agents` command.
+redirecting live runs, a `stop_subagent` tool for ending them, and an
+`/agents` command.
 
 Foreground agents block and return their final assistant text. Background
 agents return an id immediately and deliver a `<task-notification>` back into
@@ -45,6 +46,7 @@ from tau_coding.thinking import DEFAULT_THINKING_LEVEL, THINKING_LEVELS
 from .agents import AgentDefinition, format_agent_type_list, load_agent_definitions
 from .agents_menu import (
     show_agents_menu,
+    stop_run,
     supports_menu,
 )
 from .fork import ForkCapture, build_fork_entries, capture_fork, wrap_fork_task
@@ -87,6 +89,9 @@ FOREGROUND_RESULT_CHARS = 6_000
 RECORD_RESULT_CHARS = 4_000
 BATCH_DEBOUNCE_SECONDS = 0.1
 NUDGE_HOLD_SECONDS = 0.2
+#: How long stop_subagent waits for a cancelled run to wind down before it
+#: reports the stop as requested but not yet taken.
+STOP_WAIT_SECONDS = 5.0
 GROUP_TIMEOUT_SECONDS = DEFAULT_TIMEOUT
 STRAGGLER_TIMEOUT_SECONDS = STRAGGLER_TIMEOUT
 STALE_AFTER_SECONDS = 600.0
@@ -143,6 +148,13 @@ class AgentRun:
     tokens_input: int = 0
     tokens_output: int = 0
     tokens_cache_write: int = 0
+    # Liveness, which tells a busy run from a wedged one: when the child last
+    # emitted any event, and the tool it is inside right now. A tool that never
+    # returns emits nothing, and turns only count once a turn ends, so without
+    # these a hung run looks exactly like a slow one.
+    last_event_at: float | None = None
+    current_tool: str | None = None
+    current_tool_started_at: float | None = None
     # Terminal error carried by the last assistant message seen so far. Only a
     # tentative signal while the run is live: tau (like pi) can recover from a
     # mid-run overflow error via compaction + auto-retry, so a later successful
@@ -743,10 +755,16 @@ class SubagentManager:
 
     def _observe(self, run: AgentRun, event: AgentEvent, final_text: list[str]) -> None:
         run.revision += 1
+        run.last_event_at = time.monotonic()
         if event.type == "turn_end":
             run.turns += 1
         elif event.type == "tool_execution_start":
             run.tool_calls += 1
+            run.current_tool = event.tool_name
+            run.current_tool_started_at = run.last_event_at
+        elif event.type == "tool_execution_end":
+            run.current_tool = None
+            run.current_tool_started_at = None
         elif event.type == "message_end":
             message = event.message
             if getattr(message, "role", None) == "assistant":
@@ -908,8 +926,8 @@ def format_background_spawn(run: AgentRun, max_concurrent: int) -> str:
         [
             "",
             "You will be notified when this agent completes.",
-            "Use get_subagent_result to retrieve full results, or steer_subagent"
-            " to send it messages.",
+            "Use get_subagent_result to retrieve full results, steer_subagent"
+            " to send it messages, or stop_subagent to end it.",
             "Do not duplicate this agent's work.",
         ]
     )
@@ -1002,6 +1020,48 @@ def format_run_summary(run: AgentRun) -> str:
     )
 
 
+#: Seconds without an event after which get_subagent_result says a running
+#: agent may be wedged and names stop_subagent. Long enough that a test suite
+#: or a slow build does not trip it on its own.
+QUIET_WARNING_SECONDS = 300
+
+
+def format_liveness(run: AgentRun, now: float | None = None) -> str:
+    """How long a live run has gone, its last sign of life, and the tool in flight."""
+    now = time.monotonic() if now is None else now
+    if run.started_at is None:
+        return "Not started yet."
+    parts = [f"Running for {_format_seconds(now - run.started_at)}"]
+    if run.last_event_at is None:
+        parts.append("no events yet")
+    else:
+        parts.append(f"last event {_format_seconds(now - run.last_event_at)} ago")
+    if run.current_tool is not None and run.current_tool_started_at is not None:
+        parts.append(
+            f"inside `{run.current_tool}` for"
+            f" {_format_seconds(now - run.current_tool_started_at)}"
+        )
+    line = "; ".join(parts) + "."
+    quiet_since = run.last_event_at if run.last_event_at is not None else run.started_at
+    if now - quiet_since >= QUIET_WARNING_SECONDS:
+        line += (
+            " It may be wedged: a steering message waits for the current tool to"
+            " return, and stop_subagent ends the run."
+        )
+    return line
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
 def lifetime_tokens(run: AgentRun) -> int:
     """Lifetime billed tokens: input + output + cache_write (pi semantics)."""
     return run.tokens_input + run.tokens_output + run.tokens_cache_write
@@ -1061,6 +1121,11 @@ def render_get_result_call(arguments: Mapping[str, object]) -> str:
     if arguments.get("wait"):
         line += " (wait)"
     return line
+
+
+def render_stop_call(arguments: Mapping[str, object]) -> str:
+    """Friendly invocation line for stop_subagent."""
+    return f"▸ stop {arguments.get('agent_id') or '?'}"
 
 
 def render_steer_call(arguments: Mapping[str, object]) -> str:
@@ -1437,7 +1502,7 @@ def setup(tau: ExtensionAPI) -> None:
             )
         if run.status == "running":
             return _tool_result(
-                content=f"{header}\n\nStill running.",
+                content=f"{header}\n{format_liveness(run)}\n\nStill running.",
             )
         run.result_consumed = True
         manager.cancel_nudge(agent_id)
@@ -1479,6 +1544,43 @@ def setup(tau: ExtensionAPI) -> None:
             content=f"Steering message sent to agent {agent_id}."
             " The agent will process it after its current tool execution.\n"
             f"Current state: {' · '.join(state_parts)}",
+        )
+
+    async def run_stop_tool(tool_call_id, arguments, signal=None, on_update=None):  # noqa: ANN001, ANN202
+        del tool_call_id, signal, on_update
+        agent_id = str(arguments.get("agent_id", ""))
+        run = manager.runs.get(agent_id)
+        if run is None:
+            return _tool_result(
+                content=f'Agent not found: "{agent_id}". It may have been cleaned up.',
+            )
+        if run.status not in ("running", "queued"):
+            return _tool_result(
+                content=f'Agent "{agent_id}" is not running (status: {run.status}).'
+                " Nothing to stop.",
+            )
+        liveness = format_liveness(run) if run.status == "running" else ""
+        stop_run(run)
+        # Cancelling the session kills the tool in flight (bash takes its whole
+        # process group down), so the run normally winds down at once. Wait a
+        # little to report the outcome here rather than in a later nudge.
+        deadline = time.monotonic() + STOP_WAIT_SECONDS
+        while run.status in ("running", "queued") and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        header = format_run_summary(run)
+        if liveness:
+            header += f"\nBefore the stop: {liveness}"
+        if run.status in ("running", "queued"):
+            return _tool_result(
+                content=f"{header}\n\nStop requested, but the agent has not wound"
+                f" down after {STOP_WAIT_SECONDS:g}s: its current tool is not"
+                " responding to cancellation. You will be notified when it ends.",
+            )
+        run.result_consumed = True
+        manager.cancel_nudge(agent_id)
+        return _tool_result(
+            content=f"{header}\n\nStopped. Last output before the stop:\n"
+            f"{run.result_text or '(no output)'}",
         )
 
     menu_tasks: set[asyncio.Task[None]] = set()
@@ -1685,6 +1787,32 @@ def setup(tau: ExtensionAPI) -> None:
             },
             execute_fn=run_steer_tool,
             render_call=render_steer_call,
+        )
+    )
+    tau.register_tool(
+        AgentTool(
+            name="stop_subagent",
+            label="Stop subagent",
+            description=(
+                "Stop a running or queued subagent. Cancels the tool it is"
+                " executing (a hung shell command is killed with its children) and"
+                " ends the run as aborted; work it already wrote to disk stays."
+                " Use it when get_subagent_result shows no events for far longer"
+                " than the current step should take: steering cannot reach an agent"
+                " whose tool never returns."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The id of the agent to stop.",
+                    },
+                },
+                "required": ["agent_id"],
+            },
+            execute_fn=run_stop_tool,
+            render_call=render_stop_call,
         )
     )
     tau.register_command(

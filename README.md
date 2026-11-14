@@ -21,6 +21,7 @@ Also registers:
 
 - `get_subagent_result` — poll a background agent, or `wait=true` to block for it
 - `steer_subagent` — inject a message into a running (or queued) agent
+- `stop_subagent` — end a running (or queued) agent, killing the tool it is in
 - `/agents` — interactive menu over agent types, runs, and scheduled jobs
 - an **agents strip** under the prompt (TUI mode): live subagent list with an
   embedded conversation viewer (see "The agents strip")
@@ -419,6 +420,22 @@ conversation. Messages sent to a **queued** agent (one with no live session
 yet) are held and flushed the moment its session initializes. Typing inside
 an agent's in-place view (see "The agents strip") and the `/agents` steer
 dialog use the same path.
+
+## Spotting and stopping a wedged agent
+
+A tool that never returns (a shell command that hangs, a probe that never
+converges) emits no events and ends no turn, so turn limits never fire and a
+steering message never arrives. For a running agent, `get_subagent_result`
+prints how long it has run, how long since its last event, and which tool it is
+inside and for how long; after five quiet minutes it says the agent may be
+wedged.
+
+`stop_subagent` ends it: it cancels the child session, which kills the tool in
+flight (bash takes down its whole process group), and reports the aborted run
+with its last output. It waits up to five seconds for the run to wind down and
+says so if the tool ignores cancellation. Stopping a queued agent cancels it
+before it starts. Files the agent already wrote stay where they are. The
+`/agents` menu's Stop action does the same thing.
 
 ## Turn limits (`max_turns`)
 
