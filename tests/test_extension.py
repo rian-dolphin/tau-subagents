@@ -2260,6 +2260,7 @@ def test_extension_loads(tmp_path: Path) -> None:
         "agent",
         "get_subagent_result",
         "steer_subagent",
+        "stop_subagent",
     }
     registry = runtime.build_command_registry()
     assert registry.get("agents") is not None
@@ -2641,3 +2642,101 @@ async def test_fork_rejects_model_thinking_and_isolated(tmp_path: Path) -> None:
     assert "A fork cannot take provider, model, isolated" in result.text
     assert "inherit_context" in result.text  # the suggested alternative
     assert provider.calls == []  # nothing was spawned
+
+
+def _stop_tool(runtime: ExtensionRuntime):  # noqa: ANN202
+    return next(tool for tool in runtime.extension_tools if tool.name == "stop_subagent")
+
+
+def _bash_call_stream(command: str, call_id: str) -> list[object]:
+    return [
+        AssistantStartEvent(partial=AssistantMessage(model="fake")),
+        AssistantDoneEvent(
+            reason="toolUse",
+            message=AssistantMessage(
+                content=[
+                    ToolCall(
+                        id=call_id,
+                        name="bash",
+                        arguments={"command": command, "description": "Probing"},
+                    )
+                ],
+                stop_reason="toolUse",
+            ),
+        ),
+    ]
+
+
+async def test_stop_subagent_kills_a_wedged_tool_and_reports(tmp_path: Path) -> None:
+    runtime = _load_runtime(tmp_path)
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+    module = _extension_module()
+    marker = tmp_path / "finished"
+    provider = FakeProvider(
+        [
+            _bash_call_stream(f"sleep 30 && touch {marker}", "c1"),
+            _text_stream("never reached"),
+            _text_stream("never reached"),
+        ]
+    )
+    _patch_provider_factory(module, provider)
+    get_result = next(
+        tool for tool in runtime.extension_tools if tool.name == "get_subagent_result"
+    )
+
+    await _agent_tool(runtime).execute(
+        "call-1", {"prompt": "probe", "description": "probe", "run_in_background": True}
+    )
+    status = ""
+    for _ in range(500):
+        status = (await get_result.execute("call-2", {"agent_id": "agent-1"})).text
+        if "inside `bash`" in status:
+            break
+        await asyncio.sleep(0.01)
+    assert "Still running." in status
+    assert "inside `bash` for" in status
+    assert "last event" in status
+
+    start = asyncio.get_running_loop().time()
+    stopped = await _stop_tool(runtime).execute("call-3", {"agent_id": "agent-1"})
+    assert asyncio.get_running_loop().time() - start < 5.0
+    assert "[aborted]" in stopped.text
+    assert "Stopped." in stopped.text
+    assert "Before the stop: Running for" in stopped.text
+
+    # The stop reported the outcome itself, so no completion nudge follows,
+    # and the killed command never got to finish.
+    await asyncio.sleep(0.4)
+    assert not any("agent-1" in note for note in session.followed_up)
+    assert not marker.exists()
+
+    again = await _stop_tool(runtime).execute("call-4", {"agent_id": "agent-1"})
+    assert "is not running (status: aborted)" in again.text
+    missing = await _stop_tool(runtime).execute("call-5", {"agent_id": "agent-9"})
+    assert 'Agent not found: "agent-9"' in missing.text
+
+
+def test_liveness_names_the_tool_in_flight_and_flags_long_quiet(tmp_path: Path) -> None:
+    _load_runtime(tmp_path)
+    module = _extension_module()
+    run = _menu_run(
+        module,
+        status="running",
+        started_at=100.0,
+        last_event_at=110.0,
+        current_tool="bash",
+        current_tool_started_at=110.0,
+    )
+
+    busy = module.format_liveness(run, now=130.0)  # type: ignore[attr-defined]
+    assert busy == "Running for 30s; last event 20s ago; inside `bash` for 20s."
+
+    quiet = module.format_liveness(run, now=110.0 + 3 * 3600)  # type: ignore[attr-defined]
+    assert quiet.startswith("Running for 3h00m; last event 3h00m ago; inside `bash` for 3h00m.")
+    assert "may be wedged" in quiet
+    assert "stop_subagent" in quiet
+
+    silent = _menu_run(module, status="running", started_at=0.0)
+    assert "no events yet" in module.format_liveness(silent, now=5.0)  # type: ignore[attr-defined]
+    assert "may be wedged" in module.format_liveness(silent, now=400.0)  # type: ignore[attr-defined]
